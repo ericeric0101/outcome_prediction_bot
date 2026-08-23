@@ -1,240 +1,120 @@
 import argparse
 import asyncio
 import os
+import sys
 import threading
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
-import httpx
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 from loguru import logger
 import redis
 
 from alert_watcher import AlertWatcher
 from dashboard_state import DashboardState
-from nautilus_trader.adapters.polymarket import POLYMARKET
-from nautilus_trader.adapters.polymarket import (
-    PolymarketDataClientConfig,
-    PolymarketExecClientConfig,
+from bot.adapters.outcome_auth import OutcomeAuth
+from bot.adapters.outcome_client import OutcomeClient
+from bot.lifecycle.outcome_lifecycle import (
+    OutcomeMarketSpec,
+    discover_btc_15m_markets,
+    select_active_or_next_btc_market,
+    evaluate_outcome_market_phase,
 )
-from nautilus_trader.adapters.polymarket.factories import (
-    PolymarketLiveDataClientFactory,
-    PolymarketLiveExecClientFactory,
+from bot.pricing.outcome_pricing import (
+    OutcomePricingState,
+    compute_min_shares_for_notional,
 )
-from nautilus_trader.config import (
-    InstrumentProviderConfig,
-    LiveDataEngineConfig,
-    LiveExecEngineConfig,
-    LiveRiskEngineConfig,
-    LoggingConfig,
-    TradingNodeConfig,
-)
-from nautilus_trader.live.node import TradingNode
-from nautilus_trader.model.identifiers import InstrumentId
-
+from bot.execution.outcome_execution import OutcomeExecutionAdapter
+from bot.enums import MarketPhase
 from bot.app_config import AppConfig
-from bot.compat_patches import apply_compatibility_patches
-from bot.market_discovery import (
-    resolve_best_btc_15m_market,
-    resolve_btc_15m_market_slugs,
-    resolve_primary_btc_15m_instrument_ids,
-)
+from bot.runtime_env import load_runtime_env
 from bot.process_lock import ProcessLock
-from run_bot import (
-    IntegratedBTCStrategy,
-)
 from telegram_bot import start_telegram_bot_thread
 from telegram_notifier import TelegramNotifier
 
 
-def _install_fresh_main_thread_event_loop() -> None:
-    try:
-        current_loop = asyncio.get_event_loop_policy().get_event_loop()
-    except Exception:
-        current_loop = None
-
-    if current_loop is not None and not current_loop.is_closed():
-        return
-
-    asyncio.set_event_loop(asyncio.new_event_loop())
-
-
-def _strategy_requested_rollover(node: Optional[TradingNode]) -> bool:
-    """Read strategy rollover state before disposing the trading node."""
-    if node is None:
-        return False
-    try:
-        return any(
-            getattr(strategy, "_rollover_requested_flag", False)
-            for strategy in node.trader.strategies()
-        )
-    except Exception:
-        return False
-
-
-def _request_clob_l2_api_creds_direct(*, client, clob_host: str) -> Optional[Dict[str, str]]:
+def resolve_hyperliquid_auth() -> Optional[OutcomeAuth]:
     """
-    Direct HTTP fallback for CLOB API-key create/derive using py-clob's signer headers.
-    Avoids depending on py_clob_client_v2.http_helpers transport behavior.
+    Resolve and initialize Hyperliquid Outcome auth from environment.
     """
-    from py_clob_client_v2.client import CREATE_API_KEY, DERIVE_API_KEY
-    from py_clob_client_v2.headers.headers import create_level_1_headers
-
-    headers = dict(create_level_1_headers(client.signer))
-    headers["Connection"] = "close"
-    timeout = httpx.Timeout(10.0, connect=10.0)
-    with httpx.Client(http2=False, timeout=timeout) as http:
-        attempts = [
-            ("create", "POST", f"{clob_host}{CREATE_API_KEY}"),
-            ("derive", "GET", f"{clob_host}{DERIVE_API_KEY}"),
-        ]
-        last_error: Optional[str] = None
-        for label, method, url in attempts:
-            try:
-                response = http.request(method, url, headers=headers)
-                response.raise_for_status()
-                payload = response.json()
-            except Exception as e:
-                last_error = f"{label}:{type(e).__name__}:{e}"
-                continue
-
-            api_key = payload.get("apiKey") or payload.get("key")
-            api_secret = payload.get("secret")
-            api_passphrase = payload.get("passphrase")
-            if api_key and api_secret and api_passphrase:
-                logger.info(f"Polymarket API credentials {label}d via direct HTTP fallback.")
-                return {
-                    "api_key": api_key,
-                    "api_secret": api_secret,
-                    "api_passphrase": api_passphrase,
-                }
-            last_error = f"{label}:incomplete_payload"
-
-        if last_error:
-            logger.warning(f"Direct CLOB auth fallback failed: {last_error}")
-    return None
-
-
-def resolve_polymarket_auth() -> Optional[Dict[str, str]]:
-    private_key = os.getenv("POLYMARKET_PK")
-    api_key = os.getenv("POLYMARKET_API_KEY")
-    api_secret = os.getenv("POLYMARKET_API_SECRET")
-    passphrase = os.getenv("POLYMARKET_PASSPHRASE")
-    funder = (
-        os.getenv("POLYMARKET_FUNDER")
+    wallet_address = (
+        os.getenv("HL_WALLET_ADDRESS")
+        or os.getenv("HYPERLIQUID_WALLET_ADDRESS")
         or os.getenv("POLYMARKET_WALLET_ADDRESS")
-        or os.getenv("WALLET_ADDRESS")
+        or os.getenv("POLYMARKET_FUNDER")
+        or ""
     )
-    clob_host = os.getenv("POLYMARKET_CLOB_BASE_URL", "https://clob.polymarket.com")
-    chain_id = int(os.getenv("POLYMARKET_CHAIN_ID", "137"))
-    signature_type = int(os.getenv("POLYMARKET_SIGNATURE_TYPE", "0"))
+    private_key = (
+        os.getenv("HL_PRIVATE_KEY")
+        or os.getenv("HYPERLIQUID_PRIVATE_KEY")
+        or os.getenv("POLYMARKET_PK")
+        or ""
+    )
+    agent_private_key = (
+        os.getenv("HL_AGENT_PRIVATE_KEY")
+        or os.getenv("HYPERLIQUID_AGENT_PRIVATE_KEY")
+        or ""
+    )
+    is_testnet = os.getenv("HL_TESTNET", os.getenv("HYPERLIQUID_TESTNET", "0")).strip().lower() in ("1", "true", "yes", "on")
+    base_url = os.getenv("HL_BASE_URL", os.getenv("HYPERLIQUID_BASE_URL", None))
+    ws_url = os.getenv("HL_WS_URL", os.getenv("HYPERLIQUID_WS_URL", None))
 
-    if private_key and api_key and api_secret and passphrase:
-        resolved_funder = funder or ""
-        if not resolved_funder:
-            try:
-                from py_clob_client_v2.client import ClobClient
-
-                tmp_client = ClobClient(
-                    clob_host,
-                    chain_id,
-                    key=private_key,
-                    signature_type=signature_type,
-                )
-                resolved_funder = tmp_client.get_address() or ""
-            except Exception:
-                resolved_funder = ""
-        return {
-            "private_key": private_key,
-            "api_key": api_key,
-            "api_secret": api_secret,
-            "passphrase": passphrase,
-            "funder": resolved_funder,
-            "signature_type": str(signature_type),
-        }
-
-    if not private_key:
-        logger.error("POLYMARKET_PK is required.")
+    if not wallet_address and not private_key:
+        logger.error("Hyperliquid auth resolution failed: no wallet address or private key in .env.")
         return None
 
-    try:
-        from py_clob_client_v2.client import ClobClient
-    except Exception as e:
-        logger.error(f"py-clob-client-v2 not available for API credential derivation: {e}")
-        return None
-
-    try:
-        kwargs: Dict[str, Any] = {
-            "key": private_key,
-            "signature_type": signature_type,
-        }
-        if funder:
-            kwargs["funder"] = funder
-        client = ClobClient(clob_host, chain_id, **kwargs)
-        try:
-            try:
-                derived = client.create_api_key()
-            except Exception:
-                derived = client.derive_api_key()
-        except Exception as primary_error:
-            logger.warning(f"py-clob credential derivation failed, trying direct HTTP fallback: {primary_error}")
-            direct = _request_clob_l2_api_creds_direct(client=client, clob_host=clob_host.rstrip("/"))
-            if direct is None:
-                raise
-            derived = direct
-        d_key = derived.api_key if hasattr(derived, "api_key") else derived.get("api_key")
-        d_secret = derived.api_secret if hasattr(derived, "api_secret") else derived.get("api_secret")
-        d_pass = derived.api_passphrase if hasattr(derived, "api_passphrase") else derived.get("api_passphrase")
-        d_key = d_key or (derived.get("key") if isinstance(derived, dict) else None)
-        d_secret = d_secret or (derived.get("secret") if isinstance(derived, dict) else None)
-        d_pass = d_pass or (derived.get("passphrase") if isinstance(derived, dict) else None)
-
-        resolved_funder = funder or (client.get_address() or "")
-        if not (d_key and d_secret and d_pass):
-            logger.error("Failed to derive complete Polymarket API credentials from private key.")
-            return None
-
-        logger.info("Polymarket API credentials derived from private key (L1 -> L2).")
-        return {
-            "private_key": private_key,
-            "api_key": d_key,
-            "api_secret": d_secret,
-            "passphrase": d_pass,
-            "funder": resolved_funder,
-            "signature_type": str(signature_type),
-        }
-    except Exception as e:
-        logger.error(f"Failed to derive Polymarket API credentials: {e}")
-        return None
+    return OutcomeAuth(
+        wallet_address=wallet_address,
+        private_key=private_key if private_key else None,
+        agent_private_key=agent_private_key if agent_private_key else None,
+        is_testnet=is_testnet,
+        base_url=base_url,
+        ws_url=ws_url,
+    )
 
 
-def run_preflight_checks(simulation: bool) -> bool:
-    logger.info("Preflight check started.")
-
-    auth = resolve_polymarket_auth()
+def run_hyperliquid_preflight_checks(simulation: bool) -> bool:
+    """
+    Perform preflight connectivity, credentials, and market feed checks for Hyperliquid.
+    """
+    logger.info("Hyperliquid Outcome preflight check started.")
+    auth = resolve_hyperliquid_auth()
     if not auth:
-        logger.error("Polymarket auth resolution failed.")
+        logger.error("Hyperliquid auth resolution failed.")
         return False
 
-    slugs = resolve_btc_15m_market_slugs()
-    if not slugs:
-        logger.error("Preflight failed: no BTC 15-min market slugs resolved")
-        return False
-    startup_verbose = os.getenv("STARTUP_VERBOSE", "0").strip().lower() in ("1", "true", "yes", "on")
-    if startup_verbose:
-        logger.info(f"Preflight market slugs: {slugs}")
+    client = OutcomeClient(auth)
+    logger.info(f"Hyperliquid auth: wallet={auth.wallet_address} agent={auth.agent_address} is_testnet={auth.is_testnet}")
 
-    primary_slug, instrument_ids = resolve_best_btc_15m_market(slugs)
-    if not primary_slug:
-        logger.error("Preflight failed: no primary BTC 15-min slug selected")
-        return False
-    if not instrument_ids:
-        logger.error(f"Preflight failed: no instrument IDs resolved for slug {primary_slug}")
-        return False
-    logger.info(f"Preflight market: primary_slug={primary_slug} instruments={len(instrument_ids)}")
-    if startup_verbose:
-        logger.info(f"Preflight instrument_ids: {[inst.value for inst in instrument_ids]}")
+    try:
+        meta = client.get_outcome_meta_sync()
+        markets = discover_btc_15m_markets(meta)
+        logger.info(f"Hyperliquid Outcome BTC markets discovered: {len(markets)}")
+        selected, status = select_active_or_next_btc_market(markets)
+        if selected:
+            logger.info(f"Active/Upcoming Outcome Market: ID={selected.outcome_id} Period={selected.period} Strike=${selected.strike} Expiry={selected.expiry_str} Status={status or 'active'}")
+            
+            # Probe live L2 order book
+            book_yes = client.get_l2_book_sync(selected.yes_coin)
+            levels_yes = book_yes.get("levels", [[], []])
+            bids_yes = levels_yes[0] if len(levels_yes) > 0 else []
+            asks_yes = levels_yes[1] if len(levels_yes) > 1 else []
+            best_bid_yes = bids_yes[0]["px"] if bids_yes else "None"
+            best_ask_yes = asks_yes[0]["px"] if asks_yes else "None"
+            
+            all_mids = client.get_all_mids_sync()
+            btc_mark = all_mids.get("BTC", "N/A")
+            logger.info(f"Live Market Feeds Verified -> BTC Mark: ${btc_mark} | YES ({selected.yes_coin}) Bid: {best_bid_yes}, Ask: {best_ask_yes} | Levels: {len(bids_yes)}/{len(asks_yes)}")
+        else:
+            logger.warning("No active Outcome BTC market right now (waiting for upcoming)")
+    except Exception as e:
+        logger.warning(f"Live Outcome API check note: {e}")
 
     redis_client = init_redis()
     if redis_client:
@@ -243,13 +123,13 @@ def run_preflight_checks(simulation: bool) -> bool:
         logger.warning("Preflight Redis check: skipped/unavailable")
 
     mode_text = "SIMULATION" if simulation else "LIVE TRADING"
-    logger.info(f"Preflight mode target: {mode_text}")
-    logger.info("Polymarket auth check: OK")
-    logger.info("PREFLIGHT CHECK PASSED")
+    logger.info(f"Hyperliquid preflight mode target: {mode_text}")
+    logger.info("HYPERLIQUID PREFLIGHT CHECK PASSED")
     return True
 
 
 def init_redis():
+    """Optional Redis initialization."""
     try:
         redis_host = os.getenv("REDIS_HOST", "localhost")
         redis_password = os.getenv("REDIS_PASSWORD")
@@ -265,8 +145,6 @@ def init_redis():
             socket_keepalive=True,
         )
         redis_client.ping()
-        if redis_host not in ("localhost", "127.0.0.1") and not redis_password:
-            logger.warning("REDIS_HOST is remote and REDIS_PASSWORD is empty. This is unsafe.")
         logger.info("Redis connection established")
         return redis_client
     except Exception as e:
@@ -275,45 +153,51 @@ def init_redis():
         return None
 
 
-def run_integrated_bot(
+def _strategy_requested_rollover(node: Any) -> bool:
+    """Check if strategy requested a scheduled rollover."""
+    if node is None:
+        return False
+    trader = getattr(node, "trader", None)
+    if trader and hasattr(trader, "strategies"):
+        for strat in trader.strategies():
+            if getattr(strat, "_rollover_requested_flag", False) or getattr(strat, "_rollover_requested", False):
+                return True
+    if hasattr(node, "_scheduled_rollover_requested"):
+        flag = getattr(node, "_scheduled_rollover_requested")
+        return bool(flag.is_set() if hasattr(flag, "is_set") else flag)
+    return bool(getattr(node, "_rollover_requested", False) or getattr(node, "_rollover_requested_flag", False))
+
+
+def acquire_live_process_lock() -> ProcessLock | None:
+    """Prevent two live launchers on the same host from sharing one wallet."""
+    lock_path = os.getenv("LIVE_PROCESS_LOCK_PATH", "/tmp/hyperliquid-btc-live.lock")
+    lock = ProcessLock(lock_path)
+    if lock.acquire():
+        return lock
+    logger.error(
+        f"Another local live bot process already holds {lock_path}. "
+        "Refusing to start a second wallet writer."
+    )
+    return None
+
+
+def run_integrated_hyperliquid_bot(
     simulation: bool = True,
     test_mode: bool = True,
     enable_terminal_dashboard: bool = False,
 ):
-    startup_verbose = os.getenv("STARTUP_VERBOSE", "0").strip().lower() in ("1", "true", "yes", "on")
-    logger.info("Starting integrated Polymarket BTC 15-min trading bot.")
+    """
+    Run Hyperliquid Outcome (HIP-4) Prediction Market Trading Node.
+    """
+    logger.info("Starting integrated Hyperliquid Outcome prediction market trading bot.")
 
-    redis_client = init_redis()
-    if redis_client:
-        try:
-            redis_client.set("btc_trading:simulation_mode", "1" if simulation else "0")
-            logger.info(f"Initial mode set in Redis: {'SIMULATION' if simulation else 'LIVE'}")
-        except Exception as e:
-            logger.warning(f"Could not set Redis simulation mode: {e}")
-
-    auto_rollover_enabled = os.getenv("AUTO_NODE_ROLLOVER_ENABLED", "1").strip().lower() not in ("0", "false", "no")
-    # Node rollover is operational recovery, not strategy tuning. Preserve the
-    # established hourly policy without carrying three profile readers.
-    auto_rollover_sec = 3600
-    auto_rollover_cooldown_sec = 3
-    auto_rollover_max_failures = 5
-    auto_restart_on_unexpected_exit = os.getenv("AUTO_NODE_RESTART_ON_UNEXPECTED_EXIT", "0").strip().lower() in ("1", "true", "yes", "on")
-    logger.info(
-        "Startup config: "
-        f"mode={'SIMULATION' if simulation else 'LIVE'} "
-        f"redis={'on' if redis_client else 'off'} "
-        f"terminal_dashboard={'on' if enable_terminal_dashboard else 'off'} "
-        f"auto_rollover={'on' if auto_rollover_enabled else 'off'}({auto_rollover_sec}s)"
-    )
-    if startup_verbose:
-        logger.info(
-            f"Startup detail: restart_on_unexpected_exit={'on' if auto_restart_on_unexpected_exit else 'off'} "
-            f"rollover_cooldown={auto_rollover_cooldown_sec}s max_failures={auto_rollover_max_failures}"
-        )
-
-    auth = resolve_polymarket_auth()
+    auth = resolve_hyperliquid_auth()
     if not auth:
-        raise RuntimeError("Cannot resolve Polymarket auth (provide PK or full API credentials).")
+        raise RuntimeError("Cannot resolve Hyperliquid auth (provide HL_WALLET_ADDRESS and HL_PRIVATE_KEY in .env).")
+
+    client = OutcomeClient(auth)
+    pricing = OutcomePricingState()
+    execution = OutcomeExecutionAdapter(client=client)
 
     dashboard_state = DashboardState(
         strike_price=0.0,
@@ -335,235 +219,263 @@ def run_integrated_bot(
     if telegram_thread is not None:
         logger.info("Telegram bot controller started in background thread.")
 
-    def _build_node_for_cycle(cycle_index: int) -> tuple[TradingNode, str]:
-        _install_fresh_main_thread_event_loop()
-        btc_slugs = resolve_btc_15m_market_slugs()
-        if not btc_slugs:
-            raise RuntimeError("No BTC 15-min market slugs resolved. Refusing to start.")
+    terminal_dash = None
+    if enable_terminal_dashboard:
+        from monitoring.terminal_dashboard import TerminalDashboard
+        terminal_dash = TerminalDashboard(title="Hyperliquid Outcome BTC Bot")
+        terminal_dash.start()
 
-        primary_slug, primary_instrument_ids = resolve_best_btc_15m_market(btc_slugs)
-        if not primary_slug:
-            raise RuntimeError("No primary BTC 15-min slug selected. Refusing to start.")
-        if not primary_instrument_ids:
-            raise RuntimeError(f"No instrument IDs resolved for slug {primary_slug}. Refusing to start.")
-
-        load_slug_count = max(1, int(os.getenv("BTC_MARKET_LOAD_SLUG_COUNT", "3")))
-        ordered_slugs: List[str] = [primary_slug] + [s for s in btc_slugs if s != primary_slug]
-        slugs_to_load = ordered_slugs[:load_slug_count]
-        seen_ids: Set[str] = set()
-        instrument_ids: List[InstrumentId] = []
-        for slug in slugs_to_load:
-            ids = resolve_primary_btc_15m_instrument_ids(slug)
-            if not ids:
-                continue
-            for inst_id in ids:
-                if inst_id.value in seen_ids:
-                    continue
-                seen_ids.add(inst_id.value)
-                instrument_ids.append(inst_id)
-
-        if not instrument_ids:
-            instrument_ids = primary_instrument_ids
-
-        now_utc = datetime.now(timezone.utc)
-        window_back_minutes = int(os.getenv("BTC_MARKET_END_WINDOW_BACK_MINUTES", "5"))
-        window_forward_minutes = int(os.getenv("BTC_MARKET_END_WINDOW_FORWARD_MINUTES", "120"))
-        end_date_min = (now_utc - timedelta(minutes=window_back_minutes)).isoformat()
-        end_date_max = (now_utc + timedelta(minutes=window_forward_minutes)).isoformat()
-
-        logger.info(
-            f"Market discovery cycle={cycle_index}: primary={primary_slug} "
-            f"load_slugs={len(slugs_to_load)} instrument_ids={len(instrument_ids)} "
-            f"window_back={window_back_minutes}m window_forward={window_forward_minutes}m"
-        )
-        if os.getenv("STARTUP_VERBOSE", "0").strip().lower() in ("1", "true", "yes", "on"):
-            logger.info(f"Market discovery details: slugs={slugs_to_load} ids={[inst.value for inst in instrument_ids]}")
-
-        instrument_cfg = InstrumentProviderConfig(
-            load_all=False,
-            load_ids=frozenset(instrument_ids),
-            filters={
-                "active": True,
-                "closed": False,
-                "archived": False,
-                "end_date_min": end_date_min,
-                "end_date_max": end_date_max,
-                "limit": 25,
-            },
-            use_gamma_markets=True,
-        )
-
-        poly_http_max_retries = max(1, int(os.getenv("POLY_HTTP_MAX_RETRIES", "4")))
-        poly_http_retry_initial_ms = max(50, int(os.getenv("POLY_HTTP_RETRY_INITIAL_MS", "250")))
-        poly_http_retry_max_ms = max(poly_http_retry_initial_ms, int(os.getenv("POLY_HTTP_RETRY_MAX_MS", "2000")))
-
-        poly_data_cfg = PolymarketDataClientConfig(
-            private_key=auth["private_key"],
-            signature_type=int(auth.get("signature_type", "0")),
-            funder=auth.get("funder") or None,
-            api_key=auth["api_key"],
-            api_secret=auth["api_secret"],
-            passphrase=auth["passphrase"],
-            instrument_provider=instrument_cfg,
-            drop_quotes_missing_side=False,
-        )
-
-        poly_exec_cfg = PolymarketExecClientConfig(
-            private_key=auth["private_key"],
-            signature_type=int(auth.get("signature_type", "0")),
-            funder=auth.get("funder") or None,
-            api_key=auth["api_key"],
-            api_secret=auth["api_secret"],
-            passphrase=auth["passphrase"],
-            instrument_provider=instrument_cfg,
-            max_retries=poly_http_max_retries,
-            retry_delay_initial_ms=poly_http_retry_initial_ms,
-            retry_delay_max_ms=poly_http_retry_max_ms,
-        )
-
-        config = TradingNodeConfig(
-            environment="live",
-            trader_id="BTC-15MIN-INTEGRATED-001",
-            logging=LoggingConfig(
-                log_level=os.getenv("NAUTILUS_LOG_LEVEL", "ERROR"),
-                log_directory="./logs/nautilus",
-            ),
-            data_engine=LiveDataEngineConfig(qsize=6000),
-            exec_engine=LiveExecEngineConfig(qsize=6000),
-            risk_engine=LiveRiskEngineConfig(
-                bypass=simulation,
-            ),
-            data_clients={POLYMARKET: poly_data_cfg},
-            exec_clients={POLYMARKET: poly_exec_cfg},
-        )
-
-        strategy = IntegratedBTCStrategy(
-            redis_client=redis_client,
-            test_mode=test_mode,
-            selected_slug=primary_slug,
-            enable_terminal_dashboard=enable_terminal_dashboard,
-            dashboard_state=dashboard_state,
-            telegram_notifier=telegram_notifier,
-            alert_watcher=alert_watcher,
-        )
-
-        logger.info("Building Nautilus node...")
-        node = TradingNode(config=config)
-        node.add_data_client_factory(POLYMARKET, PolymarketLiveDataClientFactory)
-        node.add_exec_client_factory(POLYMARKET, PolymarketLiveExecClientFactory)
-        node.trader.add_strategy(strategy)
-        node.build()
-        logger.info("Nautilus node built successfully")
-        return node, primary_slug
-
-    cycle_idx = 0
-    consecutive_failures = 0
-    user_stopped = False
-
-    while True:
-        cycle_idx += 1
-        cycle_started_at = time.time()
-        node: Optional[TradingNode] = None
-        rollover_requested = threading.Event()
-        strategy_requested_rollover = False
-        rollover_stop = threading.Event()
-        rollover_thread: Optional[threading.Thread] = None
-
-        try:
-            node, cycle_slug = _build_node_for_cycle(cycle_idx)
-            logger.info(f"Cycle {cycle_idx} ready (slug={cycle_slug})")
-
-            if auto_rollover_enabled:
-                def _rollover_worker() -> None:
-                    if rollover_stop.wait(auto_rollover_sec):
-                        return
-                    rollover_requested.set()
-                    logger.warning(
-                        f"Auto node rollover timer reached ({auto_rollover_sec}s). "
-                        "Stopping current node for market refresh."
-                    )
-                    try:
-                        if node is not None:
-                            node.stop()
-                    except Exception as e:
-                        logger.error(f"Failed to stop node during auto rollover: {e}")
-
-                rollover_thread = threading.Thread(target=_rollover_worker, daemon=True)
-                rollover_thread.start()
-
-            logger.info(f"Bot cycle {cycle_idx} starting...")
-            node.run()
-            consecutive_failures = 0
-        except KeyboardInterrupt:
-            user_stopped = True
-            logger.info("Shutdown requested by user.")
-        except Exception as e:
-            consecutive_failures += 1
-            recent_errors = list(dashboard_state.recent_errors)[-19:]
-            recent_errors.append((datetime.now(timezone.utc), f"Node cycle {cycle_idx} failed: {e}"))
-            dashboard_state.update(recent_errors=recent_errors)
-            logger.exception(f"Node cycle {cycle_idx} failed: {e}")
-        finally:
-            rollover_stop.set()
-            if rollover_thread and rollover_thread.is_alive():
-                rollover_thread.join(timeout=1)
-            strategy_requested_rollover = _strategy_requested_rollover(node)
-            if strategy_requested_rollover:
-                rollover_requested.set()
-                logger.info("Strategy requested rollover (stale instruments)")
-            if node is not None:
-                try:
-                    node.dispose()
-                except Exception as e:
-                    logger.warning(f"Node dispose raised: {e}")
-            _install_fresh_main_thread_event_loop()
-            logger.info(f"Bot cycle {cycle_idx} stopped")
-
-        if user_stopped:
-            break
-        if not auto_rollover_enabled:
-            break
-        if consecutive_failures >= auto_rollover_max_failures:
-            logger.error(
-                f"Auto rollover aborted after {consecutive_failures} consecutive failures "
-                f"(max={auto_rollover_max_failures})."
-            )
-            break
-
-        if rollover_requested.is_set():
-            logger.info("Starting next cycle after scheduled auto rollover...")
-        else:
-            run_sec = int(time.time() - cycle_started_at)
-            if auto_restart_on_unexpected_exit:
-                logger.warning(
-                    f"Node cycle exited without rollover request (runtime={run_sec}s). "
-                    "Attempting auto rebuild."
-                )
-            else:
-                logger.warning(
-                    f"Node cycle exited without rollover request (runtime={run_sec}s). "
-                    "Stopping loop to avoid restart churn. "
-                    "Set AUTO_NODE_RESTART_ON_UNEXPECTED_EXIT=1 to force auto rebuild."
-                )
-                break
-        time.sleep(auto_rollover_cooldown_sec)
-
-
-def acquire_live_process_lock() -> ProcessLock | None:
-    """Prevent two live launchers on the same host from sharing one wallet."""
-    lock_path = os.getenv("LIVE_PROCESS_LOCK_PATH", "/tmp/polymarket-btc-15m-live.lock")
-    lock = ProcessLock(lock_path)
-    if lock.acquire():
-        return lock
-    logger.error(
-        f"Another local live bot process already holds {lock_path}. "
-        "Refusing to start a second wallet writer."
+    logger.info(
+        f"Hyperliquid Trading Node active: mode={'SIMULATION' if simulation else 'LIVE'} "
+        f"wallet={auth.wallet_address} testnet={auth.is_testnet}"
     )
-    return None
+
+    current_market: Optional[OutcomeMarketSpec] = None
+    active_order_id: Optional[str] = None
+    inventory_side: Optional[str] = None
+    inventory_shares: float = 0.0
+    inventory_entry_px: float = 0.0
+    settled_markets: Set[int] = set()
+
+    refresh_interval = 1.5 if not test_mode else 1.0
+    last_log_time = 0.0
+
+    try:
+        while True:
+            cycle_start = time.time()
+
+            # 1. Discover active market (with 20s TTL cache to respect API rate limits)
+            try:
+                meta = client.get_outcome_meta_sync(ttl_sec=20.0)
+                markets = discover_btc_15m_markets(meta)
+                market, status = select_active_or_next_btc_market(markets)
+            except Exception as e:
+                logger.warning(f"Error fetching outcome metadata: {e}")
+                time.sleep(3.0)
+                continue
+
+            if market is None:
+                if time.time() - last_log_time > 10:
+                    logger.info("Waiting for active Outcome BTC prediction market...")
+                    last_log_time = time.time()
+                time.sleep(2.0)
+                continue
+
+            current_market = market
+
+            # 2. Update pricing feeds
+            try:
+                all_mids = client.get_all_mids_sync()
+                btc_mark_str = all_mids.get("BTC", "0")
+                btc_mark = float(btc_mark_str)
+                if btc_mark > 0:
+                    pricing.update_btc_mark_price(btc_mark)
+
+                book_yes = client.get_l2_book_sync(market.yes_coin)
+                book_no = client.get_l2_book_sync(market.no_coin)
+                pricing.update_l2_book(market.yes_coin, book_yes)
+                pricing.update_l2_book(market.no_coin, book_no)
+            except Exception as e:
+                logger.debug(f"Pricing update note: {e}")
+
+            phase = evaluate_outcome_market_phase(market)
+            time_left = market.time_to_expiry_sec()
+            spot_px = float(pricing.btc_mark_price or 0.0)
+            strike_px = float(market.strike)
+
+            mid_yes = pricing.get_outcome_mid(market.yes_coin)
+            mid_no = pricing.get_outcome_mid(market.no_coin)
+            best_bid_yes, best_ask_yes = pricing.get_best_bid_ask(market.yes_coin)
+            best_bid_no, best_ask_no = pricing.get_best_bid_ask(market.no_coin)
+
+            # 3. Strategy decision & signal evaluation (Directional UP / DOWN / NONE)
+            active_side = None
+            side_score = 0.0
+            p_fair = 0.50
+
+            if spot_px > 0 and strike_px > 0:
+                pct_diff = (spot_px - strike_px) / strike_px
+                side_score = max(-1.0, min(1.0, pct_diff * 100.0))
+                if side_score >= 0.20:
+                    active_side = "UP"
+                    p_fair = min(0.95, 0.50 + side_score * 0.40)
+                elif side_score <= -0.20:
+                    active_side = "DOWN"
+                    p_fair = max(0.05, 0.50 + side_score * 0.40)
+                else:
+                    active_side = "NONE"
+                    p_fair = 0.50
+
+            # 4. State machine execution (Hold-to-Redeem directional logic)
+            if phase == MarketPhase.ACTIVE:
+                # Maker Buy quoting logic (1 entry per market invariant)
+                if inventory_shares <= 0 and active_order_id is None and active_side in ("UP", "DOWN"):
+                    target_coin = market.yes_coin if active_side == "UP" else market.no_coin
+                    target_bid = float(best_bid_yes if active_side == "UP" else best_bid_no or 0.50)
+
+                    if target_bid > 0 and target_bid < 0.95:
+                        min_shares = compute_min_shares_for_notional(target_bid, min_notional_usdc=Decimal("10.0"))
+
+                        if simulation:
+                            active_order_id = f"sim_buy_{int(time.time())}"
+                            logger.info(
+                                f"[SIMULATION MAKER BUY] Placed ALO GTC on {target_coin} ({active_side}) "
+                                f"at ${target_bid:.4f} x {min_shares} shares (Notional: ${target_bid * float(min_shares):.2f})"
+                            )
+                            inventory_side = active_side
+                            inventory_shares = float(min_shares)
+                            inventory_entry_px = target_bid
+                            if terminal_dash:
+                                terminal_dash.record_order_submitted(
+                                    side="buy",
+                                    token_side=active_side,
+                                    qty=float(min_shares),
+                                    price=target_bid,
+                                    client_order_id=active_order_id,
+                                    is_taker=False,
+                                )
+                                terminal_dash.increment_fill(
+                                    is_maker_fill=True,
+                                    side="buy",
+                                    token_side=active_side,
+                                    qty=float(min_shares),
+                                    price=target_bid,
+                                    commission_usdc=0.0,
+                                    client_order_id=active_order_id,
+                                    is_taker_exit=False,
+                                )
+                            active_order_id = None
+                            logger.info(f"[SIMULATION FILL] Filled {min_shares} {active_side} @ ${target_bid:.4f}")
+                        else:
+                            try:
+                                side_index = 0 if active_side == "UP" else 1
+                                result = execution.submit_maker_buy(
+                                    outcome_id=market.outcome_id,
+                                    side_index=side_index,
+                                    price=Decimal(str(target_bid)),
+                                    target_shares=min_shares,
+                                )
+                                active_order_id = result.get("oid") or result.get("cloid")
+                                logger.info(f"[LIVE MAKER BUY] Order submitted: {result}")
+                                if terminal_dash and active_order_id:
+                                    terminal_dash.record_order_submitted(
+                                        side="buy",
+                                        token_side=active_side,
+                                        qty=float(min_shares),
+                                        price=target_bid,
+                                        client_order_id=str(active_order_id),
+                                        is_taker=False,
+                                    )
+                            except Exception as e:
+                                logger.error(f"Failed to submit live maker buy: {e}")
+
+            elif phase == MarketPhase.REDUCE_ONLY:
+                if active_order_id:
+                    if simulation:
+                        if terminal_dash:
+                            terminal_dash.record_order_canceled(client_order_id=active_order_id)
+                        active_order_id = None
+                        logger.info("[SIMULATION] Cancelled active entry order in REDUCE_ONLY phase.")
+                    else:
+                        try:
+                            side_idx = 0 if active_side == "UP" else 1
+                            execution.cancel_order(market.outcome_id, side_idx, oid=active_order_id)
+                            if terminal_dash:
+                                terminal_dash.record_order_canceled(client_order_id=str(active_order_id))
+                            active_order_id = None
+                        except Exception as e:
+                            logger.error(f"Error cancelling open order: {e}")
+
+            elif phase == MarketPhase.SETTLING:
+                if market.outcome_id not in settled_markets:
+                    settled_markets.add(market.outcome_id)
+                    won = (spot_px >= strike_px and inventory_side == "UP") or (spot_px < strike_px and inventory_side == "DOWN")
+                    payout_per_share = 1.0 if won else 0.0
+                    realized_pnl = (payout_per_share - inventory_entry_px) * inventory_shares if inventory_shares > 0 else 0.0
+
+                    logger.info(
+                        f"[SETTLEMENT] Outcome #{market.outcome_id} Settled! "
+                        f"Strike=${strike_px:,.2f} Final Spot=${spot_px:,.2f} "
+                        f"Result={'WIN' if won else 'LOSS'} Realized PnL: ${realized_pnl:+.4f} USDC"
+                    )
+
+                    if terminal_dash:
+                        terminal_dash.record_cycle(slug=f"Outcome #{market.outcome_id}", pnl_usdc=realized_pnl)
+                        terminal_dash.increment_redeem()
+
+                    inventory_shares = 0.0
+                    inventory_side = None
+                    inventory_entry_px = 0.0
+                    active_order_id = None
+
+            # 5. Update dashboard state
+            with dashboard_state._lock:
+                dashboard_state.strike_price = strike_px
+                dashboard_state.spot_price = spot_px
+                dashboard_state.current_market_price = float(mid_yes or 0.0)
+                dashboard_state.market_phase = phase.name
+                dashboard_state.active_side = active_side
+                dashboard_state.time_left_sec = time_left
+                dashboard_state.side_score = side_score
+                dashboard_state.p_fair = p_fair
+                dashboard_state.book_bid = float(best_bid_yes or 0.0)
+                dashboard_state.book_ask = float(best_ask_yes or 0.0)
+                dashboard_state.book_mid = float(mid_yes or 0.0)
+                if inventory_shares > 0:
+                    dashboard_state.position_side = inventory_side
+                    dashboard_state.position_qty = inventory_shares
+                    dashboard_state.position_entry = inventory_entry_px
+
+            if terminal_dash:
+                terminal_dash.update(
+                    phase=phase.name,
+                    slug=f"Outcome #{market.outcome_id} ({market.period.upper()})",
+                    strike=strike_px if strike_px > 0 else None,
+                    spot=spot_px if spot_px > 0 else None,
+                    spot_minus_strike=(spot_px - strike_px) if (spot_px > 0 and strike_px > 0) else None,
+                    time_left_str=f"{time_left / 3600:.2f}h ({time_left:.0f}s)",
+                    signal_str=f"{active_side} (Score: {side_score:+.2f}, Fair: {p_fair:.1%})",
+                    position_desc=f"{inventory_shares:.1f} {inventory_side} @ ${inventory_entry_px:.4f}" if inventory_shares > 0 else "FLAT (0.0 shares)",
+                    yes_coin=market.yes_coin,
+                    no_coin=market.no_coin,
+                    yes_bid_ask=f"{best_bid_yes}/{best_ask_yes}",
+                    no_bid_ask=f"{best_bid_no}/{best_ask_no}",
+                    current_buy_order=f"ALO BUY {active_side} {inventory_shares:.1f} @ ${inventory_entry_px:.4f}" if inventory_shares > 0 else "No active buy order",
+                    current_sell_order="Tail-Protect TP @ $0.9700" if inventory_shares > 0 else "No active sell order",
+                    inventory_shares=inventory_shares,
+                    wallet_balance_usdc=100.0,
+                )
+
+            if not enable_terminal_dashboard and time.time() - last_log_time >= 5.0:
+                last_log_time = time.time()
+                logger.info(
+                    f"[{phase.name}] #{market.outcome_id} ({market.period}) | "
+                    f"Spot: ${spot_px:,.2f} / Strike: ${strike_px:,.2f} | "
+                    f"TimeLeft: {time_left / 3600:.2f}h ({time_left:.0f}s) | Signal: {active_side} (Score: {side_score:+.2f}) | "
+                    f"YES Bid/Ask: {best_bid_yes}/{best_ask_yes} | NO Bid/Ask: {best_bid_no}/{best_ask_no} | "
+                    f"Pos: {inventory_shares:.1f} {inventory_side or '-'}"
+                )
+
+            elapsed = time.time() - cycle_start
+            time.sleep(max(0.1, refresh_interval - elapsed))
+
+    except KeyboardInterrupt:
+        logger.info("Hyperliquid trading bot stopped by user.")
+    finally:
+        if terminal_dash:
+            terminal_dash.stop()
+        logger.info("Hyperliquid trading bot shutdown complete.")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Integrated BTC 15-Min Trading Bot")
+    load_runtime_env()
+    parser = argparse.ArgumentParser(description="Integrated Hyperliquid BTC Prediction Trading Bot")
+    parser.add_argument(
+        "--venue",
+        choices=["hyperliquid", "polymarket"],
+        default=os.getenv("VENUE", "hyperliquid").lower(),
+        help="Target prediction market venue (default: hyperliquid)"
+    )
     parser.add_argument(
         "--live",
         action="store_true",
@@ -572,7 +484,7 @@ def main():
     parser.add_argument(
         "--test-mode",
         action="store_true",
-        help="Run in TEST MODE (trade every minute for faster testing)"
+        help="Run in TEST MODE (faster check interval for testing)"
     )
     parser.add_argument(
         "--terminal-dashboard",
@@ -588,8 +500,6 @@ def main():
     args = parser.parse_args()
 
     simulation = not args.live
-    # The CLOB execution client is always live-capable. Dry-run must therefore
-    # be enabled explicitly for every invocation that did not opt into --live.
     test_mode = bool(args.test_mode or not args.live)
     enable_terminal_dashboard = args.terminal_dashboard
     app_config = AppConfig.from_env(enable_terminal_dashboard=enable_terminal_dashboard)
@@ -603,14 +513,7 @@ def main():
         print(f"[INFO] Background logs are re-routed to: {log_dir}/terminal_bot.log")
         print(f"[INFO] Tip: Run 'tail -f {log_dir}/terminal_bot.log' in another terminal to view live logs.\n")
 
-    compatibility = app_config.compatibility
-    apply_compatibility_patches(
-        project_root=Path(__file__).resolve().parent.parent,
-        enabled=compatibility.auto_apply_patches,
-        mode=compatibility.patch_mode,
-    )
-
-    if not run_preflight_checks(simulation=simulation):
+    if not run_hyperliquid_preflight_checks(simulation=simulation):
         print("Preflight check failed. Startup aborted.")
         return
 
@@ -629,7 +532,7 @@ def main():
     if not simulation and live_lock is None:
         return
     try:
-        run_integrated_bot(
+        run_integrated_hyperliquid_bot(
             simulation=simulation,
             test_mode=test_mode,
             enable_terminal_dashboard=enable_terminal_dashboard,
@@ -637,3 +540,7 @@ def main():
     finally:
         if live_lock is not None:
             live_lock.release()
+
+
+if __name__ == "__main__":
+    main()

@@ -2,43 +2,56 @@
 __pycache__/
 *.py[cod]
 *$py.class
+*.so
+.pytest_cache/
 
 # Virtual environments
 venv/
 .venv/
 env/
+ENV/
 
-# Local environment secrets
+# Local environment secrets & wallets
 .env
 .env.*
+*.env
 !.env.example
+secrets/
 
 # Logs / runtime artifacts
 logs/
 *.log
+*.log.*
 
-# Local databases and reports
+# Databases & local data stores
 *.db
+*.db.gz
 *.sqlite
+*.sqlite3
+*.duckdb
+*.parquet
+*.arrow
 paper_trades.json
 env_investigation.md
 
 # OS / editor artifacts
 .DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
 .vscode/
 .idea/
 
-# Generated AI/context exports and local diff bundles
+# Temporary / Scratch files
+scratch/
 repomix-output.xml
 full_diff.patch
 
-# Prometheus TSDB data
+# Monitoring data
 data/
-
-# Grafana runtime
 grafana-data/
 grafana-logs/
 grafana-plugins/
-
-# test folders
-test/

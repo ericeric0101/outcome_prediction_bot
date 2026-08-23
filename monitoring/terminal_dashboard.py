@@ -190,34 +190,43 @@ class TerminalDashboard:
                 direction = "FLAT"
                 color = "yellow"
             spot_minus_strike_str = f"[{color}]{delta:+,.2f} ({direction})[/{color}]"
+        
+        time_left_str = snapshot.get("time_left_str") or "..."
+        signal_str = snapshot.get("signal_str") or "NONE"
+        yes_ba = snapshot.get("yes_bid_ask") or "-/-"
+        no_ba = snapshot.get("no_bid_ask") or "-/-"
+        pos_desc = snapshot.get("position_desc") or "None"
+
         market_text = (
-            f"{slug}\n"
-            f"Strike: [bold]{strike_str}[/bold] | Spot: [bold]{spot_str}[/bold]\n"
-            f"Spot - Strike: {spot_minus_strike_str}"
+            f"[bold cyan]{slug}[/bold cyan] | Phase: [bold yellow]{snapshot.get('phase', 'WAITING')}[/bold yellow]\n"
+            f"Strike: [bold]{strike_str}[/bold] | Spot Mark: [bold]{spot_str}[/bold]\n"
+            f"Delta: {spot_minus_strike_str} | Time Left: [bold]{time_left_str}[/bold]\n"
+            f"Signal: [bold]{signal_str}[/bold] | Position: [bold green]{pos_desc}[/bold green]\n"
+            f"YES ({snapshot.get('yes_coin', 'YES')}): {yes_ba} | NO ({snapshot.get('no_coin', 'NO')}): {no_ba}"
         )
         
-        left_grid.add_row(Panel(market_text, title="Market", border_style="blue"))
+        left_grid.add_row(Panel(market_text, title="Market & Signals", border_style="blue"))
 
         # Right panel: Stats
         stats_table = Table(show_header=False, box=None, pad_edge=False)
         stats_table.add_column("k", style="bold green", width=16)
         stats_table.add_column("v", style="white")
-        stats_table.add_row("Inventory", f"{float(snapshot.get('inventory_shares', 0.0)):.4f}")
-        stats_table.add_row("Total Trades", str(snapshot["fills_total"]))
-        stats_table.add_row("Buys", str(snapshot["maker_buy_fills"]))
+        stats_table.add_row("Inventory", f"{float(snapshot.get('inventory_shares', 0.0)):.2f} shares")
+        stats_table.add_row("Total Trades", str(snapshot.get("fills_total", 0)))
+        stats_table.add_row("Buys", str(snapshot.get("maker_buy_fills", 0)))
         stats_table.add_row("Sells", str(int(snapshot.get("maker_sell_fills", 0)) + int(snapshot.get("taker_exit_fills", 0))))
         stats_table.add_row("Redeems", str(snapshot.get("redeem_runs", 0)))
-        stats_table.add_row("Live PnL", f"{float(snapshot['cycle_pnl_usdc']):+.4f} USDC")
-        wallet_balance = snapshot["wallet_balance_usdc"]
-        stats_table.add_row("Wallet", "..." if wallet_balance is None else f"{float(wallet_balance):.4f} USDC")
+        stats_table.add_row("Live PnL", f"{float(snapshot.get('cycle_pnl_usdc', 0.0)):+.4f} USDC")
+        wallet_balance = snapshot.get("wallet_balance_usdc")
+        stats_table.add_row("Wallet", "..." if wallet_balance is None else f"{float(wallet_balance):.2f} USDC")
 
         # Split layout
         grid = Table.grid(expand=True, padding=(0, 1))
         grid.add_column(ratio=1)
         grid.add_column(ratio=1)
         grid.add_row(
-            Panel(left_grid, title="Orders", border_style="cyan"),
-            Panel(stats_table, title="Stats", border_style="green")
+            Panel(left_grid, title="Orders & Feeds", border_style="cyan"),
+            Panel(stats_table, title="Stats & PnL", border_style="green")
         )
 
         return Panel(grid, title=f"{self.title} Live", border_style="yellow")

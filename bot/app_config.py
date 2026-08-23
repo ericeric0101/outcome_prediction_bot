@@ -475,6 +475,18 @@ class OperationsConfig:
 
 
 @dataclass(frozen=True)
+class HyperliquidConfig:
+    wallet_address: str
+    private_key: str
+    agent_private_key: str
+    is_testnet: bool
+    base_url: str
+    ws_url: str
+    min_notional_usdc: Decimal
+    referral_code: str
+
+
+@dataclass(frozen=True)
 class AppConfig:
     observability: ObservabilityConfig
     compatibility: CompatibilityConfig
@@ -484,6 +496,7 @@ class AppConfig:
     risk: RiskConfig
     market_data: MarketDataConfig
     operations: OperationsConfig
+    hyperliquid: Optional[HyperliquidConfig] = None
 
     @classmethod
     def from_env(cls, *, enable_terminal_dashboard: bool) -> "AppConfig":
@@ -1008,5 +1021,15 @@ class AppConfig:
                     0.1,
                     _env_float("SHADOW_SIMULATION_AGED_QUOTE_MAX_AGE_SEC", 30.0),
                 ),
+            ),
+            hyperliquid=HyperliquidConfig(
+                wallet_address=_env_str("HL_WALLET_ADDRESS", _env_str("HYPERLIQUID_WALLET_ADDRESS", _env_str("POLYMARKET_WALLET_ADDRESS", _env_str("WALLET_ADDRESS", "")))),
+                private_key=_env_str("HL_PRIVATE_KEY", _env_str("HYPERLIQUID_PRIVATE_KEY", _env_str("POLYMARKET_PK", ""))),
+                agent_private_key=_env_str("HL_AGENT_PRIVATE_KEY", _env_str("HYPERLIQUID_AGENT_PRIVATE_KEY", "")),
+                is_testnet=_env_bool("HL_TESTNET", _env_bool("HYPERLIQUID_TESTNET", False)),
+                base_url=_env_str("HL_BASE_URL", _env_str("HYPERLIQUID_BASE_URL", "")),
+                ws_url=_env_str("HL_WS_URL", _env_str("HYPERLIQUID_WS_URL", "")),
+                min_notional_usdc=_env_decimal("HL_MIN_NOTIONAL_USDC", "10.0"),
+                referral_code=_env_str("HL_REFERRAL_CODE", ""),
             ),
         )

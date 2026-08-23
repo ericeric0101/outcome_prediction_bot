@@ -1,190 +1,104 @@
-# Polymarket BTC 15-Minute Trading Bot
+# Hyperliquid Outcome (HIP-4) BTC 15-Minute Trading Bot
 
-An experimental, maker-first trading bot for Polymarket BTC 15-minute Up/Down
-markets. This repository can submit real orders. Dry-run output is research
-evidence, not a guarantee of fills or profitability.
+An institutional-grade, maker-first prediction market trading bot built for **Hyperliquid Outcome (HIP-4 Protocol)** BTC 15-minute markets.
 
-[`project_overview.md`](project_overview.md) is the single authority for the
-current implementation, known debt, evidence, and approved change sequence.
-This README is the concise operator entry point; it must not be used to infer
-that a planned Phase D change has already been deployed.
+[`hyperliquid_project_overview.md`](hyperliquid_project_overview.md) is the single authority for the architecture, quantitative models, execution semantics, and lifecycle rules.
 
-Traditional Chinese translation: [繁體中文 README](docs/readme_ZH.md).
+Traditional Chinese translation: [繁體中文 README](docs/readme_ZH.md) / [readme_ZH.md](readme_ZH.md).
 
-## Current live contract
+---
 
-For each 15-minute market, the bot makes one directional decision: `UP`,
-`DOWN`, or `NONE`. It is not two independent bots quoting both outcomes.
+## 1. Architecture Highlights
 
-1. **Market and strike safety.** Gamma establishes the market identity and
-   configuration. The frontend-compatible Polymarket `crypto-price` request,
-   including the market's configured 60-second TWAP parameters, supplies the
-   canonical Price To Beat. If that opening value cannot be verified, new BUYs
-   fail closed.
-2. **Shared fair and direction.** `ForecastState` is the one live fair/sigma
-   policy. `SignalEngine` turns the same state, book, trend, and strike
-   distance into a signed score: positive for UP, negative for DOWN.
-3. **Entry gates.** Fresh market data, time window, direction confidence,
-   external conflict checks, position limits, and the common `robust_net`
-   economics gate must all pass.
-4. **One entry per market.** A successful maker BUY consumes the market's
-   entry budget. Partial fills are accepted as the result of that one order;
-   the bot never reloads or supplements the entry in that market.
-5. **Exit and settlement.** `HOLD_TO_REDEEM` keeps ordinary profitable
-   inventory through settlement. When enabled and eligible, the static
-   tail-protect TP is a passive GTC sell at `0.97`. A confirmed invalidation
-   can take ownership for the recovery/urgent-exit ladder; it is distinct from
-   the normal TP. Settlement, redeem, and PnL events are written to the local
-   journal.
+1. **HyperCore L1 Native Matching**: Sub-200ms execution latency on Hyperliquid L1 with zero gas fees.
+2. **Deterministic Target Price & Mark Price**: Direct Strike parsing from `OutcomeMarketSpec` (`targetPrice`) and real-time HyperCore BTC Mark Price linear interpolation settlement — completely eliminating external oracle TWAP crawl dependencies.
+3. **Unified Margin & Auto-Settlement**: Seamless USDC margin shared across perps, spot, and outcomes. Winning outcome tokens auto-settle to 1.0 USDC directly into your clearinghouse balance without manual smart-contract claim/redeem steps.
+4. **Two-Tier Agent Key Security**: Safe, silent L1 order and cancel signing using in-memory transient Agent Keys authenticated via EIP-712.
+5. **Robust Quantitative Engine**: Shared `ForecastState` (volatility, time-decay, implied volatility floor), `SignalEngine` directional scoring, `StrongDirectionalRegime` resolution EV calibration, and single-entry per market budget enforcement.
+6. **Execution & Risk Management**: Post-Only (ALO) GTC maker buy orders, 10 USDC min notional enforcement, passive tail-protect Take-Profit (@ 0.97), and two-stage invalidation recovery exit ladder (Stage 1: Passive Recovery SELL; Stage 2: IOC Marketable SELL).
 
-The 0.97 TP does not require a fresh TWAP. A stale TWAP blocks new BUYs and,
-when configured, TWAP-confirmed recovery exits; it does not cancel an existing
-static TP by itself.
+---
 
-## Strategy status
+## 2. Setup
 
-- Phases A, B, C, and D.3 (canonical strike provenance) are complete.
-- D.4 has deployed **observability only**: fills record 10/30-second markout,
-  spot continuation, BBO/depth, volatility, time-left, and UTC
-  weekday/weekend features. Live economics still use the conservative 168-hour
-  execution-cost calibration until a candidate 12–48-hour window has at least
-  30 independent, current-version maker-BUY markets and passes the required
-  out-of-sample review.
-- D.5 configuration/document/code ownership cleanup has not started. The
-  versioned profile currently has 218 assignments; do not treat that as 218
-  daily operator knobs or delete a key based only on its name.
-
-## Setup
-
-Use the repository virtual environment directly:
+Use the project's Python virtual environment:
 
 ```bash
 git clone https://github.com/ericeric0101/Polymarket-15m-BTC-bot.git
-cd Polymarket-15m-BTC-bot
+cd Hyperliquid_prediction_bot
 python3 -m venv .venv
 ./.venv/bin/pip install -r requirements.txt
 cp config/operator.env.example .env
 ```
 
-Fill `.env` with wallet/CLOB/RPC credentials before live use. Never commit it.
+Configure your `.env` with your Hyperliquid credentials (`HL_WALLET_ADDRESS`, `HL_PRIVATE_KEY`):
 
-Configuration precedence is:
+```ini
+STRATEGY_PROFILE=btc15_twap_v3
+VENUE=hyperliquid
 
-1. `config/profiles/btc15_twap_v3.env` — versioned, non-secret advanced
-   defaults.
-2. Local `.env` — credentials, host settings, and the supported operator
-   overlay shown in `config/operator.env.example`.
-3. Shell/CI environment — highest priority.
-
-The operator example currently lists 55 supported deployment keys. The final
-reader inventory and removal of remaining profile-only/legacy settings are D.5
-work, not an invitation to copy the 218-key profile into `.env`.
-
-Validate the local configuration without printing values:
-
-```bash
-./.venv/bin/python scripts/inspect_env_contract.py --env .env --strict
+HL_WALLET_ADDRESS=0xYourWalletAddress
+HL_PRIVATE_KEY=0xYourPrivateKey
+HL_AGENT_PRIVATE_KEY=
+HL_TESTNET=0
+HL_MIN_NOTIONAL_USDC=10.0
 ```
 
-For an old, full `.env`, preview a migration before applying it:
+---
 
+## 3. Run & Operations
+
+### Preflight Check
+Verify credentials, market discovery, and connectivity before launching:
 ```bash
-./.venv/bin/python scripts/migrate_env_to_profile.py --env .env --profile btc15_twap_v3
-./.venv/bin/python scripts/migrate_env_to_profile.py --env .env --profile btc15_twap_v3 --apply
+./.venv/bin/python bot/launcher.py --preflight-only
 ```
 
-## Run
-
-Run preflight before a new deployment or configuration change:
-
+### Dry-Run Simulation
+Simulate live signal generation, orderbook drift, and order lifecycle without submitting real orders:
 ```bash
-./.venv/bin/python run_bot.py --preflight-only
+./.venv/bin/python bot/launcher.py --venue hyperliquid
 ```
 
-Dry run is the default. It exercises the live decision and local order
-lifecycle but never submits wallet orders:
-
+### Live Trading
+Start live trading on Hyperliquid Outcome (interactive confirmation required):
 ```bash
-./.venv/bin/python run_bot.py
+./.venv/bin/python bot/launcher.py --venue hyperliquid --live
 ```
 
-Live mode requires an explicit command and interactive `yes` confirmation:
-
+### Terminal Dashboard
+Run the live terminal dashboard:
 ```bash
-./.venv/bin/python run_bot.py --live
-```
-
-Useful variants:
-
-```bash
-./.venv/bin/python run_bot.py --live --terminal-dashboard
-./.venv/bin/python run_bot.py --test-mode
-```
-
-`--test-mode` is for accelerated testing, not a production strategy setting.
-Never run a second live launcher for the same wallet on the same host.
-
-## Operations and evidence
-
-```bash
-# Check collateral/allowance only.
-./.venv/bin/python scripts/check_allowance.py --check-only
-
-# Inspect settled positions; --apply sends chain transactions.
-./.venv/bin/python scripts/check_positions_and_redeem.py
-./.venv/bin/python scripts/check_positions_and_redeem.py --apply
-
-# Terminal journal dashboard.
+./.venv/bin/python bot/launcher.py --venue hyperliquid --terminal-dashboard
+# or standalone journal viewer:
 DASHBOARD_THEME=light ./.venv/bin/python dashboard.py
-
-# Historical signal replay with current gates.
-./.venv/bin/python scripts/replay_journal_signals.py --hours 168
-
-# D.4 markout/regime evidence. It does not change live policy.
-./.venv/bin/python scripts/market_regime_report.py --db logs/trade_journal.db --min-samples 30
-
-# Regression suite.
-./.venv/bin/python -m pytest -q
 ```
 
-`logs/trade_journal.db` is the canonical local strategy/order/fill/settlement
-record. Only real maker-BUY fills count toward D.4 execution-cost selection;
-dry-run shadow fills are useful diagnostics but do not replace live-fill
-evidence.
+### Run Test Suite
+Run the full test suite (310+ tests):
+```bash
+./.venv/bin/pytest
+```
 
-The Telegram controller is optional and requires both `TELEGRAM_BOT_TOKEN` and
-`TELEGRAM_OWNER_CHAT_ID`. Notification delivery is asynchronous and serialized
-so a Telegram outage cannot block the trading loop. Conditional-token balance
-queries also back off per token after an upstream API failure; the bot uses its
-safe inventory fallback rather than inventing a balance.
+---
 
-## Repository map
+## 4. Repository Structure
 
 ```text
-run_bot.py                    live/dry-run CLI entry point and strategy host
-bot/                          lifecycle, pricing, signals, quoting, exits, recovery
-execution/                    maker economics and Polymarket integration
-monitoring/trade_journal_db.py SQLite journal/report access
-config/profiles/              versioned non-secret strategy profile
-config/operator.env.example   supported local operator overlay
-scripts/                      preflight, replay, regime report, allowance, redeem
-docs/readme_ZH.md             Traditional Chinese README translation
+hyperliquid_project_overview.md  Single authoritative architecture design document
+bot/adapters/                    OutcomeAuth (Agent Key, EIP-712), OutcomeClient (REST & WS)
+bot/lifecycle/                   OutcomeLifecycle (Market spec parsing & phase transitions)
+bot/pricing/                     OutcomePricing (HyperCore Mark price, L2 book, fees & economics)
+bot/execution/                   OutcomeExecutionAdapter (Maker BUY ALO, TP, Recovery Ladder, Settlement)
+bot/                             Core quantitative brain (SignalEngine, ForecastState, PositionManager)
+monitoring/                      TradeJournalDB (SQLite auditing and multi-dimensional analytics)
+execution/                       Maker engine quote planning and fee models
+config/profiles/                 Versioned strategy profiles (btc15_twap_v3.env)
+tests/                           Comprehensive unit, integration, and regression test suites
 ```
 
-When documentation conflicts with `project_overview.md`, the overview wins.
+---
 
-## Verification and risk
+## 5. Risk Disclaimer
 
-For any intentional strategy change, run the phase-specific evidence defined
-in `project_overview.md`, then at minimum:
-
-```bash
-./.venv/bin/python -m pytest -q
-./.venv/bin/python scripts/inspect_env_contract.py --env .env --strict
-git diff --check
-```
-
-Binary contracts can lose the full entry cost. Venue availability, order state,
-settlement references, fees, and liquidity can change. Monitor live operation
-and independently verify wallet/chain activity before moving funds. This code
-is not investment advice.
+Prediction markets carry substantial risk. Orders submitted with `--live` risk real funds. Always verify testnet operation and independently monitor positions.

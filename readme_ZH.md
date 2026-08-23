@@ -2,9 +2,9 @@
 
 專為 **Hyperliquid 原生預測市場平台 —— Outcome (HIP-4 協議)** 打造的專業級 Maker-First 15 分鐘 BTC 方向性做市與量化套利系統。
 
-[`hyperliquid_project_overview.md`](../hyperliquid_project_overview.md) 為本系統唯一的架構、量化模型、執行語意與生命週期規則權威規範文件。
+[`hyperliquid_project_overview.md`](hyperliquid_project_overview.md) 為本系統唯一的架構、量化模型、執行語意與生命週期規則權威規範文件。
 
-English version: [README.md](../README.md).
+English version: [README.md](README.md).
 
 ---
 
