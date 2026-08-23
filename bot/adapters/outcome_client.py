@@ -100,23 +100,31 @@ class OutcomeClient:
     # REST /info Endpoints with Rate-Limit Resilience & Caching
     # --------------------------------------------------------------------------
 
+    @staticmethod
+    def _info_retry_delay(attempt: int) -> float:
+        """Bounded exponential backoff for rate limits and transient upstream errors."""
+        return min(8.0, float(2 ** (attempt - 1)))
+
     async def post_info(self, payload: Dict[str, Any], max_retries: int = 3) -> Any:
-        """Raw POST request to /info with automatic 429 backoff."""
+        """Raw POST request to /info with retry for 429, 5xx, and transport failures."""
         client = await self.get_async_client()
         for attempt in range(1, max_retries + 1):
             try:
                 resp = await client.post("/info", json=payload)
-                if resp.status_code == 429:
-                    wait_sec = attempt * 2.0
-                    logger.warning(f"Hyperliquid API rate-limited (429) for {payload.get('type')}. Backing off for {wait_sec:.1f}s (attempt {attempt}/{max_retries})")
+                if resp.status_code == 429 or 500 <= resp.status_code <= 599:
+                    wait_sec = self._info_retry_delay(attempt)
+                    logger.warning(
+                        f"Hyperliquid /info transient HTTP {resp.status_code} for {payload.get('type')}; "
+                        f"retrying in {wait_sec:.1f}s (attempt {attempt}/{max_retries})"
+                    )
                     await asyncio.sleep(wait_sec)
                     continue
                 resp.raise_for_status()
                 return resp.json()
             except httpx.HTTPStatusError as e:
-                if e.response.status_code == 429 and attempt < max_retries:
-                    wait_sec = attempt * 2.0
-                    logger.warning(f"Hyperliquid API rate-limited (429). Retrying in {wait_sec:.1f}s...")
+                if (e.response.status_code == 429 or 500 <= e.response.status_code <= 599) and attempt < max_retries:
+                    wait_sec = self._info_retry_delay(attempt)
+                    logger.warning(f"Hyperliquid /info HTTP {e.response.status_code}; retrying in {wait_sec:.1f}s...")
                     await asyncio.sleep(wait_sec)
                     continue
                 logger.error(f"OutcomeClient.post_info error for {payload.get('type')}: {e}")
@@ -125,25 +133,28 @@ class OutcomeClient:
                 if attempt == max_retries:
                     logger.error(f"OutcomeClient.post_info error for {payload.get('type')}: {e}")
                     raise
-                await asyncio.sleep(1.0 * attempt)
+                await asyncio.sleep(self._info_retry_delay(attempt))
 
     def post_info_sync(self, payload: Dict[str, Any], max_retries: int = 3) -> Any:
-        """Synchronous POST request to /info with automatic 429 backoff."""
+        """Synchronous /info request with retry for 429, 5xx, and transport failures."""
         client = self.get_sync_client()
         for attempt in range(1, max_retries + 1):
             try:
                 resp = client.post("/info", json=payload)
-                if resp.status_code == 429:
-                    wait_sec = attempt * 2.0
-                    logger.warning(f"Hyperliquid API rate-limited (429) for {payload.get('type')}. Backing off for {wait_sec:.1f}s (attempt {attempt}/{max_retries})")
+                if resp.status_code == 429 or 500 <= resp.status_code <= 599:
+                    wait_sec = self._info_retry_delay(attempt)
+                    logger.warning(
+                        f"Hyperliquid /info transient HTTP {resp.status_code} for {payload.get('type')}; "
+                        f"retrying in {wait_sec:.1f}s (attempt {attempt}/{max_retries})"
+                    )
                     time.sleep(wait_sec)
                     continue
                 resp.raise_for_status()
                 return resp.json()
             except httpx.HTTPStatusError as e:
-                if e.response.status_code == 429 and attempt < max_retries:
-                    wait_sec = attempt * 2.0
-                    logger.warning(f"Hyperliquid API rate-limited (429). Retrying in {wait_sec:.1f}s...")
+                if (e.response.status_code == 429 or 500 <= e.response.status_code <= 599) and attempt < max_retries:
+                    wait_sec = self._info_retry_delay(attempt)
+                    logger.warning(f"Hyperliquid /info HTTP {e.response.status_code}; retrying in {wait_sec:.1f}s...")
                     time.sleep(wait_sec)
                     continue
                 logger.error(f"OutcomeClient.post_info_sync error for {payload.get('type')}: {e}")
@@ -152,7 +163,7 @@ class OutcomeClient:
                 if attempt == max_retries:
                     logger.error(f"OutcomeClient.post_info_sync error for {payload.get('type')}: {e}")
                     raise
-                time.sleep(1.0 * attempt)
+                time.sleep(self._info_retry_delay(attempt))
 
     async def get_outcome_meta(self, ttl_sec: float = 15.0) -> Dict[str, Any]:
         """Fetch outcome markets metadata with short TTL caching."""
@@ -237,6 +248,11 @@ class OutcomeClient:
         target_user = (user or self.wallet_address).lower()
         return await self.post_info({"type": "spotClearinghouseState", "user": target_user})
 
+    def get_spot_clearinghouse_state_sync(self, user: Optional[str] = None) -> Dict[str, Any]:
+        """Synchronously fetch user spot balances, including HIP-4 outcome tokens."""
+        target_user = (user or self.wallet_address).lower()
+        return self.post_info_sync({"type": "spotClearinghouseState", "user": target_user})
+
     async def get_user_outcome(self, outcome_id: int, user: Optional[str] = None) -> Dict[str, Any]:
         """Fetch user positions/tokens for a specific outcome market."""
         target_user = (user or self.wallet_address).lower()
@@ -251,10 +267,20 @@ class OutcomeClient:
         target_user = (user or self.wallet_address).lower()
         return await self.post_info({"type": "frontendOpenOrders", "user": target_user})
 
+    def get_open_orders_sync(self, user: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Synchronously fetch active frontend orders; this endpoint is read-only."""
+        target_user = (user or self.wallet_address).lower()
+        return self.post_info_sync({"type": "frontendOpenOrders", "user": target_user})
+
     async def get_user_fills(self, user: Optional[str] = None) -> List[Dict[str, Any]]:
         """Fetch recent user trade fills."""
         target_user = (user or self.wallet_address).lower()
         return await self.post_info({"type": "userFills", "user": target_user})
+
+    def get_user_fills_sync(self, user: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Synchronously fetch recent user fills; this endpoint is read-only."""
+        target_user = (user or self.wallet_address).lower()
+        return self.post_info_sync({"type": "userFills", "user": target_user})
 
     # --------------------------------------------------------------------------
     # REST /exchange Endpoints
@@ -262,6 +288,7 @@ class OutcomeClient:
 
     async def post_exchange(self, action: Dict[str, Any], vault_address: Optional[str] = None) -> Any:
         """Sign and submit an L1 exchange action."""
+        self.auth.require_agent_authorized()
         signed_payload = self.auth.sign_l1_action(action=action, vault_address=vault_address)
         client = await self.get_async_client()
         try:
@@ -275,6 +302,7 @@ class OutcomeClient:
 
     def post_exchange_sync(self, action: Dict[str, Any], vault_address: Optional[str] = None) -> Any:
         """Synchronously sign and submit an L1 exchange action."""
+        self.auth.require_agent_authorized()
         signed_payload = self.auth.sign_l1_action(action=action, vault_address=vault_address)
         client = self.get_sync_client()
         try:
@@ -297,18 +325,25 @@ class OutcomeClient:
         reduce_only: bool = False,
         cloid: Optional[str] = None,
         vault_address: Optional[str] = None,
+        sz_decimals: int = 1,
     ) -> Dict[str, Any]:
         """
         Submit an outcome order to Hyperliquid L1.
         """
         asset_id = outcome_asset_id(outcome_id, side_index)
         aligned_price = align_outcome_price(price)
-        aligned_size = align_outcome_size(size)
+        aligned_size = align_outcome_size(size, sz_decimals=sz_decimals)
         order_cloid = cloid or generate_cloid()
 
-        tif_str = "Alo" if order_type.upper() in ("ALO", "POST_ONLY", "POSTONLY") else (
-            "Ioc" if order_type.upper() == "IOC" else "Gtc"
-        )
+        normalized_type = order_type.upper()
+        if normalized_type in ("ALO", "POST_ONLY", "POSTONLY"):
+            tif_str = "Alo"
+        elif normalized_type in ("IOC", "FOK", "FAK"):
+            tif_str = "Ioc"
+        elif normalized_type in ("GTC", "GTD"):
+            tif_str = "Gtc"
+        else:
+            raise ValueError(f"Unsupported Outcome time-in-force: {order_type!r}")
 
         order_wire = {
             "a": asset_id,
@@ -331,8 +366,10 @@ class OutcomeClient:
         }
 
         result = await self.post_exchange(action=action, vault_address=vault_address)
+        normalized = self.normalize_order_result(result)
         return {
             "result": result,
+            **normalized,
             "cloid": order_cloid,
             "asset_id": asset_id,
             "price": aligned_price,
@@ -340,6 +377,30 @@ class OutcomeClient:
             "is_buy": is_buy,
             "side_index": side_index,
             "outcome_id": outcome_id,
+        }
+
+    @staticmethod
+    def normalize_order_result(result: Any) -> Dict[str, Any]:
+        """Expose the SDK-style success/status/error contract for raw API replies."""
+        if not isinstance(result, dict):
+            return {"success": False, "status": None, "order_id": None, "shares": None, "error": "invalid exchange response"}
+        statuses = result.get("response", {}).get("data", {}).get("statuses", [])
+        if not statuses or not isinstance(statuses[0], dict):
+            return {"success": False, "status": None, "order_id": None, "shares": None, "error": str(result.get("error") or "missing order status")}
+        status = statuses[0]
+        if "error" in status:
+            return {"success": False, "status": None, "order_id": None, "shares": None, "error": str(status["error"])}
+        resting = status.get("resting")
+        filled = status.get("filled")
+        detail = resting or filled
+        if not isinstance(detail, dict):
+            return {"success": False, "status": None, "order_id": None, "shares": None, "error": "unrecognized order status"}
+        return {
+            "success": True,
+            "status": "resting" if resting else "filled",
+            "order_id": detail.get("oid"),
+            "shares": detail.get("totalSz", detail.get("sz")),
+            "error": None,
         }
 
     async def cancel_order(
@@ -427,6 +488,15 @@ class OutcomeClient:
             self._callbacks[channel] = []
         self._callbacks[channel].append(callback)
 
+    def unregister_callback(self, channel: str, callback: Callable[[Dict[str, Any]], Any]) -> None:
+        """Remove one listener, so a shadow recorder can safely roll markets."""
+        callbacks = self._callbacks.get(channel)
+        if not callbacks:
+            return
+        self._callbacks[channel] = [registered for registered in callbacks if registered != callback]
+        if not self._callbacks[channel]:
+            del self._callbacks[channel]
+
     async def start_ws(self) -> None:
         """Start the WebSocket listener loop in the background."""
         if self._ws_running:
@@ -457,11 +527,41 @@ class OutcomeClient:
         if self._ws and not self._ws.closed:
             await self._ws.send(json.dumps({"method": "subscribe", "subscription": sub}))
 
+    async def unsubscribe_all_mids(self) -> None:
+        await self._unsubscribe("allMids")
+
     async def subscribe_l2_book(self, coin: str) -> None:
         sub = {"type": "l2Book", "coin": coin}
         self._subscriptions[f"l2Book:{coin}"] = sub
         if self._ws and not self._ws.closed:
             await self._ws.send(json.dumps({"method": "subscribe", "subscription": sub}))
+
+    async def unsubscribe_l2_book(self, coin: str) -> None:
+        await self._unsubscribe(f"l2Book:{coin}")
+
+    async def subscribe_trades(self, coin: str) -> None:
+        """Subscribe to public outcome trades for one tradeable side coin."""
+        sub = {"type": "trades", "coin": coin}
+        self._subscriptions[f"trades:{coin}"] = sub
+        if self._ws and not self._ws.closed:
+            await self._ws.send(json.dumps({"method": "subscribe", "subscription": sub}))
+
+    async def unsubscribe_trades(self, coin: str) -> None:
+        await self._unsubscribe(f"trades:{coin}")
+
+    async def _unsubscribe(self, key: str) -> None:
+        sub = self._subscriptions.pop(key, None)
+        if sub and self._ws and not self._ws.closed:
+            await self._ws.send(json.dumps({"method": "unsubscribe", "subscription": sub}))
+
+    def _dispatch_callback(self, channel: str, data: Dict[str, Any]) -> None:
+        for cb in self._callbacks.get(channel, []):
+            try:
+                result = cb(data)
+                if asyncio.iscoroutine(result):
+                    asyncio.create_task(result)
+            except Exception as cb_err:
+                logger.error(f"Error in WS callback for {channel}: {cb_err}")
 
     async def subscribe_user_events(self, user: Optional[str] = None) -> None:
         target_user = (user or self.wallet_address).lower()
@@ -471,11 +571,14 @@ class OutcomeClient:
             await self._ws.send(json.dumps({"method": "subscribe", "subscription": sub}))
 
     async def _ws_loop(self) -> None:
+        reconnect_attempt = 0
         while self._ws_running:
             try:
                 async with websockets.connect(self.ws_url, ping_interval=20, ping_timeout=10) as ws:
                     self._ws = ws
+                    reconnect_attempt = 0
                     logger.info(f"OutcomeClient connected to WebSocket: {self.ws_url}")
+                    self._dispatch_callback("__lifecycle__", {"event": "connected", "received_at_ms": int(time.time() * 1000)})
                     # Resubscribe to all active topics
                     for sub in self._subscriptions.values():
                         await ws.send(json.dumps({"method": "subscribe", "subscription": sub}))
@@ -484,16 +587,27 @@ class OutcomeClient:
                         message = await ws.recv()
                         data = json.loads(message)
                         channel = data.get("channel")
-                        if channel in self._callbacks:
-                            for cb in self._callbacks[channel]:
-                                try:
-                                    res = cb(data)
-                                    if asyncio.iscoroutine(res):
-                                        asyncio.create_task(res)
-                                except Exception as cb_err:
-                                    logger.error(f"Error in WS callback for {channel}: {cb_err}")
+                        if channel:
+                            self._dispatch_callback(channel, data)
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.warning(f"OutcomeClient WebSocket disconnected ({e}), reconnecting in 2s...")
-                await asyncio.sleep(2.0)
+                if not self._ws_running:
+                    break
+                self._dispatch_callback("__lifecycle__", {
+                    "event": "disconnected", "received_at_ms": int(time.time() * 1000), "error": str(e),
+                })
+                reconnect_attempt += 1
+                if reconnect_attempt > 10:
+                    self._dispatch_callback("__lifecycle__", {
+                        "event": "reconnect_exhausted", "received_at_ms": int(time.time() * 1000),
+                        "error": str(e),
+                    })
+                    self._ws_running = False
+                    break
+                delay_sec = min(30.0, float(2 ** (reconnect_attempt - 1)))
+                logger.warning(
+                    f"OutcomeClient WebSocket disconnected ({e}), reconnecting in {delay_sec:.0f}s "
+                    f"(attempt {reconnect_attempt}/10)..."
+                )
+                await asyncio.sleep(delay_sec)

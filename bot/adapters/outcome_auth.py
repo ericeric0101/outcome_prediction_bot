@@ -80,26 +80,22 @@ def parse_outcome_asset_id(asset_id: int) -> Tuple[int, int]:
 
 def align_outcome_price(price: Union[float, Decimal, str], max_sig_figs: int = 5) -> str:
     """
-    Align price to Hyperliquid Outcome tick constraints:
-    - Must be between 0.0001 and 0.9999 inclusive.
-    - Aligns to max 5 significant figures and tick size 0.0001 (4 decimal places).
+    Align a HIP-4 price to the SDK's five-significant-figure rule.
+
+    This deliberately uses ``Decimal`` end-to-end.  Outcome's SDK accepts
+    prices down to the FrontendMarket extreme of 0.00001, so a fixed four
+    decimal-place tick would silently corrupt valid low-probability quotes.
     """
     p = Decimal(str(price))
-    p = max(Decimal("0.0001"), min(Decimal("0.9999"), p))
-    # Round to 4 decimal places (0.0001 tick size)
-    p_rounded = p.quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
-    
-    # Format to string, stripping trailing zeros if after decimal point up to 4 places
-    formatted = f"{float(p_rounded):.4f}".rstrip("0").rstrip(".")
-    if "." not in formatted:
-        formatted += ".0"
-    # Ensure precision is at least 0.0001 format if needed
-    float_val = float(formatted)
-    if float_val < 0.0001:
-        return "0.0001"
-    if float_val > 0.9999:
-        return "0.9999"
-    return str(float_val)
+    if not p.is_finite() or p <= 0 or p >= 1:
+        raise ValueError("Outcome price must be strictly between 0 and 1")
+    minimum, maximum = Decimal("0.00001"), Decimal("0.99999")
+    p = max(minimum, min(maximum, p))
+    decimal_places = max(0, max_sig_figs - 1 - p.adjusted())
+    quantum = Decimal(1).scaleb(-decimal_places)
+    rounded = p.quantize(quantum, rounding=ROUND_HALF_UP)
+    rounded = max(minimum, min(maximum, rounded))
+    return format(rounded.normalize(), "f")
 
 
 def align_outcome_size(size: Union[float, Decimal, str], sz_decimals: int = 1) -> str:
@@ -113,7 +109,7 @@ def align_outcome_size(size: Union[float, Decimal, str], sz_decimals: int = 1) -
         return str(int(s.to_integral_value(rounding=ROUND_HALF_UP)))
     fmt = "0." + "0" * sz_decimals
     s_rounded = s.quantize(Decimal(fmt), rounding=ROUND_HALF_UP)
-    return str(float(s_rounded))
+    return format(s_rounded, "f")
 
 
 def generate_cloid() -> str:
@@ -205,10 +201,30 @@ class OutcomeAuth:
                 self._is_transient_agent = True
 
         self.agent_address = self.agent_account.address.lower()
+        # A key being present is not proof of the one-time on-chain approval
+        # required by HIP-4.  Execution remains blocked until an integration
+        # explicitly records successful external approval verification.
+        self._agent_authorized = False
 
     @property
     def is_transient_agent(self) -> bool:
         return self._is_transient_agent
+
+    @property
+    def agent_authorized(self) -> bool:
+        return self._agent_authorized
+
+    def mark_agent_authorized_after_verification(self) -> None:
+        """Enable signing only after the approved agent was independently verified."""
+        if self.is_transient_agent:
+            raise RuntimeError("A transient agent key cannot be marked authorized")
+        self._agent_authorized = True
+
+    def require_agent_authorized(self) -> None:
+        if not self._agent_authorized:
+            raise RuntimeError(
+                "Outcome agent authorization is unverified; complete and verify HIP-4 agent approval first"
+            )
 
     def create_agent_approval_payload(
         self,

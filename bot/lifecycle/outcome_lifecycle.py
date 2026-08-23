@@ -45,6 +45,8 @@ class OutcomeMarketSpec:
     raw_spec: str
     sz_decimals: int = 1
     max_leverage: int = 1
+    side_names: tuple[str, str] = ("Yes", "No")
+    raw_meta: Optional[Dict[str, Any]] = None
 
     @property
     def strike(self) -> Decimal:
@@ -57,6 +59,11 @@ class OutcomeMarketSpec:
 
     def is_expired(self, current_timestamp: Optional[int] = None) -> bool:
         return self.time_to_expiry_sec(current_timestamp) <= 0.0
+
+    def side_name(self, side_index: int) -> str:
+        if side_index not in (0, 1):
+            raise ValueError("side_index must be 0 or 1")
+        return self.side_names[side_index]
 
 
 def parse_expiry_string_to_timestamp(expiry_str: str) -> int:
@@ -161,6 +168,15 @@ def parse_outcome_market_spec(universe_item: Dict[str, Any]) -> Optional[Outcome
     start_ts = expiry_ts - period_seconds
     sz_decimals = int(universe_item.get("szDecimals", 1))
     max_leverage = int(universe_item.get("maxLeverage", 1))
+    side_specs = universe_item.get("sideSpecs") or []
+    parsed_side_names = tuple(
+        str(item.get("name", "")).strip() for item in side_specs if isinstance(item, dict)
+    )
+    side_names: tuple[str, str] = (
+        (parsed_side_names[0], parsed_side_names[1])
+        if len(parsed_side_names) == 2 and all(parsed_side_names)
+        else ("Yes", "No")
+    )
 
     coin_name = f"@{outcome_id}"
     yes_coin = f"#{outcome_id}0"
@@ -185,6 +201,8 @@ def parse_outcome_market_spec(universe_item: Dict[str, Any]) -> Optional[Outcome
         raw_spec=spec_text,
         sz_decimals=sz_decimals,
         max_leverage=max_leverage,
+        side_names=side_names,
+        raw_meta=dict(universe_item),
     )
 
 

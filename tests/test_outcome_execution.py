@@ -104,7 +104,7 @@ async def test_submit_recovery_ladder(mock_execution_adapter):
     assert order2.is_urgent is True
 
 
-def test_compute_settlement(mock_execution_adapter):
+def test_compute_settlement_rejects_unverified_mark_inference(mock_execution_adapter):
     adapter = mock_execution_adapter
     market_spec = OutcomeMarketSpec(
         outcome_id=516,
@@ -123,30 +123,11 @@ def test_compute_settlement(mock_execution_adapter):
         raw_spec="",
     )
 
-    # Case 1: Final mark = 78250 >= strike (78213) -> UP wins
-    # We held UP (side 0) with 25 shares, cost 11.25 USDC (avg 0.45)
-    s_win = adapter.compute_settlement(
+    with pytest.raises(RuntimeError, match="inference is disabled"):
+        adapter.compute_settlement(
         market_spec=market_spec,
         settlement_mark_price=Decimal("78250.0"),
         inventory_shares=Decimal("25.0"),
         inventory_cost_usdc=Decimal("11.25"),
         held_side_index=0,
-    )
-    assert s_win["winning_side"] == "UP"
-    assert s_win["is_winner"] is True
-    assert s_win["redeem_value_usdc"] == 25.0
-    assert s_win["settlement_pnl_usdc"] == 13.75  # 25 - 11.25 = +13.75
-
-    # Case 2: Final mark = 78200 < strike (78213) -> DOWN wins
-    # We held UP (side 0) -> LOSS
-    s_loss = adapter.compute_settlement(
-        market_spec=market_spec,
-        settlement_mark_price=Decimal("78200.0"),
-        inventory_shares=Decimal("25.0"),
-        inventory_cost_usdc=Decimal("11.25"),
-        held_side_index=0,
-    )
-    assert s_loss["winning_side"] == "DOWN"
-    assert s_loss["is_winner"] is False
-    assert s_loss["redeem_value_usdc"] == 0.0
-    assert s_loss["settlement_pnl_usdc"] == -11.25
+        )

@@ -60,6 +60,54 @@ Simulate live signal generation, orderbook drift, and order lifecycle without su
 ./.venv/bin/python bot/launcher.py --venue hyperliquid
 ```
 
+### Read-Only Outcome Shadow Collection
+The supported pre-live collection path. It reads Outcome market/account endpoints,
+feeds the existing position and exit-risk components, and records
+`OUTCOME_SHADOW_CYCLE` telemetry in SQLite. It does not import an execution
+adapter, sign an action, simulate a fill, or call `/exchange`.
+Each cycle journals the raw two-sided book snapshot plus ForecastState fair
+probabilities, SignalEngine diagnostics, proposed side, entry eligibility, and
+existing exit-risk decisions for later research/backtesting.
+
+```bash
+# One connectivity and journal smoke test
+./.venv/bin/python scripts/outcome_shadow.py --cycles 1
+
+# Continuous collection; stop safely with Ctrl-C
+./.venv/bin/python scripts/outcome_shadow.py --interval-sec 5
+
+# P0 + P1: also retain raw market specs and read-only L2/mid/trade stream evidence
+./.venv/bin/python scripts/outcome_shadow.py --interval-sec 5 --ws \
+  --journal-path logs/outcome_shadow.db
+```
+
+`--ws` never submits an order: it only subscribes to public market data. On
+every WebSocket reconnect, the next REST cycle records an
+`OUTCOME_WS_REST_RESYNC` event after refreshing mids and both books. Check the
+collection in a second terminal:
+
+```bash
+sqlite3 logs/outcome_shadow.db "select event_type, count(*) from strategy_events where event_type like 'OUTCOME_%' group by event_type order by event_type;"
+```
+
+P4 is deliberately non-live. It can only report missing evidence and write an
+audit event; it imports no exchange client:
+
+```bash
+./.venv/bin/python scripts/outcome_canary_preflight.py --db logs/outcome_shadow.db --record
+```
+
+### Outcome Shadow Dashboard
+With the collector running, open a second terminal and view its SQLite
+telemetry. Use the same journal path passed to the collector.
+
+```bash
+./.venv/bin/python scripts/outcome_shadow_dashboard.py --db logs/outcome_shadow.db
+```
+
+Use `--once` for a static snapshot. The dashboard is read-only and lets you
+compare BTC mark, strike, and YES/NO bid-ask directly against Outcome's UI.
+
 ### Live Trading
 Start live trading on Hyperliquid Outcome (interactive confirmation required):
 ```bash

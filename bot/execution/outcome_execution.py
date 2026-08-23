@@ -104,7 +104,9 @@ class OutcomeExecutionAdapter:
             vault_address=vault_address,
         )
 
-        venue_oid = None
+        if not resp.get("success"):
+            return {"success": False, "error": resp.get("error"), "response": resp, "cloid": order_cloid}
+        venue_oid = resp.get("order_id")
         statuses = (
             resp.get("result", {})
             .get("response", {})
@@ -127,9 +129,11 @@ class OutcomeExecutionAdapter:
             venue_oid=venue_oid,
             created_at=time.time(),
         )
-        self._active_orders[order_cloid] = active_order
+        if resp.get("status") == "resting":
+            self._active_orders[order_cloid] = active_order
 
         return {
+            "success": True,
             "cloid": order_cloid,
             "venue_oid": venue_oid,
             "outcome_id": outcome_id,
@@ -167,7 +171,9 @@ class OutcomeExecutionAdapter:
             vault_address=vault_address,
         )
 
-        venue_oid = None
+        if not resp.get("success"):
+            return {"success": False, "error": resp.get("error"), "response": resp, "cloid": order_cloid}
+        venue_oid = resp.get("order_id")
         statuses = (
             resp.get("result", {})
             .get("response", {})
@@ -191,9 +197,11 @@ class OutcomeExecutionAdapter:
             created_at=time.time(),
             is_exit=True,
         )
-        self._active_orders[order_cloid] = active_order
+        if resp.get("status") == "resting":
+            self._active_orders[order_cloid] = active_order
 
         return {
+            "success": True,
             "cloid": order_cloid,
             "venue_oid": venue_oid,
             "outcome_id": outcome_id,
@@ -235,7 +243,9 @@ class OutcomeExecutionAdapter:
             vault_address=vault_address,
         )
 
-        venue_oid = None
+        if not resp.get("success"):
+            return {"success": False, "error": resp.get("error"), "response": resp, "cloid": order_cloid}
+        venue_oid = resp.get("order_id")
         statuses = (
             resp.get("result", {})
             .get("response", {})
@@ -261,9 +271,11 @@ class OutcomeExecutionAdapter:
             is_recovery=True,
             is_urgent=is_ioc,
         )
-        self._active_orders[order_cloid] = active_order
+        if resp.get("status") == "resting":
+            self._active_orders[order_cloid] = active_order
 
         return {
+            "success": True,
             "cloid": order_cloid,
             "venue_oid": venue_oid,
             "outcome_id": outcome_id,
@@ -315,36 +327,6 @@ class OutcomeExecutionAdapter:
         inventory_cost_usdc: Decimal | float,
         held_side_index: int = 0,  # 0 = UP / YES, 1 = DOWN / NO
     ) -> Dict[str, Any]:
-        """
-        Reconcile Hyperliquid native settlement for Outcome.
-        Payout:
-          If mark_price >= strike: Side 0 (YES / UP) wins -> 1 USDC payout per share.
-          If mark_price < strike: Side 1 (NO / DOWN) wins -> 1 USDC payout per share.
-        """
-        mark = Decimal(str(settlement_mark_price))
-        strike = market_spec.strike
-        inv = Decimal(str(inventory_shares))
-        cost = Decimal(str(inventory_cost_usdc))
-
-        winning_side = "UP" if mark >= strike else "DOWN"
-        held_side_str = "UP" if held_side_index == 0 else "DOWN"
-        is_winner = (held_side_str == winning_side)
-
-        redeem_per_share = Decimal("1.0") if is_winner else Decimal("0.0")
-        redeem_value_usdc = inv * redeem_per_share
-        settlement_pnl_usdc = redeem_value_usdc - cost
-
-        return {
-            "outcome_id": market_spec.outcome_id,
-            "coin_name": market_spec.coin_name,
-            "strike": float(strike),
-            "settlement_mark_price": float(mark),
-            "winning_side": winning_side,
-            "held_side": held_side_str,
-            "is_winner": is_winner,
-            "inventory_shares": float(inv),
-            "inventory_cost_usdc": float(cost),
-            "redeem_per_share": float(redeem_per_share),
-            "redeem_value_usdc": float(redeem_value_usdc),
-            "settlement_pnl_usdc": float(settlement_pnl_usdc),
-        }
+        raise RuntimeError(
+            "Outcome settlement inference is disabled: pass official resolution evidence through the settlement bridge instead."
+        )

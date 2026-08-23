@@ -32,6 +32,12 @@ def test_outcome_asset_id_calculation():
         outcome_asset_id(-1, 0)
 
 
+def test_outcome_price_alignment_uses_five_significant_figures_without_float_loss():
+    assert align_outcome_price("0.550012") == "0.55001"
+    assert align_outcome_price("0.000012345") == "0.000012345"
+    assert align_outcome_price("0.999999") == "0.99999"
+
+
 def test_parse_outcome_asset_id():
     assert parse_outcome_asset_id(100005160) == (516, 0)
     assert parse_outcome_asset_id(100005161) == (516, 1)
@@ -43,16 +49,17 @@ def test_parse_outcome_asset_id():
 
 
 def test_align_outcome_price():
-    # Bound clamping
-    assert align_outcome_price(0.00001) == "0.0001"
-    assert align_outcome_price(1.5) == "0.9999"
+    # Supported FrontendMarket boundary and invalid price rejection.
+    assert align_outcome_price(0.00001) == "0.00001"
+    with pytest.raises(ValueError):
+        align_outcome_price(1.5)
     assert align_outcome_price(0.0001) == "0.0001"
     assert align_outcome_price(0.9999) == "0.9999"
 
     # Tick precision
     assert align_outcome_price("0.45") == "0.45"
     assert align_outcome_price(Decimal("0.4500")) == "0.45"
-    assert align_outcome_price(0.45123) == "0.4512"
+    assert align_outcome_price(0.45123) == "0.45123"
     assert align_outcome_price("0.5000") == "0.5"
 
 
@@ -71,6 +78,16 @@ def test_generate_cloid():
     assert c1.startswith("0x")
     assert len(c1) == 34  # '0x' + 32 hex chars = 128 bits
     assert c1 != c2
+
+
+def test_agent_authorization_requires_explicit_post_approval_verification():
+    eoa = Account.create()
+    agent = Account.create()
+    auth = OutcomeAuth(eoa.address, private_key=eoa.key.hex(), agent_private_key=agent.key.hex())
+    with pytest.raises(RuntimeError, match="unverified"):
+        auth.require_agent_authorized()
+    auth.mark_agent_authorized_after_verification()
+    auth.require_agent_authorized()
 
 
 def test_outcome_auth_signing():

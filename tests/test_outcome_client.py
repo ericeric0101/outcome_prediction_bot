@@ -9,6 +9,26 @@ from bot.adapters.outcome_auth import OutcomeAuth
 from bot.adapters.outcome_client import OutcomeClient
 
 
+def test_sync_info_retries_transient_502_then_returns_payload(monkeypatch):
+    auth = OutcomeAuth(wallet_address="0x" + "a" * 40, is_testnet=True)
+    client = OutcomeClient(auth)
+    request = httpx.Request("POST", "https://example.test/info")
+    responses = [
+        httpx.Response(502, request=request),
+        httpx.Response(200, json={"outcomes": []}, request=request),
+    ]
+
+    class FakeSyncClient:
+        is_closed = False
+        def post(self, *_args, **_kwargs):
+            return responses.pop(0)
+
+    monkeypatch.setattr(client, "get_sync_client", lambda: FakeSyncClient())
+    monkeypatch.setattr("bot.adapters.outcome_client.time.sleep", lambda _seconds: None)
+    assert client.post_info_sync({"type": "outcomeMeta"}) == {"outcomes": []}
+    assert responses == []
+
+
 @pytest.mark.anyio
 async def test_outcome_client_mock_requests(monkeypatch):
     test_eoa = Account.create()
@@ -84,6 +104,8 @@ async def test_outcome_client_mock_requests(monkeypatch):
     assert res["size"] == "25.0"
     assert res["is_buy"] is True
     assert res["result"]["status"] == "ok"
+    assert res["success"] is True
+    assert res["status"] == "resting"
 
     # Test split & merge
     split_res = await client.split_outcome(outcome_id=516, amount=50)
