@@ -90,19 +90,21 @@ collection in a second terminal:
 sqlite3 logs/outcome_shadow.db "select event_type, count(*) from strategy_events where event_type like 'OUTCOME_%' group by event_type order by event_type;"
 ```
 
-P4 is deliberately non-live. It can only report missing evidence and write an
-audit event; it imports no exchange client:
+P4 strategy activation remains deliberately non-live. The preflight reports
+missing evidence and writes an audit event; it does not activate execution:
 
 ```bash
 ./.venv/bin/python scripts/outcome_canary_preflight.py --db logs/outcome_shadow.db --record
 ```
 
-### Official SDK sidecar (P4 preparation only)
+### Official SDK sidecar
 
 The Python strategy remains the source of decisions. `outcome_sdk_sidecar/` is
-an isolated JSON-lines boundary around the official TypeScript SDK, currently
-limited to `health` and typed `fetch_markets`. Auth, order, and cancel commands
-are hard-disabled until a separately approved P4 implementation.
+an isolated JSON-lines boundary around the official TypeScript SDK. It exposes
+typed market discovery plus formal limit-order and cancel operations. Execution
+requires both `allow_execution=True` in Python and the explicit operator
+environment gate `OUTCOME_SDK_EXECUTION_ENABLED=1`; cancelling additionally
+verifies that the target is an open order owned by the configured wallet.
 
 ```bash
 cd outcome_sdk_sidecar
@@ -110,6 +112,27 @@ npm install
 npm run build
 npm run health
 ```
+
+### One bounded maker cycle
+
+The formal runner obtains the current first bid, posts an integer-share ALO
+buy that meets the 10 USDC minimum, then only after an account-confirmed fill
+cancels any remainder and posts the acquired shares at the then-current first
+ask with ALO. It never takes liquidity or sells without confirmed inventory.
+Both execution gates must be set explicitly by the operator.
+
+```bash
+OUTCOME_MAKER_CYCLE_ENABLED=1 OUTCOME_SDK_EXECUTION_ENABLED=1 \
+  ./.venv/bin/python -m bot.outcome_maker_cycle \
+  --market-id 1153 --outcome '#11530' --timeout-sec 900
+```
+
+It prints an immediate monitoring status and a periodic update every 30
+seconds. `Ctrl+C` stops monitoring cleanly and intentionally does **not**
+cancel a live order; reconcile or cancel that order explicitly.
+
+On restart, an already-held position with a covering ALO sell is reported as
+protected and the runner exits without placing another order.
 
 ### Outcome Shadow Dashboard
 With the collector running, open a second terminal and view its SQLite

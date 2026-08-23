@@ -139,7 +139,7 @@ class OutcomePricingState:
 def compute_min_shares_for_notional(
     price: Decimal | float | str,
     min_notional_usdc: Decimal = DEFAULT_MIN_NOTIONAL_USDC,
-    sz_decimals: int = 1,
+    sz_decimals: int = 0,
 ) -> Decimal:
     """
     Compute the minimum number of shares required to meet the min notional constraint.
@@ -177,7 +177,7 @@ def estimate_outcome_economics(
 
     # Determine shares: ensure notional is at least min_notional_usdc
     target_notional = max(quote_size_usdc, min_notional_usdc)
-    shares = compute_min_shares_for_notional(p, target_notional, sz_decimals=1)
+    shares = compute_min_shares_for_notional(p, target_notional, sz_decimals=0)
 
     # Expected spread capture
     spread_capture = shares * p * half_spread

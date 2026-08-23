@@ -1,7 +1,9 @@
-"""Constrained Python client for the isolated official-SDK sidecar.
+"""Python boundary for the official Outcome TypeScript SDK sidecar.
 
-The allowed command set intentionally contains no trading command while P4 is
-hard-disabled.  This module never receives private keys.
+Execution is disabled by default twice: callers must opt in with
+``allow_execution=True`` and the operator must set
+``OUTCOME_SDK_EXECUTION_ENABLED=1`` for the sidecar process. Private keys
+remain exclusively in the sidecar environment.
 """
 from __future__ import annotations
 
@@ -9,27 +11,40 @@ import json
 import subprocess
 import uuid
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Mapping
 
 
 class OutcomeSdkSidecarError(RuntimeError):
     pass
 
 
-ReadOnlyCommand = Literal["health", "fetch_markets"]
+ReadOnlyCommand = Literal["health", "fetch_markets", "fetch_order_book"]
+ExecutionCommand = Literal["place_limit_order", "cancel_order"]
+SidecarCommand = ReadOnlyCommand | ExecutionCommand
 
 
 class OutcomeSdkSidecarClient:
     def __init__(self, sidecar_dir: str | Path = "outcome_sdk_sidecar") -> None:
         self.sidecar_dir = Path(sidecar_dir).resolve()
 
-    def request(self, command: ReadOnlyCommand, *, testnet: bool = False) -> Any:
-        if command not in {"health", "fetch_markets"}:
-            raise OutcomeSdkSidecarError(f"P4 hard-disabled command: {command}")
+    def request(
+        self,
+        command: SidecarCommand,
+        *,
+        testnet: bool = False,
+        payload: Mapping[str, str] | None = None,
+        allow_execution: bool = False,
+    ) -> Any:
+        if command in {"place_limit_order", "cancel_order"} and not allow_execution:
+            raise OutcomeSdkSidecarError("execution requires explicit allow_execution=True")
+        if command not in {"health", "fetch_markets", "fetch_order_book", "place_limit_order", "cancel_order"}:
+            raise OutcomeSdkSidecarError(f"unsupported sidecar command: {command}")
         script = self.sidecar_dir / "dist" / "main.js"
         if not script.exists():
             raise OutcomeSdkSidecarError("SDK sidecar is not built; run `npm install` then `npm run build`")
-        request = {"id": uuid.uuid4().hex, "command": command, "testnet": testnet}
+        request: dict[str, Any] = {"id": uuid.uuid4().hex, "command": command, "testnet": testnet}
+        if payload is not None:
+            request["payload"] = dict(payload)
         completed = subprocess.run(
             ["node", str(script)], input=json.dumps(request) + "\n", text=True,
             capture_output=True, cwd=self.sidecar_dir, check=False, timeout=30,

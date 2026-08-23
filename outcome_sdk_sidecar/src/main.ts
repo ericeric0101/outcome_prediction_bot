@@ -1,184 +1,115 @@
-/*
- * JSON-lines process boundary for the official Outcome TypeScript SDK.
- *
- * P4 safety: the sidecar deliberately exposes only read-only commands today.
- * Order/cancel requests receive a deterministic rejection without initialising
- * an agent key or calling the trading adapter.
- */
+/* JSON-lines boundary for the official Outcome HIP-4 TypeScript SDK. */
 import { createHIP4Adapter } from "@outcome.xyz/hip4";
 import type { DefaultBinaryMarket } from "@outcome.xyz/hip4";
 import { privateKeyToAccount } from "viem/accounts";
 import { createInterface } from "node:readline";
 
-type Request = {
-  id: string;
-  command:
-    | "health"
-    | "fetch_markets"
-    | "auth_status"
-    | "place_limit_order"
-    | "cancel_order"
-    | "canary_preflight"
-    | "canary_limit_buy";
-  testnet?: boolean;
-  payload?: Record<string, unknown>;
-};
+type Command = "health" | "fetch_markets" | "fetch_order_book" | "place_limit_order" | "cancel_order";
+type Request = { id: string; command: Command; testnet?: boolean; payload?: Record<string, unknown> };
+type Response = { id: string; ok: boolean; result?: unknown; error?: { code: string; message: string } };
+type LimitOrderPayload = { marketId: string; outcome: string; side: "buy" | "sell"; price: string; amount: string; timeInForce?: "GTC" | "GTD" | "FOK" | "FAK" | "ALO" };
+type CancelPayload = { marketId: string; outcome: string; orderId: string };
 
-type Response = {
-  id: string;
-  ok: boolean;
-  result?: unknown;
-  error?: { code: string; message: string };
-};
-
-const EXECUTION_DISABLED_MESSAGE =
-  "P4 canary is hard-disabled: this sidecar cannot initialize auth, place orders, or cancel orders.";
-
-const ONE_SHOT_CANARY = {
-  marketId: "1153",
-  outcome: "#11530",
-  side: "buy" as const,
-  price: "0.60",
-  // One-shot user-authorised precision canary: $0.60 × 16.666667 ≈ $10.
-  amount: "16.666667",
-  timeInForce: "ALO" as const,
-};
-
-function requireMainnet(request: Request): void {
-  if (request.testnet === true) throw new Error("This one-shot canary is mainnet-only");
-}
-
-function canaryEnabled(): boolean {
-  return process.env.OUTCOME_SIDECAR_CANARY_EXECUTION === "1";
-}
-
-function requireExactCanaryPayload(payload: Record<string, unknown> | undefined): void {
-  for (const [key, expected] of Object.entries(ONE_SHOT_CANARY)) {
-    if (payload?.[key] !== expected) throw new Error(`canary payload ${key} must be ${expected}`);
-  }
-}
-
-async function getCanaryPreflight(hip4: ReturnType<typeof createHIP4Adapter>): Promise<{
-  market: DefaultBinaryMarket;
-  bestAsk: number;
-}> {
-  const markets = (await hip4.events.fetchMarkets({ type: "defaultBinary" })) as DefaultBinaryMarket[];
-  const market = markets.find((candidate) => candidate.outcomeId === Number(ONE_SHOT_CANARY.marketId));
-  if (!market) throw new Error(`Outcome market #${ONE_SHOT_CANARY.marketId} is not active`);
-  if (market.underlying !== "BTC" || market.sides[0]?.coin !== ONE_SHOT_CANARY.outcome) {
-    throw new Error("Outcome market metadata does not match the approved BTC Up canary");
-  }
-  const book = await hip4.marketData.fetchOrderBook(ONE_SHOT_CANARY.marketId, 0);
-  const bestAsk = Number(book.asks[0]?.price);
-  if (!Number.isFinite(bestAsk) || bestAsk <= 0) throw new Error("No valid best ask for BTC Up");
-  if (Number(ONE_SHOT_CANARY.price) >= bestAsk) {
-    throw new Error(`${ONE_SHOT_CANARY.price} is not maker-safe: best ask is ${bestAsk}`);
-  }
-  return { market, bestAsk };
-}
-
-function respond(response: Response): void {
-  process.stdout.write(`${JSON.stringify(response)}\n`);
-}
-
+function respond(response: Response): void { process.stdout.write(`${JSON.stringify(response)}\n`); }
 function parseRequest(line: string): Request {
   const value: unknown = JSON.parse(line);
   if (!value || typeof value !== "object") throw new Error("request must be an object");
   const request = value as Partial<Request>;
-  if (typeof request.id !== "string" || request.id.length === 0) throw new Error("request.id is required");
+  if (typeof request.id !== "string" || !request.id) throw new Error("request.id is required");
   if (typeof request.command !== "string") throw new Error("request.command is required");
   return request as Request;
 }
+function executionEnabled(): boolean { return process.env.OUTCOME_SDK_EXECUTION_ENABLED === "1"; }
+function getWalletAndSigner() {
+  const wallet = process.env.HL_WALLET_ADDRESS;
+  const agentKey = process.env.HL_AGENT_PRIVATE_KEY;
+  const mainKey = process.env.HL_PRIVATE_KEY;
+  if (!wallet || !(agentKey || mainKey)) throw new Error("HL_WALLET_ADDRESS and a signing key are required");
+  const signer = privateKeyToAccount((agentKey || mainKey) as `0x${string}`);
+  if (!agentKey && signer.address.toLowerCase() !== wallet.toLowerCase()) {
+    throw new Error("HL_PRIVATE_KEY does not match HL_WALLET_ADDRESS; configure an approved HL_AGENT_PRIVATE_KEY");
+  }
+  return { wallet, signer };
+}
+function requireString(value: unknown, name: string): string {
+  if (typeof value !== "string" || !value) throw new Error(`${name} is required`);
+  return value;
+}
+function parseLimitPayload(payload: Record<string, unknown> | undefined): LimitOrderPayload {
+  const marketId = requireString(payload?.marketId, "payload.marketId");
+  const outcome = requireString(payload?.outcome, "payload.outcome");
+  const price = requireString(payload?.price, "payload.price");
+  const amount = requireString(payload?.amount, "payload.amount");
+  const side = payload?.side;
+  const timeInForce = payload?.timeInForce ?? "GTC";
+  if (side !== "buy" && side !== "sell") throw new Error("payload.side must be buy or sell");
+  if (!["GTC", "GTD", "FOK", "FAK", "ALO"].includes(String(timeInForce))) throw new Error("invalid timeInForce");
+  if (!/^\d+$/.test(amount) || Number(amount) <= 0) throw new Error("Outcome amount must be a positive integer number of shares");
+  const numericPrice = Number(price);
+  if (!Number.isFinite(numericPrice) || numericPrice <= 0 || numericPrice >= 1) throw new Error("price must be strictly between 0 and 1");
+  if (numericPrice * Number(amount) < 10) throw new Error("order notional must be at least 10 USDC");
+  return { marketId, outcome, side, price, amount, timeInForce: timeInForce as LimitOrderPayload["timeInForce"] };
+}
+function parseCancelPayload(payload: Record<string, unknown> | undefined): CancelPayload {
+  const marketId = requireString(payload?.marketId, "payload.marketId");
+  const outcome = requireString(payload?.outcome, "payload.outcome");
+  const orderId = requireString(payload?.orderId, "payload.orderId");
+  if (!/^\d+$/.test(orderId)) throw new Error("payload.orderId must be numeric");
+  return { marketId, outcome, orderId };
+}
+async function requireMarketSide(hip4: ReturnType<typeof createHIP4Adapter>, marketId: string, outcome: string): Promise<number> {
+  const markets = (await hip4.events.fetchMarkets({ type: "defaultBinary" })) as DefaultBinaryMarket[];
+  const market = markets.find((candidate) => String(candidate.outcomeId) === marketId);
+  if (!market) throw new Error(`active defaultBinary market ${marketId} not found`);
+  const sideIndex = market.sides.findIndex((side) => side.coin === outcome);
+  if (sideIndex < 0) throw new Error(`outcome ${outcome} is not a side of market ${marketId}`);
+  return sideIndex;
+}
+async function requireAloIsMaker(hip4: ReturnType<typeof createHIP4Adapter>, payload: LimitOrderPayload, sideIndex: number): Promise<void> {
+  if (payload.timeInForce !== "ALO") return;
+  const book = await hip4.marketData.fetchOrderBook(payload.marketId, sideIndex);
+  const price = Number(payload.price);
+  const opposing = payload.side === "buy" ? Number(book.asks[0]?.price) : Number(book.bids[0]?.price);
+  if (!Number.isFinite(opposing) || opposing <= 0) throw new Error("no valid opposing best price for ALO validation");
+  if ((payload.side === "buy" && price >= opposing) || (payload.side === "sell" && price <= opposing)) throw new Error(`ALO would cross the book at ${opposing}`);
+}
 
 async function handle(request: Request): Promise<Response> {
-  if (request.command === "health") {
-    return {
-      id: request.id,
-      ok: true,
-      result: { protocol: "outcome-sdk-sidecar/v1", execution: "hard_disabled" },
-    };
-  }
-  if (request.command === "place_limit_order" || request.command === "cancel_order" || request.command === "auth_status") {
-    return {
-      id: request.id,
-      ok: false,
-      error: { code: "P4_HARD_DISABLED", message: EXECUTION_DISABLED_MESSAGE },
-    };
-  }
-  if (request.command !== "fetch_markets" && request.command !== "canary_preflight" && request.command !== "canary_limit_buy") {
-    return { id: request.id, ok: false, error: { code: "UNKNOWN_COMMAND", message: request.command } };
-  }
-  if (request.command === "canary_limit_buy" && !canaryEnabled()) {
-    return { id: request.id, ok: false, error: { code: "CANARY_EXECUTION_NOT_ENABLED", message: "Set OUTCOME_SIDECAR_CANARY_EXECUTION=1 for the approved one-shot canary." } };
-  }
+  if (request.command === "health") return { id: request.id, ok: true, result: { protocol: "outcome-sdk-sidecar/v1", execution: "disabled_by_default" } };
+  if (!(["fetch_markets", "fetch_order_book", "place_limit_order", "cancel_order"] as string[]).includes(request.command)) return { id: request.id, ok: false, error: { code: "UNKNOWN_COMMAND", message: request.command } };
+  if ((request.command === "place_limit_order" || request.command === "cancel_order") && !executionEnabled()) return { id: request.id, ok: false, error: { code: "EXECUTION_DISABLED", message: "Set OUTCOME_SDK_EXECUTION_ENABLED=1 after explicit operator approval." } };
   const hip4 = createHIP4Adapter({ testnet: request.testnet ?? false });
   await hip4.initialize();
-  if (request.command === "canary_preflight") {
-    requireMainnet(request);
-    const { market, bestAsk } = await getCanaryPreflight(hip4);
-    return {
-      id: request.id,
-      ok: true,
-      result: {
-        marketId: market.outcomeId,
-        underlying: market.underlying,
-        outcome: ONE_SHOT_CANARY.outcome,
-        bestAsk: String(bestAsk),
-        approvedPrice: ONE_SHOT_CANARY.price,
-        approvedAmount: ONE_SHOT_CANARY.amount,
-        expectedNotional: "10.0000002",
-        makerSafe: true,
-      },
-    };
+  if (request.command === "fetch_markets") {
+    const markets = (await hip4.events.fetchMarkets({ type: "defaultBinary" })) as DefaultBinaryMarket[];
+    return { id: request.id, ok: true, result: markets.map((market) => ({ outcomeId: market.outcomeId, name: market.name, underlying: market.underlying, targetPrice: market.targetPrice, period: market.period, expiry: market.expiry.toISOString(), sides: market.sides.map((side) => ({ name: side.name, coin: side.coin, asset: side.asset })) })) };
   }
-  if (request.command === "canary_limit_buy") {
-    requireMainnet(request);
-    requireExactCanaryPayload(request.payload);
-    const { bestAsk } = await getCanaryPreflight(hip4);
-    const wallet = process.env.HL_WALLET_ADDRESS;
-    const signerPrivateKey = process.env.HL_AGENT_PRIVATE_KEY || process.env.HL_PRIVATE_KEY;
-    if (!wallet || !signerPrivateKey) throw new Error("HL_WALLET_ADDRESS and a signing key are required");
-    const signer = privateKeyToAccount(signerPrivateKey as `0x${string}`);
-    if (signer.address.toLowerCase() !== wallet.toLowerCase()) {
-      throw new Error("No approved HL_AGENT_PRIVATE_KEY is configured, and HL_PRIVATE_KEY does not match HL_WALLET_ADDRESS");
-    }
-    await hip4.auth.initAuth(wallet, signer);
-    const order = await hip4.trading.placeOrder({ ...ONE_SHOT_CANARY, type: "limit" });
-    return {
-      id: request.id,
-      ok: order.success,
-      result: { ...order, preflight: { bestAsk: String(bestAsk), expectedNotional: "10.0000002", timeInForce: "ALO" } },
-      ...(order.success ? {} : { error: { code: "ORDER_REJECTED", message: order.error ?? "Outcome rejected order" } }),
-    };
+  if (request.command === "fetch_order_book") {
+    const marketId = requireString(request.payload?.marketId, "payload.marketId");
+    const outcome = requireString(request.payload?.outcome, "payload.outcome");
+    const sideIndex = await requireMarketSide(hip4, marketId, outcome);
+    const book = await hip4.marketData.fetchOrderBook(marketId, sideIndex);
+    return { id: request.id, ok: true, result: { marketId, outcome, bids: book.bids, asks: book.asks, timestamp: book.timestamp } };
   }
-  const markets = (await hip4.events.fetchMarkets({ type: "defaultBinary" })) as DefaultBinaryMarket[];
-  // Do not return the full raw object across the Python boundary.  Preserve
-  // only typed discovery fields required by the strategy research layer.
-  return {
-    id: request.id,
-    ok: true,
-    result: markets.map((market) => ({
-      outcomeId: market.outcomeId,
-      name: market.name,
-      underlying: "underlying" in market ? market.underlying : undefined,
-      targetPrice: "targetPrice" in market ? market.targetPrice : undefined,
-      period: "period" in market ? market.period : undefined,
-      expiry: "expiry" in market && market.expiry ? market.expiry.toISOString() : undefined,
-      sides: market.sides.map((side) => ({ name: side.name, coin: side.coin, asset: side.asset })),
-    })),
-  };
+  const { wallet, signer } = getWalletAndSigner();
+  await hip4.auth.initAuth(wallet, signer);
+  if (request.command === "place_limit_order") {
+    const payload = parseLimitPayload(request.payload);
+    const sideIndex = await requireMarketSide(hip4, payload.marketId, payload.outcome);
+    await requireAloIsMaker(hip4, payload, sideIndex);
+    const result = await hip4.trading.placeOrder({ ...payload, type: "limit" });
+    return result.success ? { id: request.id, ok: true, result } : { id: request.id, ok: false, result, error: { code: "ORDER_REJECTED", message: result.error ?? "Outcome rejected order" } };
+  }
+  const payload = parseCancelPayload(request.payload);
+  const openOrders = await hip4.account.fetchOpenOrders(wallet);
+  const ownedOrder = openOrders.find((order) => String(order.oid) === payload.orderId);
+  if (!ownedOrder || ownedOrder.coin !== payload.outcome) throw new Error("order is not an open order owned by the configured wallet with the requested outcome");
+  const result = await hip4.trading.cancelOrder([payload]);
+  return { id: request.id, ok: true, result };
 }
 
 const input = createInterface({ input: process.stdin, crlfDelay: Infinity });
 for await (const line of input) {
-  try {
-    const request = parseRequest(line);
-    respond(await handle(request));
-  } catch (error) {
-    respond({
-      id: "invalid-request",
-      ok: false,
-      error: { code: "INVALID_REQUEST", message: error instanceof Error ? error.message : String(error) },
-    });
-  }
+  try { respond(await handle(parseRequest(line))); }
+  catch (error) { respond({ id: "invalid-request", ok: false, error: { code: "INVALID_REQUEST", message: error instanceof Error ? error.message : String(error) } }); }
 }

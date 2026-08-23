@@ -68,6 +68,7 @@ def test_align_outcome_price():
 
 
 def test_align_outcome_size():
+    assert align_outcome_size(10.55) == "11"
     assert align_outcome_size(10, 0) == "10"
     assert align_outcome_size(10.55, 1) == "10.6"
     assert align_outcome_size(Decimal("25.0"), 1) == "25.0"

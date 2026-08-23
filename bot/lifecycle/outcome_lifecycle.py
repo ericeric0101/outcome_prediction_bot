@@ -43,7 +43,7 @@ class OutcomeMarketSpec:
     target_price: Decimal    # Strike price from spec
     period: str              # e.g. "15m"
     raw_spec: str
-    sz_decimals: int = 1
+    sz_decimals: int = 0
     max_leverage: int = 1
     side_names: tuple[str, str] = ("Yes", "No")
     raw_meta: Optional[Dict[str, Any]] = None
@@ -166,7 +166,9 @@ def parse_outcome_market_spec(universe_item: Dict[str, Any]) -> Optional[Outcome
             period_seconds = 86400
 
     start_ts = expiry_ts - period_seconds
-    sz_decimals = int(universe_item.get("szDecimals", 1))
+    # HIP-4 outcomeMeta does not expose spot/perp-style size decimals.  Live
+    # Outcome orders use whole shares; do not inherit a fictional 0.1 step.
+    sz_decimals = 0
     max_leverage = int(universe_item.get("maxLeverage", 1))
     side_specs = universe_item.get("sideSpecs") or []
     parsed_side_names = tuple(

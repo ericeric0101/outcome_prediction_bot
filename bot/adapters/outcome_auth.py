@@ -99,9 +99,14 @@ def align_outcome_price(price: Union[float, Decimal, str], max_sig_figs: int = 5
     return format(rounded.normalize(), "f")
 
 
-def align_outcome_size(size: Union[float, Decimal, str], sz_decimals: int = 1) -> str:
+def align_outcome_size(size: Union[float, Decimal, str], sz_decimals: int = 0) -> str:
     """
-    Align order size to instrument decimal precision.
+    Align Outcome order size to integer shares by default.
+
+    Outcome ``outcomeMeta`` does not publish a per-market ``szDecimals`` and
+    live venue replies reject fractional Outcome share amounts.  Keep an
+    explicit override only for isolated test fixtures / a future official
+    metadata field, never as the production default.
     """
     s = Decimal(str(size))
     if s <= 0:

@@ -325,7 +325,7 @@ class OutcomeClient:
         reduce_only: bool = False,
         cloid: Optional[str] = None,
         vault_address: Optional[str] = None,
-        sz_decimals: int = 1,
+        sz_decimals: int = 0,
     ) -> Dict[str, Any]:
         """
         Submit an outcome order to Hyperliquid L1.

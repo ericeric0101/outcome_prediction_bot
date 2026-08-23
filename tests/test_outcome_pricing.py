@@ -46,19 +46,19 @@ def test_outcome_pricing_state_l2_book():
 
 
 def test_compute_min_shares_for_notional():
-    # Price = 0.50, min notional = 10 USDC -> shares = 20.0 (20 * 0.5 = 10.0 >= 10.0)
-    shares = compute_min_shares_for_notional(Decimal("0.50"), Decimal("10.0"), sz_decimals=1)
-    assert shares == Decimal("20.0")
+    # Outcome shares are integer: price = 0.50 -> exactly 20 shares.
+    shares = compute_min_shares_for_notional(Decimal("0.50"), Decimal("10.0"))
+    assert shares == Decimal("20")
     assert shares * Decimal("0.50") >= Decimal("10.0")
 
-    # Price = 0.45, min notional = 10 USDC -> shares >= 22.222... -> 22.3 (22.3 * 0.45 = 10.035 >= 10.0)
-    shares_45 = compute_min_shares_for_notional(Decimal("0.45"), Decimal("10.0"), sz_decimals=1)
-    assert shares_45 >= Decimal("22.2")
+    # Price = 0.45 -> round up to 23 whole shares (not 22.3).
+    shares_45 = compute_min_shares_for_notional(Decimal("0.45"), Decimal("10.0"))
+    assert shares_45 == Decimal("23")
     assert shares_45 * Decimal("0.45") >= Decimal("10.0")
 
     # Price = 0.10, min notional = 10 USDC -> shares = 100.0
-    shares_10 = compute_min_shares_for_notional(Decimal("0.10"), Decimal("10.0"), sz_decimals=1)
-    assert shares_10 == Decimal("100.0")
+    shares_10 = compute_min_shares_for_notional(Decimal("0.10"), Decimal("10.0"))
+    assert shares_10 == Decimal("100")
     assert shares_10 * Decimal("0.10") >= Decimal("10.0")
 
 

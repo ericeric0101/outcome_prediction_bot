@@ -20,7 +20,10 @@ def mock_execution_adapter(monkeypatch):
     )
     client = OutcomeClient(auth)
 
+    submitted_actions = []
+
     async def mock_post_exchange(action, vault_address=None):
+        submitted_actions.append(action)
         return {
             "status": "ok",
             "response": {
@@ -31,13 +34,14 @@ def mock_execution_adapter(monkeypatch):
 
     monkeypatch.setattr(client, "post_exchange", mock_post_exchange)
     adapter = OutcomeExecutionAdapter(client, min_notional_usdc=Decimal("10.0"))
+    adapter.submitted_actions = submitted_actions
     return adapter
 
 
 @pytest.mark.anyio
 async def test_submit_maker_buy_min_notional(mock_execution_adapter):
     adapter = mock_execution_adapter
-    # price = 0.40, size = 10 -> notional = 4 < 10 -> should be adjusted to 25.0
+    # price = 0.40, size = 10 -> notional = 4 < 10 -> 25 whole shares.
     res = await adapter.submit_maker_buy(
         outcome_id=516,
         side_index=0,
@@ -54,6 +58,7 @@ async def test_submit_maker_buy_min_notional(mock_execution_adapter):
     order = adapter.get_order_by_cloid(cloid)
     assert order is not None
     assert order.order_type == "ALO"
+    assert adapter.submitted_actions[-1]["orders"][0]["s"] == "25"
 
 
 @pytest.mark.anyio
@@ -72,6 +77,7 @@ async def test_submit_take_profit(mock_execution_adapter):
     assert order is not None
     assert order.is_exit is True
     assert order.order_type == "Gtc"
+    assert adapter.submitted_actions[-1]["orders"][0]["s"] == "25"
 
 
 @pytest.mark.anyio
@@ -102,6 +108,7 @@ async def test_submit_recovery_ladder(mock_execution_adapter):
     order2 = adapter.get_order_by_cloid(res2["cloid"])
     assert order2.is_recovery is True
     assert order2.is_urgent is True
+    assert adapter.submitted_actions[-1]["orders"][0]["s"] == "25"
 
 
 def test_compute_settlement_rejects_unverified_mark_inference(mock_execution_adapter):

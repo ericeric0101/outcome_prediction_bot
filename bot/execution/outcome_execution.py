@@ -57,9 +57,11 @@ class OutcomeExecutionAdapter:
         self,
         client: OutcomeClient,
         min_notional_usdc: Decimal = DEFAULT_MIN_NOTIONAL_USDC,
+        sz_decimals: int = 0,
     ) -> None:
         self.client = client
         self.min_notional_usdc = min_notional_usdc
+        self.sz_decimals = int(sz_decimals)
         self._active_orders: Dict[str, ActiveOutcomeOrder] = {}  # cloid -> ActiveOutcomeOrder
 
     @property
@@ -83,11 +85,11 @@ class OutcomeExecutionAdapter:
         Ensures min notional (10 USDC) is satisfied.
         """
         p = Decimal(str(price))
-        s = Decimal(str(size))
+        s = Decimal(align_outcome_size(size, sz_decimals=self.sz_decimals))
 
         # Check / enforce min notional
         if p * s < self.min_notional_usdc:
-            s = compute_min_shares_for_notional(p, self.min_notional_usdc)
+            s = compute_min_shares_for_notional(p, self.min_notional_usdc, sz_decimals=self.sz_decimals)
             logger.info(f"Adjusted BUY size to {s} to satisfy min notional {self.min_notional_usdc} USDC at price {p}")
 
         order_cloid = cloid or generate_cloid()
@@ -102,6 +104,7 @@ class OutcomeExecutionAdapter:
             reduce_only=False,
             cloid=order_cloid,
             vault_address=vault_address,
+            sz_decimals=self.sz_decimals,
         )
 
         if not resp.get("success"):
@@ -156,7 +159,7 @@ class OutcomeExecutionAdapter:
         Submit a passive Take-Profit (TP) GTC SELL limit order.
         """
         p = Decimal(str(tp_price))
-        s = Decimal(str(size))
+        s = Decimal(align_outcome_size(size, sz_decimals=self.sz_decimals))
         order_cloid = cloid or generate_cloid()
 
         resp = await self.client.submit_order(
@@ -169,6 +172,7 @@ class OutcomeExecutionAdapter:
             reduce_only=True,
             cloid=order_cloid,
             vault_address=vault_address,
+            sz_decimals=self.sz_decimals,
         )
 
         if not resp.get("success"):
@@ -227,7 +231,7 @@ class OutcomeExecutionAdapter:
         - Stage 2: IOC Marketable SELL (is_ioc=True)
         """
         p = Decimal(str(exit_price))
-        s = Decimal(str(size))
+        s = Decimal(align_outcome_size(size, sz_decimals=self.sz_decimals))
         order_cloid = cloid or generate_cloid()
         tif = "Ioc" if is_ioc else "Gtc"
 
@@ -241,6 +245,7 @@ class OutcomeExecutionAdapter:
             reduce_only=True,
             cloid=order_cloid,
             vault_address=vault_address,
+            sz_decimals=self.sz_decimals,
         )
 
         if not resp.get("success"):

@@ -109,7 +109,7 @@ async def test_outcome_client_mock_requests(monkeypatch):
     )
     assert res["asset_id"] == 100005160
     assert res["price"] == "0.45"
-    assert res["size"] == "25.0"
+    assert res["size"] == "25"
     assert res["is_buy"] is True
     assert res["result"]["status"] == "ok"
     assert res["success"] is True
