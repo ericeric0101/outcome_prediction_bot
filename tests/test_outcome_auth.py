@@ -4,13 +4,17 @@ import time
 from decimal import Decimal
 import pytest
 from eth_account import Account
+from eth_account.messages import encode_typed_data
 
 from bot.adapters.outcome_auth import (
+    AGENT_EIP712_TYPES,
+    EXCHANGE_DOMAIN,
     OutcomeAuth,
     align_outcome_price,
     align_outcome_size,
     generate_cloid,
     hash_action,
+    construct_phantom_agent,
     outcome_asset_id,
     parse_outcome_asset_id,
 )
@@ -88,6 +92,27 @@ def test_agent_authorization_requires_explicit_post_approval_verification():
         auth.require_agent_authorized()
     auth.mark_agent_authorized_after_verification()
     auth.require_agent_authorized()
+
+
+def test_l1_signature_uses_official_phantom_agent_message():
+    agent = Account.from_key("0x" + "11" * 32)
+    auth = OutcomeAuth(wallet_address="0x" + "a" * 40, agent_private_key=agent.key.hex(), is_testnet=True)
+    action = {"type": "order", "orders": [], "grouping": "na"}
+    nonce = 1_700_000_000_000
+    payload = auth.sign_l1_action(action, nonce=nonce)
+    connection_id = hash_action(action, None, nonce)
+    # Fixed vector produced by Hyperliquid's reference ``action_hash`` format:
+    # msgpack(action) + uint64-big-endian nonce + null vault marker.
+    assert connection_id.hex() == "eb4729f4d12c2bdaa7cae0e877016eaee3e646ba05bd7d861c705a44b1dfc586"
+    assert construct_phantom_agent(connection_id, is_mainnet=False)["source"] == "b"
+    assert construct_phantom_agent(connection_id, is_mainnet=True)["source"] == "a"
+    typed = encode_typed_data(
+        domain_data=EXCHANGE_DOMAIN,
+        message_types=AGENT_EIP712_TYPES,
+        message_data=construct_phantom_agent(connection_id, is_mainnet=False),
+    )
+    recovered = Account.recover_message(typed, vrs=[payload["signature"]["v"], payload["signature"]["r"], payload["signature"]["s"]])
+    assert recovered.lower() == agent.address.lower()
 
 
 def test_outcome_auth_signing():

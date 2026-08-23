@@ -22,9 +22,13 @@ from execution.rebate_model import QuoteEconomics
 
 
 DEFAULT_MIN_NOTIONAL_USDC = Decimal("10.0")
-DEFAULT_HL_MAKER_FEE_RATE = Decimal("0.00015")  # 1.5 bps
-DEFAULT_HL_TAKER_FEE_RATE = Decimal("0.00035")  # 3.5 bps
-DEFAULT_REFERRAL_DISCOUNT = Decimal("0.04")     # 4% discount
+# Outcome documents state that HIP-4 trading fees are currently zero during
+# testing.  Post-testing fees follow Hyperliquid's changing protocol schedule,
+# so production research must inject a freshly verified rate instead of using a
+# stale hard-coded tier.
+DEFAULT_HL_MAKER_FEE_RATE = Decimal("0")
+DEFAULT_HL_TAKER_FEE_RATE = Decimal("0")
+DEFAULT_REFERRAL_DISCOUNT = Decimal("0")
 
 
 @dataclass(frozen=True)
@@ -165,8 +169,8 @@ def estimate_outcome_economics(
     adverse_selection_buffer: Decimal = Decimal("0"),
 ) -> QuoteEconomics:
     """
-    Calculate Hyperliquid Outcome quote economics taking into account fees, spread capture,
-    and 10 USDC min notional.
+    Calculate Outcome quote economics.  Defaults model the current testing
+    schedule (zero trading fee); callers must inject verified live fee inputs.
     """
     p = max(Decimal("0.0001"), min(Decimal("0.9999"), probability))
     effective_maker_fee_rate = maker_fee_rate * (Decimal("1") - referral_discount)

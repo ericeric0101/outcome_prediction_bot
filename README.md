@@ -97,6 +97,20 @@ audit event; it imports no exchange client:
 ./.venv/bin/python scripts/outcome_canary_preflight.py --db logs/outcome_shadow.db --record
 ```
 
+### Official SDK sidecar (P4 preparation only)
+
+The Python strategy remains the source of decisions. `outcome_sdk_sidecar/` is
+an isolated JSON-lines boundary around the official TypeScript SDK, currently
+limited to `health` and typed `fetch_markets`. Auth, order, and cancel commands
+are hard-disabled until a separately approved P4 implementation.
+
+```bash
+cd outcome_sdk_sidecar
+npm install
+npm run build
+npm run health
+```
+
 ### Outcome Shadow Dashboard
 With the collector running, open a second terminal and view its SQLite
 telemetry. Use the same journal path passed to the collector.

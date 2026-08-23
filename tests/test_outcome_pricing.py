@@ -72,5 +72,11 @@ def test_estimate_outcome_economics():
     assert econ.shares == Decimal("20.0")
     assert econ.probability == Decimal("0.50")
     assert econ.expected_spread_capture_usdc > Decimal("0")
-    assert econ.fee_equivalent_usdc > Decimal("0")
+    assert econ.fee_equivalent_usdc == Decimal("0")
     assert econ.expected_net_usdc > Decimal("0")
+
+    charged = estimate_outcome_economics(
+        quote_size_usdc=Decimal("10.0"), probability=Decimal("0.50"), half_spread=Decimal("0.01"),
+        maker_fee_rate=Decimal("0.00015"), referral_discount=Decimal("0"),
+    )
+    assert charged.fee_equivalent_usdc > Decimal("0")

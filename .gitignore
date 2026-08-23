@@ -5,6 +5,10 @@ __pycache__/
 *.so
 .pytest_cache/
 
+# Outcome official-SDK sidecar build artifacts
+outcome_sdk_sidecar/node_modules/
+outcome_sdk_sidecar/dist/
+
 # Virtual environments
 venv/
 .venv/

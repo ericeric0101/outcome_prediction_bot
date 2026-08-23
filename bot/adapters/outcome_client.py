@@ -263,14 +263,14 @@ class OutcomeClient:
         })
 
     async def get_open_orders(self, user: Optional[str] = None) -> List[Dict[str, Any]]:
-        """Fetch active open orders."""
+        """Fetch active orders across every DEX, matching the official SDK."""
         target_user = (user or self.wallet_address).lower()
-        return await self.post_info({"type": "frontendOpenOrders", "user": target_user})
+        return await self.post_info({"type": "frontendOpenOrders", "user": target_user, "dex": "ALL_DEXS"})
 
     def get_open_orders_sync(self, user: Optional[str] = None) -> List[Dict[str, Any]]:
-        """Synchronously fetch active frontend orders; this endpoint is read-only."""
+        """Synchronously fetch all active frontend orders; read-only."""
         target_user = (user or self.wallet_address).lower()
-        return self.post_info_sync({"type": "frontendOpenOrders", "user": target_user})
+        return self.post_info_sync({"type": "frontendOpenOrders", "user": target_user, "dex": "ALL_DEXS"})
 
     async def get_user_fills(self, user: Optional[str] = None) -> List[Dict[str, Any]]:
         """Fetch recent user trade fills."""

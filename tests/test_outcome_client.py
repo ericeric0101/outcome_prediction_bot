@@ -39,8 +39,11 @@ async def test_outcome_client_mock_requests(monkeypatch):
     )
     client = OutcomeClient(auth)
 
+    info_payloads = []
+
     # Mock post_info
     async def mock_post_info(payload):
+        info_payloads.append(payload)
         req_type = payload.get("type")
         if req_type == "outcomeMeta":
             return {
@@ -89,6 +92,11 @@ async def test_outcome_client_mock_requests(monkeypatch):
     book = await client.get_l2_book("@516")
     assert book["coin"] == "@516"
     assert len(book["levels"][0]) == 1
+
+    # The official HIP-4 SDK scopes frontend open-order requests to all DEXes.
+    await client.get_open_orders()
+    assert info_payloads[-1]["type"] == "frontendOpenOrders"
+    assert info_payloads[-1]["dex"] == "ALL_DEXS"
 
     # Test submit_order
     res = await client.submit_order(

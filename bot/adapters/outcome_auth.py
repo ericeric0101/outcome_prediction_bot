@@ -21,7 +21,8 @@ from typing import Any, Dict, Optional, Tuple, Union
 try:
     import msgpack
     def _pack_action(action: Dict[str, Any]) -> bytes:
-        return msgpack.packb(action, use_bin_type=True)
+        # Match Hyperliquid's reference ``msgpack.packb(action)`` byte-for-byte.
+        return msgpack.packb(action)
 except ImportError:
     from msgspec import msgpack
     def _pack_action(action: Dict[str, Any]) -> bytes:
@@ -45,7 +46,7 @@ EXCHANGE_DOMAIN = {
 
 AGENT_EIP712_TYPES = {
     "Agent": [
-        {"name": "source", "type": "address"},
+        {"name": "source", "type": "string"},
         {"name": "connectionId", "type": "bytes32"},
     ],
 }
@@ -140,6 +141,11 @@ def hash_action(action: Dict[str, Any], vault_address: Optional[str], nonce: int
         
     full_data = packed_action + nonce_bytes + vault_bytes
     return keccak(full_data)
+
+
+def construct_phantom_agent(connection_id: bytes, is_mainnet: bool) -> Dict[str, Any]:
+    """Build Hyperliquid's canonical L1 EIP-712 message."""
+    return {"source": "a" if is_mainnet else "b", "connectionId": connection_id}
 
 
 class OutcomeAuth:
@@ -310,13 +316,10 @@ class OutcomeAuth:
         current_nonce = nonce if nonce is not None else int(time.time() * 1000)
         action_hash_bytes = hash_action(action, vault_address, current_nonce)
 
-        # Build EIP-712 Agent typed data
-        # source is the address of the agent signing the request (or user address)
-        source_address = self.agent_account.address
-        message_data = {
-            "source": "0x0000000000000000000000000000000000000000" if self.agent_account == self.eoa_account else source_address,
-            "connectionId": action_hash_bytes,
-        }
+        # L1 actions are signed over a *phantom agent* message.  The source is
+        # a network marker, not the signing wallet address; see Hyperliquid's
+        # reference ``construct_phantom_agent`` implementation.
+        message_data = construct_phantom_agent(action_hash_bytes, is_mainnet=not self.is_testnet)
 
         encoded_data = encode_typed_data(
             domain_data=EXCHANGE_DOMAIN,

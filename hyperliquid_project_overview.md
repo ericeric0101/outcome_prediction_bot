@@ -86,6 +86,12 @@ Outcome/HIP-4 的機制提供四個需驗證的研究方向：
 
 **SDK Guides 對齊（2026-08-23）：** repo 是 Python direct-adapter，不能逐字使用官方 TypeScript SDK，但已對齊其關鍵語意：`OutcomeMarketSpec` 保留 typed side names / raw metadata；價格以五位有效數字對齊、size 可傳 market `szDecimals`；原始 order reply 正規化為 `success/status/error`；exchange action 在明確的 agent-approval verification 前一律拒絕；WS 使用單連線、unsubscribe、指數 backoff（最多十次）與 lifecycle resync。仍不可將 `compute_settlement` 用 BTC mark 推定勝方，它現在會直接拒絕。官方參考：[fetch markets](https://docs.outcome.xyz/sdk/guides/fetch-markets.md)、[trading](https://docs.outcome.xyz/sdk/guides/trading.md)、[conversions](https://docs.outcome.xyz/sdk/guides/conversions.md)、[real-time data](https://docs.outcome.xyz/sdk/guides/real-time-data.md)。
 
+**HIP-4 下單 size 規則（2026-08-23，待實盤對照）：** `amount` 是 shares，不是 USDC；價格精度與 shares 精度是兩個不同概念。官方 SDK 提供 `getMinShares(markPx)`，但 Outcome UI 已成功建立 `Buy Yes 16 @ 0.80`（$12.80）掛單，故不可把該 helper 的輸出當作 exchange 唯一的 minimum-size truth，也不可由 exchange 的兩次拒絕（`0.80 × 12.5`、`0.60 × 16.666667` 均為 `Order has invalid size.`）推定「shares 必須整數」或 51/56 shares minimum。兩次 API 請求均為 ALO/post-only，未建立訂單也未成交；第二次送單時 best ask 為 0.83302。UI 訂單簿的 0.001/0.01/0.1/1/10 選單是**價格聚合檔位**，不是 shares 精度證據。live sizing 必須以 Outcome UI 實際訂單、官方 SDK account adapter 讀回的原始 order，以及 exchange reply 三者對照後才可啟用；目前 Python `frontendOpenOrders` 已對齊 SDK 加上 `dex: "ALL_DEXS"`，但尚未讀回截圖所示訂單，帳戶／API path 差異仍為 blocker。
+
+**簽名與費率更正（2026-08-23）：** L1 action 的 EIP-712 `Agent.source` 必須是 phantom-agent network marker：mainnet 為 `"a"`、testnet 為 `"b"`，且型別是 `string`，不可使用 signer address。此規則已依 Hyperliquid 官方 Python SDK 加入固定 hash／recover regression test。Outcome 在 HIP-4 testing 期間的交易費目前為零；testing 後才採 Hyperliquid protocol schedule，因此 economics 預設為 0、但要求 live research 注入已驗證費率。這不代表永久零費，settlement fee 仍必須以每個 market 的官方 evidence 為準。
+
+**官方 SDK sidecar（P4 前置，hard-disabled）：** `outcome_sdk_sidecar/` 使用官方 `@outcome.xyz/hip4` TypeScript SDK；Python 只可透過 `bot/outcome_sdk_sidecar.py` 傳送 JSON-lines 的 `health`／`fetch_markets`。`auth_status`、`place_limit_order`、`cancel_order` 一律回覆 `P4_HARD_DISABLED`，sidecar 不讀取私鑰、更不會初始化 agent signer 或呼叫 trading adapter。這讓 Python 策略與官方 execution implementation 可逐步對照，但不會在 P0–P3 未通過時意外擴張成 live path。
+
 #### 必須修正或新增的資料欄位
 
 - 每筆 snapshot：兩側完整 L2 depth、server timestamp、local receive timestamp、book age、WS reconnect / gap、鏡像有效 bid/ask、`YES+NO` 可執行 bundle 價格、預估滑價。

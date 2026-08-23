@@ -1,0 +1,19 @@
+{
+  "name": "outcome-sdk-sidecar",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/main.js",
+    "health": "printf '{\"id\":\"health\",\"command\":\"health\"}\\n' | node dist/main.js"
+  },
+  "dependencies": {
+    "@outcome.xyz/hip4": "1.0.3-beta",
+    "viem": "^2.37.6"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "typescript": "^5.7.2"
+  }
+}
