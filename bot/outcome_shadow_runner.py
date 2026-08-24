@@ -9,6 +9,7 @@ from __future__ import annotations
 import time
 import uuid
 import math
+import os
 from collections import deque
 from dataclasses import dataclass
 from decimal import Decimal
@@ -19,6 +20,8 @@ from bot.forecast_state import ForecastState, build_forecast_state
 from bot.lifecycle.outcome_lifecycle import (
     OutcomeMarketSpec,
     discover_btc_15m_markets,
+    parse_period_preferences,
+    select_configured_btc_market,
     select_active_or_next_btc_market,
 )
 from bot.models import SignalDecision
@@ -28,6 +31,7 @@ from bot.outcome_parity import OutcomeParityAnalyzer
 from bot.outcome_event_bridge import OutcomeJournalBridge
 from bot.outcome_spec_audit import OutcomeSpecAudit
 from bot.outcome_ws_recorder import OutcomeWebSocketRecorder
+from bot.outcome_p3_pipeline import OutcomeP3Pipeline
 from bot.position_manager import PositionManager, PositionManagerConfig
 from bot.pricing.outcome_pricing import OutcomePricingState
 from bot.signal_engine import SignalEngine, SignalEngineConfig
@@ -213,6 +217,7 @@ class OutcomeShadowRunner:
         self.parity_analyzer = OutcomeParityAnalyzer()
         self.fill_bridge = OutcomeJournalBridge(journal, self.run_id)
         self._recorded_fill_ids: set[str] = set()
+        self.p3_pipeline = OutcomeP3Pipeline(journal, self.run_id)
 
     @staticmethod
     def _raw_meta_for_market(meta: dict[str, Any], outcome_id: int) -> Optional[dict[str, Any]]:
@@ -311,13 +316,10 @@ class OutcomeShadowRunner:
         if self.spec_audit and self._last_market:
             self.spec_audit.mark_pending_resolution(self._last_market, now_ts)
         meta = self.client.get_outcome_meta_sync(ttl_sec=0)
-        market, status = select_active_or_next_btc_market(discover_btc_15m_markets(meta))
+        preferences = parse_period_preferences(os.environ.get("OUTCOME_MARKET_PERIODS"))
+        allow_fallback = os.environ.get("OUTCOME_MARKET_ALLOW_FALLBACK", "1").lower() not in {"0", "false", "no"}
+        market, status, _, _ = select_configured_btc_market(meta, period_preferences=preferences, allow_fallback=allow_fallback)
         account = self.account.fetch_snapshot()
-        for fill in account.fills:
-            if fill.trade_id in self._recorded_fill_ids:
-                continue
-            self.fill_bridge.record_fill(fill, market_key=f"outcome:{fill.outcome_id}")
-            self._recorded_fill_ids.add(fill.trade_id)
         if market is None:
             self.journal.log_strategy_event(self.run_id, "OUTCOME_SHADOW_CYCLE", {
                 "venue": "hyperliquid_outcome", "read_only": True, "market_status": status,
@@ -330,6 +332,10 @@ class OutcomeShadowRunner:
         if self.spec_audit and raw_market is not None:
             self.spec_audit.observe(market, raw_market)
 
+        for fill in account.fills:
+            observed_period = market.period if fill.outcome_id == market.outcome_id else "unknown"
+            self.p3_pipeline.record_actual_fill(fill, period=observed_period)
+
         mids = self.client.get_all_mids_sync(ttl_sec=0)
         self.pricing.update_btc_mark_price(mids["BTC"])
         raw_books = {}
@@ -339,8 +345,20 @@ class OutcomeShadowRunner:
         parity = self.parity_analyzer.analyze(market, raw_books[market.yes_coin], raw_books[market.no_coin])
         self.journal.log_strategy_event(self.run_id, "OUTCOME_P2_PARITY_SNAPSHOT", {
             "venue": "hyperliquid_outcome", "period": market.period,
+            "snapshot_timestamp_ms": int(time.time() * 1000),
+            "outcome_id": market.outcome_id, "yes_coin": market.yes_coin, "no_coin": market.no_coin,
+            "yes_l2": raw_books[market.yes_coin], "no_l2": raw_books[market.no_coin],
+            "fee_evidence": "unverified_conversion_cost_excluded",
             **parity.as_dict(),
         })
+        yes_top = self.pricing.get_book_top(market.yes_coin)
+        p3_written = self.p3_pipeline.observe_quotes(
+            outcome_id=market.outcome_id, period=market.period,
+            quotes=self.p3_pipeline.quotes_from_journal(outcome_id=market.outcome_id, period=market.period),
+            time_left_sec=market.time_to_expiry_sec(),
+            spread=(yes_top.spread if yes_top else None),
+            depth=(yes_top.bid_size if yes_top else None), volatility_regime="unknown",
+        )
 
         if self.ws_recorder:
             if self._last_market and self._last_market.outcome_id != market.outcome_id:
@@ -355,6 +373,7 @@ class OutcomeShadowRunner:
                     "outcome_id": market.outcome_id, "reason": "websocket_lifecycle_transition",
                     "rest_mids_refreshed": True, "rest_l2_refreshed": True,
                 })
+                self.ws_recorder.mark_rest_resynced()
                 self.ws_recorder.resync_required.clear()
 
         up_mid = self.pricing.get_outcome_mid(market.yes_coin)
@@ -414,6 +433,7 @@ class OutcomeShadowRunner:
             "account_open_order_count": len(account.open_orders), "account_fill_count": len(account.fills),
             "market_snapshots": market_snapshots,
             "p2_parity": parity.as_dict(),
+            "p3_markouts_written": p3_written,
             "strategy_telemetry": telemetry,
             "risk_decisions": decisions,
         })

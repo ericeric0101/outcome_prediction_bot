@@ -34,6 +34,7 @@ class OutcomeParitySnapshot:
     sell_complete_set_proceeds: Optional[Decimal]
     sell_complete_set_edge: Optional[Decimal]
     fee_status: str = "unverified_excluded"
+    fee_rate: Optional[Decimal] = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -44,6 +45,7 @@ class OutcomeParitySnapshot:
             "sell_complete_set_proceeds": self.sell_complete_set_proceeds,
             "sell_complete_set_edge": self.sell_complete_set_edge,
             "fee_status": self.fee_status,
+            "fee_rate": self.fee_rate,
             "research_only": True,
             "conversion_submission_disabled": True,
         }
@@ -52,10 +54,11 @@ class OutcomeParitySnapshot:
 class OutcomeParityAnalyzer:
     """Calculate executable two-leg prices; it has no venue client dependency."""
 
-    def __init__(self, requested_shares: Decimal = Decimal("10")) -> None:
+    def __init__(self, requested_shares: Decimal = Decimal("10"), fee_rate: Optional[Decimal] = None) -> None:
         if requested_shares <= 0:
             raise ValueError("requested_shares must be positive")
         self.requested_shares = requested_shares
+        self.fee_rate = fee_rate
 
     def analyze(
         self,
@@ -80,4 +83,6 @@ class OutcomeParityAnalyzer:
             buy_complete_set_edge=(self.requested_shares - buy_cost) if buy_cost is not None else None,
             sell_complete_set_proceeds=sell_proceeds,
             sell_complete_set_edge=(sell_proceeds - self.requested_shares) if sell_proceeds is not None else None,
+            fee_status="verified_included" if self.fee_rate is not None else "unverified_excluded",
+            fee_rate=self.fee_rate,
         )

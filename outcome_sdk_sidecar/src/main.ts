@@ -1,14 +1,15 @@
 /* JSON-lines boundary for the official Outcome HIP-4 TypeScript SDK. */
-import { createHIP4Adapter } from "@outcome.xyz/hip4";
+import { createHIP4Adapter, HIP4Client } from "@outcome.xyz/hip4";
 import type { DefaultBinaryMarket } from "@outcome.xyz/hip4";
 import { privateKeyToAccount } from "viem/accounts";
 import { createInterface } from "node:readline";
 
-type Command = "health" | "fetch_markets" | "fetch_order_book" | "place_limit_order" | "cancel_order";
+type Command = "health" | "fetch_markets" | "fetch_order_book" | "fetch_settled_outcome" | "fetch_account_snapshot" | "place_limit_order" | "cancel_order" | "merge_outcome";
 type Request = { id: string; command: Command; testnet?: boolean; payload?: Record<string, unknown> };
 type Response = { id: string; ok: boolean; result?: unknown; error?: { code: string; message: string } };
 type LimitOrderPayload = { marketId: string; outcome: string; side: "buy" | "sell"; price: string; amount: string; timeInForce?: "GTC" | "GTD" | "FOK" | "FAK" | "ALO" };
 type CancelPayload = { marketId: string; outcome: string; orderId: string };
+type MergePayload = { marketId: string; amount: string };
 
 function respond(response: Response): void { process.stdout.write(`${JSON.stringify(response)}\n`); }
 function parseRequest(line: string): Request {
@@ -57,6 +58,12 @@ function parseCancelPayload(payload: Record<string, unknown> | undefined): Cance
   if (!/^\d+$/.test(orderId)) throw new Error("payload.orderId must be numeric");
   return { marketId, outcome, orderId };
 }
+function parseMergePayload(payload: Record<string, unknown> | undefined): MergePayload {
+  const marketId = requireString(payload?.marketId, "payload.marketId");
+  const amount = requireString(payload?.amount, "payload.amount");
+  if (!/^\d+(\.\d+)?$/.test(amount) || Number(amount) <= 0) throw new Error("payload.amount must be positive");
+  return { marketId, amount };
+}
 async function requireMarketSide(hip4: ReturnType<typeof createHIP4Adapter>, marketId: string, outcome: string): Promise<number> {
   const markets = (await hip4.events.fetchMarkets({ type: "defaultBinary" })) as DefaultBinaryMarket[];
   const market = markets.find((candidate) => String(candidate.outcomeId) === marketId);
@@ -76,8 +83,8 @@ async function requireAloIsMaker(hip4: ReturnType<typeof createHIP4Adapter>, pay
 
 async function handle(request: Request): Promise<Response> {
   if (request.command === "health") return { id: request.id, ok: true, result: { protocol: "outcome-sdk-sidecar/v1", execution: "disabled_by_default" } };
-  if (!(["fetch_markets", "fetch_order_book", "place_limit_order", "cancel_order"] as string[]).includes(request.command)) return { id: request.id, ok: false, error: { code: "UNKNOWN_COMMAND", message: request.command } };
-  if ((request.command === "place_limit_order" || request.command === "cancel_order") && !executionEnabled()) return { id: request.id, ok: false, error: { code: "EXECUTION_DISABLED", message: "Set OUTCOME_SDK_EXECUTION_ENABLED=1 after explicit operator approval." } };
+  if (!(["fetch_markets", "fetch_order_book", "fetch_settled_outcome", "fetch_account_snapshot", "place_limit_order", "cancel_order", "merge_outcome"] as string[]).includes(request.command)) return { id: request.id, ok: false, error: { code: "UNKNOWN_COMMAND", message: request.command } };
+  if ((request.command === "place_limit_order" || request.command === "cancel_order" || request.command === "merge_outcome") && !executionEnabled()) return { id: request.id, ok: false, error: { code: "EXECUTION_DISABLED", message: "Set OUTCOME_SDK_EXECUTION_ENABLED=1 after explicit operator approval." } };
   const hip4 = createHIP4Adapter({ testnet: request.testnet ?? false });
   await hip4.initialize();
   if (request.command === "fetch_markets") {
@@ -91,6 +98,18 @@ async function handle(request: Request): Promise<Response> {
     const book = await hip4.marketData.fetchOrderBook(marketId, sideIndex);
     return { id: request.id, ok: true, result: { marketId, outcome, bids: book.bids, asks: book.asks, timestamp: book.timestamp } };
   }
+  if (request.command === "fetch_settled_outcome") {
+    const marketId = requireString(request.payload?.marketId, "payload.marketId");
+    const client = new HIP4Client({ testnet: request.testnet ?? false });
+    return { id: request.id, ok: true, result: await client.fetchSettledOutcome(Number(marketId)) };
+  }
+  if (request.command === "fetch_account_snapshot") {
+    const wallet = requireString(request.payload?.wallet, "payload.wallet");
+    const [positions, balances, orders, activity] = await Promise.all([
+      hip4.account.fetchPositions(wallet), hip4.account.fetchBalance(wallet), hip4.account.fetchOpenOrders(wallet), hip4.account.fetchActivity(wallet),
+    ]);
+    return { id: request.id, ok: true, result: { positions, balances, openOrders: orders, activity } };
+  }
   const { wallet, signer } = getWalletAndSigner();
   await hip4.auth.initAuth(wallet, signer);
   if (request.command === "place_limit_order") {
@@ -99,6 +118,14 @@ async function handle(request: Request): Promise<Response> {
     await requireAloIsMaker(hip4, payload, sideIndex);
     const result = await hip4.trading.placeOrder({ ...payload, type: "limit" });
     return result.success ? { id: request.id, ok: true, result } : { id: request.id, ok: false, result, error: { code: "ORDER_REJECTED", message: result.error ?? "Outcome rejected order" } };
+  }
+  if (request.command === "merge_outcome") {
+    if (process.env.OUTCOME_SETTLEMENT_ACTION_ENABLED !== "1") return { id: request.id, ok: false, error: { code: "SETTLEMENT_ACTION_DISABLED", message: "Set OUTCOME_SETTLEMENT_ACTION_ENABLED=1 after explicit operator approval." } };
+    const merge = parseMergePayload(request.payload);
+    const client = new HIP4Client({ testnet: request.testnet ?? false });
+    if (!(await client.fetchSettledOutcome(Number(merge.marketId)))) return { id: request.id, ok: false, error: { code: "NOT_SETTLED", message: "Outcome is not settled; merge is not a redemption substitute." } };
+    const result = await hip4.trading.mergeOutcome({ outcome: Number(merge.marketId), amount: merge.amount });
+    return result.success ? { id: request.id, ok: true, result } : { id: request.id, ok: false, result, error: { code: "MERGE_REJECTED", message: result.error ?? "merge rejected" } };
   }
   const payload = parseCancelPayload(request.payload);
   const openOrders = await hip4.account.fetchOpenOrders(wallet);

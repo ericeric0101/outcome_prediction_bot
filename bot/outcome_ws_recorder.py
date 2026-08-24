@@ -7,6 +7,8 @@ import time
 from typing import Any, Mapping, Optional
 
 from monitoring.trade_journal_db import TradeJournalDB
+from bot.lifecycle.outcome_lifecycle import OutcomeMarketSpec
+from bot.outcome_stream_health import OutcomeStreamHealth
 
 
 class OutcomeWebSocketRecorder:
@@ -19,6 +21,7 @@ class OutcomeWebSocketRecorder:
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
         self.resync_required = threading.Event()
+        self.health = OutcomeStreamHealth()
         self._registered = False
 
     @staticmethod
@@ -52,11 +55,15 @@ class OutcomeWebSocketRecorder:
 
     def _on_lifecycle(self, payload: Mapping[str, Any]) -> None:
         self._record("OUTCOME_WS_LIFECYCLE", payload)
+        self.health.on_lifecycle(str(payload.get("event", "")))
         if payload.get("event") in {"connected", "disconnected"}:
             self.resync_required.set()
 
     def _on_l2(self, payload: Mapping[str, Any]) -> None:
         self._record("OUTCOME_WS_L2_BOOK", payload)
+        data = payload.get("data")
+        if isinstance(data, Mapping) and isinstance(data.get("coin"), str):
+            self.health.on_l2_book(data["coin"])
 
     def _on_mids(self, payload: Mapping[str, Any]) -> None:
         self._record("OUTCOME_WS_ALL_MIDS", payload)
@@ -70,6 +77,9 @@ class OutcomeWebSocketRecorder:
                 return
             raise RuntimeError("market rollover requires recorder restart; stale subscriptions are unsafe")
         self._market_id, self._coins = outcome_id, (yes_coin, no_coin)
+        self.health.market_id, self.health.coins = outcome_id, (yes_coin, no_coin)
+        self.health.book_received_at = {}
+        self.health.resync_required = True
         self._stop.clear()
         self._register_callbacks()
         self._thread = threading.Thread(target=self._run, daemon=True, name="outcome-shadow-ws")
@@ -120,3 +130,7 @@ class OutcomeWebSocketRecorder:
         if self._thread:
             self._thread.join(timeout=5)
         self._unregister_callbacks()
+
+    def mark_rest_resynced(self) -> None:
+        """Permit execution only after caller completed both REST book reads."""
+        self.health.mark_rest_resynced()

@@ -18,8 +18,8 @@ class OutcomeSdkSidecarError(RuntimeError):
     pass
 
 
-ReadOnlyCommand = Literal["health", "fetch_markets", "fetch_order_book"]
-ExecutionCommand = Literal["place_limit_order", "cancel_order"]
+ReadOnlyCommand = Literal["health", "fetch_markets", "fetch_order_book", "fetch_settled_outcome", "fetch_account_snapshot"]
+ExecutionCommand = Literal["place_limit_order", "cancel_order", "merge_outcome"]
 SidecarCommand = ReadOnlyCommand | ExecutionCommand
 
 
@@ -35,9 +35,9 @@ class OutcomeSdkSidecarClient:
         payload: Mapping[str, str] | None = None,
         allow_execution: bool = False,
     ) -> Any:
-        if command in {"place_limit_order", "cancel_order"} and not allow_execution:
+        if command in {"place_limit_order", "cancel_order", "merge_outcome"} and not allow_execution:
             raise OutcomeSdkSidecarError("execution requires explicit allow_execution=True")
-        if command not in {"health", "fetch_markets", "fetch_order_book", "place_limit_order", "cancel_order"}:
+        if command not in {"health", "fetch_markets", "fetch_order_book", "fetch_settled_outcome", "fetch_account_snapshot", "place_limit_order", "cancel_order", "merge_outcome"}:
             raise OutcomeSdkSidecarError(f"unsupported sidecar command: {command}")
         script = self.sidecar_dir / "dist" / "main.js"
         if not script.exists():

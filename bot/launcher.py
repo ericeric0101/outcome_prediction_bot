@@ -4,6 +4,7 @@ import os
 import sys
 import threading
 import time
+import uuid
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -23,6 +24,8 @@ from bot.adapters.outcome_client import OutcomeClient
 from bot.lifecycle.outcome_lifecycle import (
     OutcomeMarketSpec,
     discover_btc_15m_markets,
+    parse_period_preferences,
+    select_configured_btc_market,
     select_active_or_next_btc_market,
     evaluate_outcome_market_phase,
 )
@@ -30,7 +33,12 @@ from bot.pricing.outcome_pricing import (
     OutcomePricingState,
     compute_min_shares_for_notional,
 )
-from bot.execution.outcome_execution import OutcomeExecutionAdapter
+from bot.outcome_live_execution_runtime import OutcomeLiveExecutionRuntime
+from bot.outcome_settlement import OutcomeSettlementAdapter
+from bot.outcome_ws_recorder import OutcomeWebSocketRecorder
+from bot.outcome_execution_ledger import OutcomeExecutionLedger
+from bot.outcome_operations_monitor import OutcomeOperationsMonitor
+from monitoring.trade_journal_db import TradeJournalDB
 from bot.enums import MarketPhase
 from bot.app_config import AppConfig
 from bot.runtime_env import load_runtime_env
@@ -94,9 +102,10 @@ def run_hyperliquid_preflight_checks(simulation: bool) -> bool:
 
     try:
         meta = client.get_outcome_meta_sync()
-        markets = discover_btc_15m_markets(meta)
-        logger.info(f"Hyperliquid Outcome BTC markets discovered: {len(markets)}")
-        selected, status = select_active_or_next_btc_market(markets)
+        preferences = parse_period_preferences(os.getenv("OUTCOME_MARKET_PERIODS"))
+        allow_fallback = os.getenv("OUTCOME_MARKET_ALLOW_FALLBACK", "1").strip().lower() not in {"0", "false", "no"}
+        selected, status, selected_period, fallback_used = select_configured_btc_market(meta, period_preferences=preferences, allow_fallback=allow_fallback)
+        logger.info(f"Hyperliquid Outcome market preferences={preferences} selected_period={selected_period} fallback={fallback_used}")
         if selected:
             logger.info(f"Active/Upcoming Outcome Market: ID={selected.outcome_id} Period={selected.period} Strike=${selected.strike} Expiry={selected.expiry_str} Status={status or 'active'}")
             
@@ -197,7 +206,16 @@ def run_integrated_hyperliquid_bot(
 
     client = OutcomeClient(auth)
     pricing = OutcomePricingState()
-    execution = OutcomeExecutionAdapter(client=client)
+    # Live orders are only dispatched through the recovery-aware official SDK
+    # runtime; this remains inert without both explicit execution gates.
+    live_journal = TradeJournalDB(os.getenv("OUTCOME_EXECUTION_JOURNAL_PATH", "./logs/outcome_execution.db"))
+    live_ws_recorder: OutcomeWebSocketRecorder | None = None
+    ops_monitor = OutcomeOperationsMonitor(live_journal, f"outcome-ops-{uuid.uuid4().hex[:10]}")
+    live_execution = OutcomeLiveExecutionRuntime(
+        account=client, wallet=auth.wallet_address,
+        ledger=OutcomeExecutionLedger(live_journal, f"outcome-live-{uuid.uuid4().hex[:10]}"),
+    )
+    settlement_adapter = OutcomeSettlementAdapter()
 
     dashboard_state = DashboardState(
         strike_price=0.0,
@@ -239,6 +257,8 @@ def run_integrated_hyperliquid_bot(
 
     refresh_interval = 1.5 if not test_mode else 1.0
     last_log_time = 0.0
+    market_preferences = parse_period_preferences(os.getenv("OUTCOME_MARKET_PERIODS"))
+    market_allow_fallback = os.getenv("OUTCOME_MARKET_ALLOW_FALLBACK", "1").strip().lower() not in {"0", "false", "no"}
 
     try:
         while True:
@@ -247,8 +267,11 @@ def run_integrated_hyperliquid_bot(
             # 1. Discover active market (with 20s TTL cache to respect API rate limits)
             try:
                 meta = client.get_outcome_meta_sync(ttl_sec=20.0)
-                markets = discover_btc_15m_markets(meta)
-                market, status = select_active_or_next_btc_market(markets)
+                market, status, selected_period, fallback_used = select_configured_btc_market(
+                    meta, period_preferences=market_preferences, allow_fallback=market_allow_fallback,
+                )
+                if fallback_used:
+                    logger.info(f"Outcome preferred market unavailable; using configured fallback period={selected_period}")
             except Exception as e:
                 logger.warning(f"Error fetching outcome metadata: {e}")
                 time.sleep(3.0)
@@ -277,6 +300,34 @@ def run_integrated_hyperliquid_bot(
                 pricing.update_l2_book(market.no_coin, book_no)
             except Exception as e:
                 logger.debug(f"Pricing update note: {e}")
+
+            if not simulation:
+                try:
+                    if live_ws_recorder is None or live_ws_recorder._market_id != market.outcome_id:
+                        if live_ws_recorder is not None:
+                            live_ws_recorder.stop()
+                        live_ws_recorder = OutcomeWebSocketRecorder(client, live_journal, f"outcome-live-ws-{uuid.uuid4().hex[:10]}")
+                    live_ws_recorder.start(outcome_id=market.outcome_id, yes_coin=market.yes_coin, no_coin=market.no_coin)
+                    if live_ws_recorder.resync_required.is_set():
+                        # The REST reads above are the mandatory post-connect
+                        # snapshot before a WS stream can permit entry.
+                        live_ws_recorder.mark_rest_resynced()
+                        live_ws_recorder.resync_required.clear()
+                    live_execution.stream_health = live_ws_recorder.health
+                except Exception as e:
+                    logger.warning(f"Outcome WS health setup failed; runtime will fail closed: {e}")
+                operational = ops_monitor.observe(
+                    market=market, fallback_used=fallback_used,
+                    stream_health=live_ws_recorder.health if live_ws_recorder else None,
+                    automated_execution_enabled=OutcomeLiveExecutionRuntime.enabled(),
+                )
+                if time.time() - last_log_time > 10:
+                    logger.info(
+                        f"[OUTCOME OPS] market=#{operational.market_id} period={operational.period} "
+                        f"fallback={operational.fallback_used} ws={operational.ws_reason} "
+                        f"auto_execution={operational.automated_execution_enabled}"
+                    )
+                    last_log_time = time.time()
 
             phase = evaluate_outcome_market_phase(market)
             time_left = market.time_to_expiry_sec()
@@ -308,8 +359,16 @@ def run_integrated_hyperliquid_bot(
 
             # 4. State machine execution (Hold-to-Redeem directional logic)
             if phase == MarketPhase.ACTIVE:
+                if not simulation:
+                    try:
+                        entry_side_index = 0 if active_side == "UP" else 1 if active_side == "DOWN" else None
+                        runtime_result = live_execution.tick_market(market=market, entry_side_index=entry_side_index)
+                        active_order_id = runtime_result.order_id if runtime_result.state in {"buy_placed", "buy_resting"} else None
+                        logger.info(f"[LIVE OUTCOME RUNTIME] state={runtime_result.state} detail={runtime_result.detail} order={runtime_result.order_id}")
+                    except Exception as e:
+                        logger.error(f"Outcome live runtime failed closed: {e}")
                 # Maker Buy quoting logic (1 entry per market invariant)
-                if inventory_shares <= 0 and active_order_id is None and active_side in ("UP", "DOWN"):
+                if simulation and inventory_shares <= 0 and active_order_id is None and active_side in ("UP", "DOWN"):
                     target_coin = market.yes_coin if active_side == "UP" else market.no_coin
                     target_bid = float(best_bid_yes if active_side == "UP" else best_bid_no or 0.50)
 
@@ -346,28 +405,6 @@ def run_integrated_hyperliquid_bot(
                                 )
                             active_order_id = None
                             logger.info(f"[SIMULATION FILL] Filled {min_shares} {active_side} @ ${target_bid:.4f}")
-                        else:
-                            try:
-                                side_index = 0 if active_side == "UP" else 1
-                                result = execution.submit_maker_buy(
-                                    outcome_id=market.outcome_id,
-                                    side_index=side_index,
-                                    price=Decimal(str(target_bid)),
-                                    target_shares=min_shares,
-                                )
-                                active_order_id = result.get("oid") or result.get("cloid")
-                                logger.info(f"[LIVE MAKER BUY] Order submitted: {result}")
-                                if terminal_dash and active_order_id:
-                                    terminal_dash.record_order_submitted(
-                                        side="buy",
-                                        token_side=active_side,
-                                        qty=float(min_shares),
-                                        price=target_bid,
-                                        client_order_id=str(active_order_id),
-                                        is_taker=False,
-                                    )
-                            except Exception as e:
-                                logger.error(f"Failed to submit live maker buy: {e}")
 
             elif phase == MarketPhase.REDUCE_ONLY:
                 if active_order_id:
@@ -378,8 +415,8 @@ def run_integrated_hyperliquid_bot(
                         logger.info("[SIMULATION] Cancelled active entry order in REDUCE_ONLY phase.")
                     else:
                         try:
-                            side_idx = 0 if active_side == "UP" else 1
-                            execution.cancel_order(market.outcome_id, side_idx, oid=active_order_id)
+                            result = live_execution.cancel_resting_buys(market=market)
+                            logger.info(f"[LIVE OUTCOME REDUCE_ONLY] state={result.state} detail={result.detail}")
                             if terminal_dash:
                                 terminal_dash.record_order_canceled(client_order_id=str(active_order_id))
                             active_order_id = None
@@ -388,25 +425,41 @@ def run_integrated_hyperliquid_bot(
 
             elif phase == MarketPhase.SETTLING:
                 if market.outcome_id not in settled_markets:
-                    settled_markets.add(market.outcome_id)
-                    won = (spot_px >= strike_px and inventory_side == "UP") or (spot_px < strike_px and inventory_side == "DOWN")
-                    payout_per_share = 1.0 if won else 0.0
-                    realized_pnl = (payout_per_share - inventory_entry_px) * inventory_shares if inventory_shares > 0 else 0.0
+                    if not simulation:
+                        try:
+                            settlement = settlement_adapter.fetch(market)
+                            if not settlement.settled:
+                                logger.info(f"[OUTCOME SETTLEMENT] #{market.outcome_id} not yet confirmed by official SDK; holding state.")
+                            else:
+                                settled_markets.add(market.outcome_id)
+                                logger.info(
+                                    f"[OUTCOME SETTLEMENT] #{market.outcome_id} confirmed by official SDK "
+                                    f"fraction={settlement.settle_fraction} details={settlement.details}"
+                                )
+                                # A standalone binary side has no generic SDK
+                                # redeem action.  Do not infer one from BTC price.
+                        except Exception as e:
+                            logger.warning(f"[OUTCOME SETTLEMENT] official confirmation unavailable: {e}")
+                    else:
+                        settled_markets.add(market.outcome_id)
+                        won = (spot_px >= strike_px and inventory_side == "UP") or (spot_px < strike_px and inventory_side == "DOWN")
+                        payout_per_share = 1.0 if won else 0.0
+                        realized_pnl = (payout_per_share - inventory_entry_px) * inventory_shares if inventory_shares > 0 else 0.0
 
-                    logger.info(
-                        f"[SETTLEMENT] Outcome #{market.outcome_id} Settled! "
-                        f"Strike=${strike_px:,.2f} Final Spot=${spot_px:,.2f} "
-                        f"Result={'WIN' if won else 'LOSS'} Realized PnL: ${realized_pnl:+.4f} USDC"
-                    )
+                        logger.info(
+                            f"[SETTLEMENT] Outcome #{market.outcome_id} Settled! "
+                            f"Strike=${strike_px:,.2f} Final Spot=${spot_px:,.2f} "
+                            f"Result={'WIN' if won else 'LOSS'} Realized PnL: ${realized_pnl:+.4f} USDC"
+                        )
 
-                    if terminal_dash:
-                        terminal_dash.record_cycle(slug=f"Outcome #{market.outcome_id}", pnl_usdc=realized_pnl)
-                        terminal_dash.increment_redeem()
+                        if terminal_dash:
+                            terminal_dash.record_cycle(slug=f"Outcome #{market.outcome_id}", pnl_usdc=realized_pnl)
+                            terminal_dash.increment_redeem()
 
-                    inventory_shares = 0.0
-                    inventory_side = None
-                    inventory_entry_px = 0.0
-                    active_order_id = None
+                        inventory_shares = 0.0
+                        inventory_side = None
+                        inventory_entry_px = 0.0
+                        active_order_id = None
 
             # 5. Update dashboard state
             with dashboard_state._lock:
@@ -462,6 +515,8 @@ def run_integrated_hyperliquid_bot(
     except KeyboardInterrupt:
         logger.info("Hyperliquid trading bot stopped by user.")
     finally:
+        if live_ws_recorder is not None:
+            live_ws_recorder.stop()
         if terminal_dash:
             terminal_dash.stop()
         logger.info("Hyperliquid trading bot shutdown complete.")

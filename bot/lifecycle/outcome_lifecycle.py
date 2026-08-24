@@ -258,6 +258,57 @@ def discover_btc_15m_markets(
     return all_btc
 
 
+def parse_period_preferences(value: str | None, *, default: tuple[str, ...] = ("15m", "1d", "1h", "daily", "24h")) -> tuple[str, ...]:
+    """Parse operator market-period preferences without requiring 15m to exist."""
+    if not value or not value.strip():
+        return default
+    periods = tuple(item.strip().lower() for item in value.split(",") if item.strip())
+    if not periods:
+        raise ValueError("Outcome market period preference cannot be empty")
+    return periods
+
+
+def discover_btc_markets_by_preference(
+    outcome_meta: Dict[str, Any],
+    *,
+    period_preferences: tuple[str, ...],
+    allow_fallback: bool = True,
+    current_timestamp: Optional[int] = None,
+) -> tuple[List[OutcomeMarketSpec], Optional[str], bool]:
+    """Return markets for the first available preferred period.
+
+    A temporary absence of 15m contracts is normal during Outcome rollout.
+    This function selects the first *available* configured period rather than
+    treating its absence as a discovery failure.  With fallback disabled it
+    returns an empty list, allowing an operator to require an exact period.
+    """
+    all_markets = discover_btc_markets(outcome_meta, current_timestamp=current_timestamp, allowed_periods=())
+    for period in period_preferences:
+        matching = [market for market in all_markets if market.period == period]
+        if matching:
+            return matching, period, period != period_preferences[0]
+    if not allow_fallback:
+        return [], None, False
+    # If an unforeseen but valid period appears, prefer it over an outage.
+    return all_markets, (all_markets[0].period if all_markets else None), bool(all_markets)
+
+
+def select_configured_btc_market(
+    outcome_meta: Dict[str, Any],
+    *,
+    period_preferences: tuple[str, ...],
+    allow_fallback: bool = True,
+    current_timestamp: Optional[int] = None,
+) -> tuple[Optional[OutcomeMarketSpec], Optional[str], Optional[str], bool]:
+    """Select active/next configured BTC market plus chosen-period metadata."""
+    markets, period, fallback_used = discover_btc_markets_by_preference(
+        outcome_meta, period_preferences=period_preferences, allow_fallback=allow_fallback,
+        current_timestamp=current_timestamp,
+    )
+    selected, status = select_active_or_next_btc_market(markets, current_timestamp=current_timestamp)
+    return selected, status, period, fallback_used
+
+
 def select_active_or_next_btc_market(
     markets: List[OutcomeMarketSpec],
     current_timestamp: Optional[int] = None,

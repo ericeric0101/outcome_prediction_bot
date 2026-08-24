@@ -30,3 +30,11 @@ def test_parity_marks_insufficient_depth_instead_of_inventing_price():
     result = OutcomeParityAnalyzer(Decimal("10")).analyze(_market(), book, book)
     assert result.buy_complete_set_cost is None
     assert result.sell_complete_set_proceeds is None
+
+
+def test_parity_retains_fee_evidence_state_without_claiming_live_trade():
+    book = {"levels": [[{"px": "0.51", "sz": "10"}], [{"px": "0.49", "sz": "10"}]]}
+    result = OutcomeParityAnalyzer(Decimal("10"), fee_rate=Decimal("0.001")).analyze(_market(), book, book)
+    assert result.fee_status == "verified_included"
+    assert result.fee_rate == Decimal("0.001")
+    assert result.as_dict()["research_only"] is True
