@@ -7,7 +7,7 @@ import { createInterface } from "node:readline";
 type Command = "health" | "fetch_markets" | "fetch_order_book" | "fetch_settled_outcome" | "fetch_account_snapshot" | "place_limit_order" | "cancel_order" | "merge_outcome";
 type Request = { id: string; command: Command; testnet?: boolean; payload?: Record<string, unknown> };
 type Response = { id: string; ok: boolean; result?: unknown; error?: { code: string; message: string } };
-type LimitOrderPayload = { marketId: string; outcome: string; side: "buy" | "sell"; price: string; amount: string; timeInForce?: "GTC" | "GTD" | "FOK" | "FAK" | "ALO" };
+type LimitOrderPayload = { marketId: string; outcome: string; side: "buy" | "sell"; price: string; amount: string; timeInForce?: "GTC" | "GTD" | "FOK" | "FAK" | "ALO"; skipMinNotionalCheck?: boolean };
 type CancelPayload = { marketId: string; outcome: string; orderId: string };
 type MergePayload = { marketId: string; amount: string };
 
@@ -43,13 +43,16 @@ function parseLimitPayload(payload: Record<string, unknown> | undefined): LimitO
   const amount = requireString(payload?.amount, "payload.amount");
   const side = payload?.side;
   const timeInForce = payload?.timeInForce ?? "GTC";
+  const skipMinNotionalCheck = payload?.skipMinNotionalCheck;
   if (side !== "buy" && side !== "sell") throw new Error("payload.side must be buy or sell");
   if (!["GTC", "GTD", "FOK", "FAK", "ALO"].includes(String(timeInForce))) throw new Error("invalid timeInForce");
+  if (skipMinNotionalCheck !== undefined && typeof skipMinNotionalCheck !== "boolean") throw new Error("payload.skipMinNotionalCheck must be boolean");
+  if (skipMinNotionalCheck && side !== "sell") throw new Error("skipMinNotionalCheck is allowed only for reduce-only sell flows");
   if (!/^\d+$/.test(amount) || Number(amount) <= 0) throw new Error("Outcome amount must be a positive integer number of shares");
   const numericPrice = Number(price);
   if (!Number.isFinite(numericPrice) || numericPrice <= 0 || numericPrice >= 1) throw new Error("price must be strictly between 0 and 1");
-  if (numericPrice * Number(amount) < 10) throw new Error("order notional must be at least 10 USDC");
-  return { marketId, outcome, side, price, amount, timeInForce: timeInForce as LimitOrderPayload["timeInForce"] };
+  if (numericPrice * Number(amount) < 10 && !skipMinNotionalCheck) throw new Error("order notional must be at least 10 USDC unless this is a reduce-only sell");
+  return { marketId, outcome, side, price, amount, timeInForce: timeInForce as LimitOrderPayload["timeInForce"], skipMinNotionalCheck: Boolean(skipMinNotionalCheck) };
 }
 function parseCancelPayload(payload: Record<string, unknown> | undefined): CancelPayload {
   const marketId = requireString(payload?.marketId, "payload.marketId");

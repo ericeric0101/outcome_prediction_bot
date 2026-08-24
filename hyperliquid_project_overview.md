@@ -128,6 +128,14 @@ Outcome/HIP-4 的機制提供四個需驗證的研究方向：
 
 **正式官方 SDK execution adapter（2026-08-23）：** `outcome_sdk_sidecar/` 使用官方 `@outcome.xyz/hip4` TypeScript SDK，`bot/outcome_sdk_sidecar.py` 是唯一 Python 邊界。它提供 `place_limit_order` 與 `cancel_order`，但每一層預設關閉：Python 呼叫端必須給 `allow_execution=True`，且 operator 必須明確設定 `OUTCOME_SDK_EXECUTION_ENABLED=1`。下單只接受整數 shares、價格 0–1、至少 10 USDC、存在的 market/outcome side；ALO 會以即時 order book 拒絕穿價。取消會先以 configured wallet 讀取 open orders，只有 oid 仍屬於該錢包且 outcome 一致時才簽名。私鑰只在 TypeScript sidecar process；Python 不接收。先前的 `outcome_canary_*` 一次性 scripts 已刪除，未來測試必須走這個正式 adapter，不再增加臨時執行腳本。
 
+**Residual close minimum-notional 修正（2026-08-24）：** 已安裝的 official SDK `@outcome.xyz/hip4@1.0.3-beta` 型別與實作均確認 `PredictionOrderParams.skipMinNotionalCheck?: boolean` 是給 close / close-all residual 用途：它只跳過 SDK 的本地 minimum-notional / minimum-shares pre-check，實際 exchange 是否接受仍由 Hyperliquid 決定。原先 Python gateway 與 TS sidecar 對所有 sell 也套用 $10，會錯誤阻擋部分成交後的小額保護性出場；現已修正如下：
+
+1. `OutcomeExecutionGateway.place_alo()` 的低於 $10 sell 必須明確給 `reduce_only=True`，否則在 Python 層 fail-closed；buy 永遠不可用此旗標。
+2. `OutcomeMakerStateMachine` 只在本 tick 由 wallet `spotClearinghouseState` 同步到正整數 inventory、且正要為全部該 inventory 建 protective ALO sell 時，才傳入 `reduce_only=True`。它不會為任意 strategy sell、未確認庫存、或小數 shares 繞過限制。
+3. sidecar 只接受 boolean `skipMinNotionalCheck`，且只允許 sell；它把此欄位傳給官方 `hip4.trading.placeOrder()`。generic sell / buy、非整數 amount、或一般低於 $10 order 仍在本地拒絕。
+
+這是**僅限平倉的 SDK pre-check 例外**，不是免除交易所規則，也不是新的實盤授權；這次沒有提交低於 $10 的 live sell。ALO response 的 `orderId` / `status` 欄位名稱已由 installed SDK `PredictionOrderResult` 確認，且先前成功建立的正式 ALO buy/sell 已實際通過 gateway 的 `status == "resting"` gate。修正驗證：`tests/test_outcome_execution_gateway.py`、`tests/test_outcome_maker_state_machine.py`、`tests/test_outcome_live_execution_runtime.py` **17 passed**；sidecar `npm run build` 通過；完整 repository regression **380 passed**。
+
 **正式 maker cycle runner（2026-08-23）：** `python -m bot.outcome_maker_cycle --market-id <id> --outcome <#side>` 是唯一的單次買入→賣出測試／操作入口，不建立暫時腳本。它讀 current first bid、以 `ceil(10 / bid)` 的整數 shares 掛 ALO buy；只有帳戶 spot balance 證明持倉後，才取消未成交 remainder、讀 current first ask、以同一已持有數量掛 ALO sell。任何 ALO crossing、買單消失卻沒有 inventory、非整數 inventory、或 sidecar reply 非 resting 都會停止，絕不 fallback 成 taker；900 秒 timeout 時會取消仍未成交的 buy，避免孤兒掛單。它還需 `OUTCOME_MAKER_CYCLE_ENABLED=1` 與 `OUTCOME_SDK_EXECUTION_ENABLED=1` 兩個 operator gates。
 
 Runner 啟動時立即輸出監看中的 oid／price／shares，之後每 30 秒輸出一次 resting status。`Ctrl+C` 是 operator stop：乾淨退出、**不**自行取消 live order，必須由 operator 明確 reconcile 或 cancel；避免把「停止監看」誤解成「授權撤單」。

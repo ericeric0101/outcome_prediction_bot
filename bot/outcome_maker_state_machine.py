@@ -72,7 +72,16 @@ class OutcomeMakerStateMachine:
                 return MakerTickResult("blocked", "cancelled unfilled buy remainder before protective sell", str(order["oid"]))
             book = self.gateway.fetch_order_book(market=market, side_index=side_index)
             ask = self._best(book["asks"], "ask")
-            result = self.gateway.place_alo(market=market, side_index=side_index, is_buy=False, price=ask, requested_shares=inventory)
+            result = self.gateway.place_alo(
+                market=market,
+                side_index=side_index,
+                is_buy=False,
+                price=ask,
+                requested_shares=inventory,
+                # ``inventory`` came from this tick's wallet reconciliation;
+                # allow the official SDK's documented residual-close exception.
+                reduce_only=True,
+            )
             return MakerTickResult("sell_placed", "placed ALO sell for reconciled inventory", str(result["orderId"]))
 
         if sells:

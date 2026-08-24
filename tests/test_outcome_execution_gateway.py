@@ -35,3 +35,37 @@ def test_gateway_only_uses_official_sidecar_contract():
 def test_gateway_rejects_invalid_side_index():
     with pytest.raises(ValueError):
         OutcomeExecutionGateway.outcome_coin(_market(), 2)
+
+
+def test_gateway_allows_a_wallet_reconciled_subminimum_reduce_only_sell():
+    calls = []
+
+    class Sidecar:
+        def request(self, command, **kwargs):
+            calls.append((command, kwargs))
+            return {"status": "resting", "orderId": "43"}
+
+    result = OutcomeExecutionGateway(Sidecar()).place_alo(
+        market=_market(), side_index=0, is_buy=False, price=Decimal("0.78"),
+        requested_shares=Decimal("3"), reduce_only=True,
+    )
+
+    assert result["shares"] == 3
+    assert calls[0][1]["payload"]["skipMinNotionalCheck"] is True
+
+
+def test_gateway_rejects_subminimum_sell_without_reduce_only_attestation():
+    class Sidecar:
+        def request(self, *_args, **_kwargs):
+            raise AssertionError("sidecar must not be called")
+
+    with pytest.raises(RuntimeError, match="requires reduce_only=True"):
+        OutcomeExecutionGateway(Sidecar()).place_alo(
+            market=_market(), side_index=0, is_buy=False, price=Decimal("0.78"),
+            requested_shares=Decimal("3"),
+        )
+
+
+def test_gateway_rejects_fractional_reduce_only_inventory():
+    with pytest.raises(ValueError, match="integer number of shares"):
+        whole_share_size(Decimal("0.78"), Decimal("3.1"), enforce_minimum=False)

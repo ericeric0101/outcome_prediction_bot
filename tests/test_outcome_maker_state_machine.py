@@ -35,6 +35,7 @@ def test_tick_never_adds_to_filled_inventory_and_places_protective_sell():
     assert result.state == "sell_placed"
     assert gateway.calls[0][1]["is_buy"] is False
     assert gateway.calls[0][1]["requested_shares"] == Decimal("13")
+    assert gateway.calls[0][1]["reduce_only"] is True
 
 
 def test_tick_cancels_partial_buy_before_sale():

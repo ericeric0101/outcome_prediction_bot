@@ -32,7 +32,7 @@ class OutcomeSdkSidecarClient:
         command: SidecarCommand,
         *,
         testnet: bool = False,
-        payload: Mapping[str, str] | None = None,
+        payload: Mapping[str, Any] | None = None,
         allow_execution: bool = False,
     ) -> Any:
         if command in {"place_limit_order", "cancel_order", "merge_outcome"} and not allow_execution:
