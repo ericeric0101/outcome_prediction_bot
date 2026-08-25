@@ -17,6 +17,7 @@ from bot.outcome_execution_gateway import OutcomeExecutionGateway
 class AccountReader(Protocol):
     def get_spot_clearinghouse_state_sync(self, user: str) -> dict[str, Any]: ...
     def get_open_orders_sync(self, user: str) -> list[dict[str, Any]]: ...
+    def get_user_fills_sync(self, user: str) -> list[dict[str, Any]]: ...
 
 
 @dataclass(frozen=True)
@@ -24,6 +25,7 @@ class MakerTickResult:
     state: Literal["flat", "buy_resting", "sell_resting", "buy_placed", "sell_placed", "blocked"]
     detail: str
     order_id: str | None = None
+    audit: dict[str, str] | None = None
 
 
 class OutcomeMakerStateMachine:
@@ -80,6 +82,52 @@ class OutcomeMakerStateMachine:
         floor = avg_entry_price * (Decimal("1") - loss_reprice_pct) / (Decimal("1") - maker_close_fee_rate)
         return floor if Decimal("0") < floor < Decimal("0.99999") else None
 
+    def _fill_vwap_for_inventory(self, *, coin: str, inventory: Decimal) -> Decimal | None:
+        """Reconstruct the remaining long inventory from exchange-confirmed fills.
+
+        ``entryNtl`` is useful account metadata, but a take-profit calculation
+        must not silently rely on it when it disagrees with the exchange's
+        actual fills.  FIFO reconstruction is intentionally conservative: a
+        partial or incomplete fill history returns ``None`` rather than an
+        unverifiable price.
+        """
+        get_fills = getattr(self.account, "get_user_fills_sync", None)
+        if not callable(get_fills) or inventory <= 0:
+            return None
+        lots: list[list[Decimal]] = []
+        try:
+            fills = sorted(get_fills(self.wallet), key=lambda fill: int(fill.get("time", 0)))
+        except (TypeError, ValueError):
+            return None
+        for raw in fills:
+            if str(raw.get("coin")) != coin:
+                continue
+            try:
+                quantity = Decimal(str(raw.get("sz")))
+                price = Decimal(str(raw.get("px")))
+            except (ArithmeticError, ValueError):
+                continue
+            if quantity <= 0 or not Decimal("0") < price < Decimal("1"):
+                continue
+            side = str(raw.get("side", "")).upper()
+            if side in {"B", "BUY"}:
+                lots.append([quantity, price])
+            elif side in {"A", "SELL"}:
+                remaining = quantity
+                while remaining > 0 and lots:
+                    lot = lots[0]
+                    consumed = min(remaining, lot[0])
+                    lot[0] -= consumed
+                    remaining -= consumed
+                    if lot[0] == 0:
+                        lots.pop(0)
+                if remaining > 0:
+                    return None
+        reconstructed_quantity = sum((lot[0] for lot in lots), Decimal("0"))
+        if reconstructed_quantity != inventory:
+            return None
+        return sum((lot[0] * lot[1] for lot in lots), Decimal("0")) / inventory
+
     def tick(
         self, *, market: OutcomeMarketSpec, side_index: int, entry_permitted: bool,
         minimum_return_pct: Decimal | None = None, maker_close_fee_rate: Decimal | None = None,
@@ -92,7 +140,23 @@ class OutcomeMakerStateMachine:
         sells = [order for order in orders if order.get("side") == "A"]
 
         if inventory > 0:
-            avg_entry = (entry_notional / inventory) if inventory else Decimal("0")
+            account_entry_vwap = (entry_notional / inventory) if inventory else Decimal("0")
+            fill_entry_vwap = self._fill_vwap_for_inventory(coin=coin, inventory=inventory)
+            # Calibration exits must use exchange-confirmed fill VWAP.  This
+            # prevents a stale or semantically different ``entryNtl`` value
+            # from generating a sell below the configured net target.
+            if minimum_return_pct is not None and fill_entry_vwap is None:
+                return MakerTickResult(
+                    "blocked", "cannot verify fill VWAP for calibration exit; explicit reconciliation required",
+                    audit={"account_entry_vwap": str(account_entry_vwap), "inventory": str(inventory)},
+                )
+            avg_entry = fill_entry_vwap or account_entry_vwap
+            audit = {
+                "inventory": str(inventory),
+                "account_entry_vwap": str(account_entry_vwap),
+                "fill_entry_vwap": str(fill_entry_vwap) if fill_entry_vwap is not None else "unavailable",
+                "pricing_basis": "exchange_fill_vwap" if fill_entry_vwap is not None else "account_entry_ntl",
+            }
             profit_target = self._target_sell_price(
                 avg_entry_price=avg_entry, minimum_return_pct=minimum_return_pct, maker_close_fee_rate=maker_close_fee_rate,
             )
@@ -100,7 +164,7 @@ class OutcomeMakerStateMachine:
                 avg_entry_price=avg_entry, loss_reprice_pct=loss_reprice_pct, maker_close_fee_rate=maker_close_fee_rate,
             )
             if minimum_return_pct is not None and profit_target is None:
-                return MakerTickResult("blocked", "calibration take-profit target is not executable; inventory requires explicit reconciliation")
+                return MakerTickResult("blocked", "calibration take-profit target is not executable; inventory requires explicit reconciliation", audit=audit)
             covering = next((order for order in sells if Decimal(str(order.get("sz", "0"))) >= inventory), None)
             if covering:
                 # ALO cannot guarantee an immediate stop.  Once the midpoint
@@ -114,14 +178,14 @@ class OutcomeMakerStateMachine:
                 existing_price = Decimal(str(covering.get("limitPx", covering.get("px", "0"))))
                 if loss_triggered and existing_price > loss_floor:
                     self.gateway.cancel_owned_order(market=market, side_index=side_index, order_id=str(covering["oid"]))
-                    return MakerTickResult("blocked", "loss threshold crossed; cancelled old profit sell for maker-only protection reprice", str(covering["oid"]))
-                return MakerTickResult("sell_resting", "inventory is protected by owned ALO sell", str(covering.get("oid")))
+                    return MakerTickResult("blocked", "loss threshold crossed; cancelled old profit sell for maker-only protection reprice", str(covering["oid"]), audit)
+                return MakerTickResult("sell_resting", "inventory is protected by owned ALO sell", str(covering.get("oid")), audit)
             if buys:
                 # Never add exposure after any fill.  The next tick will see
                 # the cancelled remainder and then post the protective sale.
                 order = buys[0]
                 self.gateway.cancel_owned_order(market=market, side_index=side_index, order_id=str(order["oid"]))
-                return MakerTickResult("blocked", "cancelled unfilled buy remainder before protective sell", str(order["oid"]))
+                return MakerTickResult("blocked", "cancelled unfilled buy remainder before protective sell", str(order["oid"]), audit)
             book = self.gateway.fetch_order_book(market=market, side_index=side_index)
             bid, ask = self._best(book["bids"], "bid"), self._best(book["asks"], "ask")
             midpoint = (bid + ask) / Decimal("2")
@@ -129,18 +193,25 @@ class OutcomeMakerStateMachine:
             target = loss_floor if loss_triggered else profit_target
             assert target is not None or minimum_return_pct is None
             target = target or ask
+            requested_price = max(ask, target)
+            audit.update({
+                "requested_price": str(requested_price),
+                "take_profit_price": str(profit_target) if profit_target is not None else "unavailable",
+                "loss_reprice_floor": str(loss_floor) if loss_floor is not None else "unavailable",
+                "exit_mode": "loss_band" if loss_triggered else "take_profit",
+            })
             result = self.gateway.place_alo(
                 market=market,
                 side_index=side_index,
                 is_buy=False,
-                price=max(ask, target),
+                price=requested_price,
                 requested_shares=inventory,
                 # ``inventory`` came from this tick's wallet reconciliation;
                 # allow the official SDK's documented residual-close exception.
                 reduce_only=True,
             )
             detail = "placed maker-only loss-band protection sell" if loss_triggered else "placed net take-profit ALO sell for reconciled inventory"
-            return MakerTickResult("sell_placed", detail, str(result["orderId"]))
+            return MakerTickResult("sell_placed", detail, str(result["orderId"]), audit)
 
         if sells:
             return MakerTickResult("blocked", "wallet has sell order without inventory; reconcile explicitly", str(sells[0].get("oid")))

@@ -30,13 +30,12 @@ class OutcomeP3Pipeline:
     def record_actual_fill(self, fill: OutcomeFillEvent, *, period: str | None) -> bool:
         if self._has_fill(fill.trade_id):
             return False
-        self.bridge.record_fill(fill, market_key=f"outcome:{fill.outcome_id}", extra_payload={
+        return self.bridge.record_fill(fill, market_key=f"outcome:{fill.outcome_id}", extra_payload={
             "actual_fill": True,
             "period": period or "unknown",
             "fill_provenance": "hyperliquid_userFills",
             "research_only": True,
         })
-        return True
 
     def _actual_fills(self, *, outcome_id: int, period: str) -> list[OutcomeFillEvent]:
         with sqlite3.connect(self.journal.db_path) as conn:

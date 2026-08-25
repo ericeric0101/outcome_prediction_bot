@@ -151,7 +151,7 @@ class OutcomeJournalBridge:
         *,
         market_key: str,
         extra_payload: Optional[Mapping[str, Any]] = None,
-    ) -> None:
+    ) -> bool:
         payload: Dict[str, Any] = {
             "venue": "hyperliquid_outcome",
             "market_key": market_key,
@@ -167,9 +167,9 @@ class OutcomeJournalBridge:
         }
         if extra_payload:
             payload.update(dict(extra_payload))
-        self.journal.log_order_event(
+        return self.journal.log_outcome_fill_once(
             self.run_id,
-            "ORDER_FILLED",
+            trade_id=fill.trade_id,
             client_order_id=fill.client_order_id,
             venue_order_id=fill.venue_order_id,
             side=fill.side,

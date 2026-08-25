@@ -114,6 +114,13 @@ class TradeJournalDB:
         CREATE INDEX IF NOT EXISTS idx_order_events_run_ts ON order_events(run_id, ts);
         CREATE INDEX IF NOT EXISTS idx_order_events_client ON order_events(client_order_id);
 
+        -- An Outcome exchange trade ID is one fact even when both the live
+        -- runtime and P3 collector observe it concurrently.
+        CREATE TABLE IF NOT EXISTS outcome_fill_registry (
+            trade_id TEXT PRIMARY KEY,
+            first_seen_at TEXT NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS strategy_events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             ts TEXT NOT NULL,
@@ -127,6 +134,20 @@ class TradeJournalDB:
         try:
             with self._connect() as conn:
                 conn.executescript(ddl)
+                # Seed the registry from journals created before the atomic
+                # registry existed.  We preserve raw history for audit, while
+                # preventing a restarted collector from inserting it again.
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO outcome_fill_registry (trade_id, first_seen_at)
+                    SELECT json_extract(payload_json, '$.trade_id'), MIN(ts)
+                    FROM order_events
+                    WHERE event_type='ORDER_FILLED'
+                      AND json_extract(payload_json, '$.venue')='hyperliquid_outcome'
+                      AND COALESCE(json_extract(payload_json, '$.trade_id'), '') <> ''
+                    GROUP BY json_extract(payload_json, '$.trade_id')
+                    """
+                )
                 conn.commit()
         except Exception as e:
             logger.warning(f"TradeJournalDB schema init failed: {e}")
@@ -696,6 +717,52 @@ class TradeJournalDB:
                 conn.commit()
         except Exception as e:
             logger.debug(f"TradeJournalDB log_order_event failed: {e}")
+
+    def log_outcome_fill_once(
+        self,
+        run_id: str,
+        *,
+        trade_id: str,
+        client_order_id: Optional[str] = None,
+        venue_order_id: Optional[str] = None,
+        side: Optional[str] = None,
+        price: Optional[float] = None,
+        qty: Optional[float] = None,
+        status: Optional[str] = "FILLED",
+        instrument_id: Optional[str] = None,
+        commission_usdc: Optional[float] = None,
+        payload: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """Atomically persist one HIP-4 fill across every local writer."""
+        normalized_trade_id = str(trade_id or "").strip()
+        if not normalized_trade_id:
+            raise ValueError("Outcome fill requires a non-empty exchange trade_id")
+        sql = """
+        INSERT INTO order_events (
+            ts, run_id, event_type, client_order_id, venue_order_id, side, price, qty, status,
+            instrument_id, commission_usdc, payload_json
+        ) VALUES (?, ?, 'ORDER_FILLED', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """
+        try:
+            with self._connect() as conn:
+                claimed = conn.execute(
+                    "INSERT OR IGNORE INTO outcome_fill_registry (trade_id, first_seen_at) VALUES (?, ?)",
+                    (normalized_trade_id, _utc_now_iso()),
+                )
+                if claimed.rowcount != 1:
+                    return False
+                conn.execute(
+                    sql,
+                    (
+                        _utc_now_iso(), run_id, client_order_id, venue_order_id, side, price, qty,
+                        status, instrument_id, commission_usdc, _json_dumps(payload or {}),
+                    ),
+                )
+                conn.commit()
+            return True
+        except Exception as e:
+            logger.debug(f"TradeJournalDB log_outcome_fill_once failed: {e}")
+            return False
 
     def load_recent_buy_submits(self, instrument_id: str, limit: int = 20) -> list[Dict[str, Any]]:
         if not instrument_id:
