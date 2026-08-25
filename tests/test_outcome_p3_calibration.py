@@ -17,10 +17,9 @@ def test_side_choice_follows_feasible_market_mid_consensus_not_sample_balance():
         mids={0: Decimal("0.80"), 1: Decimal("0.20")}, entry_bids={0: Decimal("0.79"), 1: Decimal("0.19")},
         target_return_pct=Decimal("0.05"), maker_close_fee_rate=Decimal("0.0004"), tie_breaker=2,
     ) == 0
-    # A high-probability side is only excluded when the configured profit band
-    # cannot fit below the legal price ceiling; the lower side is not chosen to
-    # balance a sample count.
+    # If the market-consensus side cannot fit below the legal price ceiling,
+    # the complementary side is not used as a directional fallback.
     assert choose_consensus_calibration_side(
         mids={0: Decimal("0.97"), 1: Decimal("0.03")}, entry_bids={0: Decimal("0.96"), 1: Decimal("0.02")},
         target_return_pct=Decimal("0.05"), maker_close_fee_rate=Decimal("0.0004"), tie_breaker=2,
-    ) == 1
+    ) is None

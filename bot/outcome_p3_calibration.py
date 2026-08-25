@@ -55,12 +55,13 @@ def choose_consensus_calibration_side(
     alpha.  It deliberately does not force a low-probability complementary
     side merely to balance data collection.
     """
-    feasible = [
-        side for side, bid in entry_bids.items()
-        if Decimal("0") < bid < Decimal("1")
-        and take_profit_price(entry_price=bid, target_return_pct=target_return_pct, maker_close_fee_rate=maker_close_fee_rate) is not None
-        and whole_share_size(bid) > 0
-    ]
-    if not feasible:
+    candidates = [side for side in mids if side in entry_bids and Decimal("0") < entry_bids[side] < Decimal("1")]
+    if not candidates:
         return None
-    return max(feasible, key=lambda side: (mids.get(side, Decimal("-1")), -((side - tie_breaker) % 2)))
+    consensus_side = max(candidates, key=lambda side: (mids[side], -((side - tie_breaker) % 2)))
+    bid = entry_bids[consensus_side]
+    # Never fall back to the complementary low-consensus side merely because
+    # the preferred side cannot fit the configured maker take-profit band.
+    if take_profit_price(entry_price=bid, target_return_pct=target_return_pct, maker_close_fee_rate=maker_close_fee_rate) is None:
+        return None
+    return consensus_side if whole_share_size(bid) > 0 else None
