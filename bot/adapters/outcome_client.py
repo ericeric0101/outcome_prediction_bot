@@ -217,6 +217,10 @@ class OutcomeClient:
         self._cache["allMids"] = (now, data)
         return data
 
+    def get_user_fees_sync(self, user: str) -> Dict[str, Any]:
+        """Fetch the wallet's effective Hyperliquid spot fee schedule read-only."""
+        return self.post_info_sync({"type": "userFees", "user": user})
+
     async def get_l2_book(self, coin: str, ttl_sec: float = 1.0) -> Dict[str, Any]:
         """Fetch L2 order book depth for a coin with TTL caching."""
         now = time.time()

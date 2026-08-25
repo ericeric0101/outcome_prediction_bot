@@ -9,6 +9,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+from bot.outcome_p2_quality import is_eligible_p2_snapshot
+
 
 @dataclass(frozen=True)
 class P2PeriodReport:
@@ -46,7 +48,7 @@ def p2_report(db_path: str | Path, *, periods: tuple[str, ...], min_snapshots: i
             payload = json.loads(raw)
         except (TypeError, json.JSONDecodeError):
             continue
-        if isinstance(payload, dict) and payload.get("venue") == "hyperliquid_outcome":
+        if isinstance(payload, dict) and payload.get("venue") == "hyperliquid_outcome" and is_eligible_p2_snapshot(payload):
             data.append(payload)
     reports = []
     for period in periods:

@@ -8,6 +8,7 @@ from typing import Any, Iterable
 
 from bot.outcome_event_bridge import OutcomeFillEvent, OutcomeJournalBridge
 from bot.outcome_markout import OutcomeQuote, markouts_for_fill
+from bot.outcome_p2_quality import is_eligible_p2_snapshot
 from monitoring.trade_journal_db import TradeJournalDB
 
 
@@ -81,6 +82,8 @@ class OutcomeP3Pipeline:
             try:
                 snapshot = json.loads(raw)
             except (TypeError, json.JSONDecodeError):
+                continue
+            if not isinstance(snapshot, dict) or not is_eligible_p2_snapshot(snapshot):
                 continue
             if snapshot.get("period") != period or int(snapshot.get("outcome_id", -1)) != outcome_id:
                 continue

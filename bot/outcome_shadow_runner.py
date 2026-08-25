@@ -32,6 +32,7 @@ from bot.outcome_event_bridge import OutcomeJournalBridge
 from bot.outcome_spec_audit import OutcomeSpecAudit
 from bot.outcome_ws_recorder import OutcomeWebSocketRecorder
 from bot.outcome_p3_pipeline import OutcomeP3Pipeline
+from bot.outcome_p2_quality import P2_SCHEMA_VERSION, build_p2_capture_quality
 from bot.position_manager import PositionManager, PositionManagerConfig
 from bot.pricing.outcome_pricing import OutcomePricingState
 from bot.signal_engine import SignalEngine, SignalEngineConfig
@@ -339,16 +340,48 @@ class OutcomeShadowRunner:
         mids = self.client.get_all_mids_sync(ttl_sec=0)
         self.pricing.update_btc_mark_price(mids["BTC"])
         raw_books = {}
+        local_received_at_ms: dict[str, int] = {}
         for coin in (market.yes_coin, market.no_coin):
             raw_books[coin] = self.client.get_l2_book_sync(coin, ttl_sec=0)
+            local_received_at_ms[coin] = int(time.time() * 1000)
             self.pricing.update_l2_book(coin, raw_books[coin])
-        parity = self.parity_analyzer.analyze(market, raw_books[market.yes_coin], raw_books[market.no_coin])
+        capture_complete_at_ms = int(time.time() * 1000)
+        capture_quality = build_p2_capture_quality(
+            yes_book=raw_books[market.yes_coin], no_book=raw_books[market.no_coin],
+            yes_local_received_at_ms=local_received_at_ms[market.yes_coin],
+            no_local_received_at_ms=local_received_at_ms[market.no_coin],
+            capture_complete_at_ms=capture_complete_at_ms,
+        )
+        try:
+            user_fees = self.client.get_user_fees_sync(self.account.wallet_address)
+            maker_close_fee_rate = Decimal(str(user_fees["userSpotAddRate"]))
+            taker_close_fee_rate = Decimal(str(user_fees["userSpotCrossRate"]))
+            fee_evidence: dict[str, Any] = {
+                "source": "hyperliquid_userFees",
+                "open_fee_rate": "0",
+                "user_spot_cross_rate": str(taker_close_fee_rate),
+                "user_spot_add_rate": str(maker_close_fee_rate),
+                # userFees does not establish every market's conversion or
+                # settlement cost, so it cannot unlock P2 economics by itself.
+                "status": "observed_settlement_conversion_unverified",
+            }
+        except Exception as exc:
+            maker_close_fee_rate = None
+            taker_close_fee_rate = None
+            fee_evidence = {"source": "hyperliquid_userFees", "status": "unavailable", "error_type": type(exc).__name__}
+        parity = OutcomeParityAnalyzer(
+            self.parity_analyzer.requested_shares,
+            maker_close_fee_rate=maker_close_fee_rate,
+            taker_close_fee_rate=taker_close_fee_rate,
+        ).analyze(market, raw_books[market.yes_coin], raw_books[market.no_coin])
         self.journal.log_strategy_event(self.run_id, "OUTCOME_P2_PARITY_SNAPSHOT", {
             "venue": "hyperliquid_outcome", "period": market.period,
-            "snapshot_timestamp_ms": int(time.time() * 1000),
+            "p2_schema_version": P2_SCHEMA_VERSION,
+            "snapshot_timestamp_ms": capture_complete_at_ms,
             "outcome_id": market.outcome_id, "yes_coin": market.yes_coin, "no_coin": market.no_coin,
             "yes_l2": raw_books[market.yes_coin], "no_l2": raw_books[market.no_coin],
-            "fee_evidence": "unverified_conversion_cost_excluded",
+            "capture_quality": capture_quality,
+            "fee_evidence": fee_evidence,
             **parity.as_dict(),
         })
         yes_top = self.pricing.get_book_top(market.yes_coin)

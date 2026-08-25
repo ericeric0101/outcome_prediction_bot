@@ -38,6 +38,28 @@ def test_tick_never_adds_to_filled_inventory_and_places_protective_sell():
     assert gateway.calls[0][1]["reduce_only"] is True
 
 
+def test_tick_recognizes_hyperliquid_plus_prefixed_spot_inventory():
+    gateway = Gateway()
+    account = Account("0")
+    account.get_spot_clearinghouse_state_sync = lambda _: {"balances": [{"coin": "+11530", "total": "13", "entryNtl": "10"}]}
+    result = OutcomeMakerStateMachine(account=account, gateway=gateway, wallet="w").tick(
+        market=market(), side_index=0, entry_permitted=False,
+    )
+    assert result.state == "sell_placed"
+
+
+def test_calibration_inventory_uses_net_ten_percent_take_profit():
+    gateway = Gateway()
+    account = Account("0")
+    account.get_spot_clearinghouse_state_sync = lambda _: {"balances": [{"coin": "+11530", "total": "13", "entryNtl": "10"}]}
+    result = OutcomeMakerStateMachine(account=account, gateway=gateway, wallet="w").tick(
+        market=market(), side_index=0, entry_permitted=False,
+        minimum_return_pct=Decimal("0.10"), maker_close_fee_rate=Decimal("0.0004"),
+    )
+    assert result.state == "sell_placed"
+    assert gateway.calls[0][1]["price"] == (Decimal("10") / Decimal("13")) * Decimal("1.10") / Decimal("0.9996")
+
+
 def test_tick_cancels_partial_buy_before_sale():
     gateway = Gateway()
     result = OutcomeMakerStateMachine(account=Account("3", [{"coin": "#11530", "side": "B", "oid": 7, "sz": "10"}]), gateway=gateway, wallet="w").tick(market=market(), side_index=0, entry_permitted=True)

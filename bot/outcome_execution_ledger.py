@@ -31,7 +31,7 @@ class OutcomeExecutionLedger:
             payload={"venue": "hyperliquid_outcome", "outcome_id": market_id, "coin": coin, "runtime_state": result.state},
         )
 
-    def sync_fills(self, *, fills: list[dict[str, Any]], market_key: str) -> int:
+    def sync_fills(self, *, fills: list[dict[str, Any]], market_key: str, period: str | None = None) -> int:
         recorded = 0
         for raw in fills:
             trade_id = str(raw.get("tid") or raw.get("hash") or "")
@@ -41,7 +41,12 @@ class OutcomeExecutionLedger:
                 fill = OutcomeFillEvent.from_user_fill(raw)
             except ValueError:
                 continue
-            self.fill_bridge.record_fill(fill, market_key=market_key)
+            self.fill_bridge.record_fill(fill, market_key=market_key, extra_payload={
+                "actual_fill": True,
+                "period": period or "unknown",
+                "fill_provenance": "hyperliquid_userFills",
+                "research_only": True,
+            })
             self._fill_ids.add(trade_id)
             recorded += 1
         return recorded

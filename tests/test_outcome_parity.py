@@ -32,9 +32,15 @@ def test_parity_marks_insufficient_depth_instead_of_inventing_price():
     assert result.sell_complete_set_proceeds is None
 
 
-def test_parity_retains_fee_evidence_state_without_claiming_live_trade():
+def test_parity_includes_zero_open_fee_and_maker_close_fee_without_claiming_settlement():
     book = {"levels": [[{"px": "0.51", "sz": "10"}], [{"px": "0.49", "sz": "10"}]]}
-    result = OutcomeParityAnalyzer(Decimal("10"), fee_rate=Decimal("0.001")).analyze(_market(), book, book)
-    assert result.fee_status == "verified_included"
-    assert result.fee_rate == Decimal("0.001")
+    result = OutcomeParityAnalyzer(
+        Decimal("10"), maker_close_fee_rate=Decimal("0.0004"), taker_close_fee_rate=Decimal("0.0007"),
+    ).analyze(_market(), book, book)
+    assert result.buy_complete_set_cost == Decimal("9.80")
+    assert result.sell_complete_set_proceeds == Decimal("10.20") * Decimal("0.9996")
+    assert result.fee_status == "open_zero_close_rates_included_settlement_unverified"
+    assert result.open_fee_rate == Decimal("0")
+    assert result.maker_close_fee_rate == Decimal("0.0004")
+    assert result.taker_close_fee_rate == Decimal("0.0007")
     assert result.as_dict()["research_only"] is True

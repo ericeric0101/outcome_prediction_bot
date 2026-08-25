@@ -34,7 +34,9 @@ class OutcomeParitySnapshot:
     sell_complete_set_proceeds: Optional[Decimal]
     sell_complete_set_edge: Optional[Decimal]
     fee_status: str = "unverified_excluded"
-    fee_rate: Optional[Decimal] = None
+    open_fee_rate: Decimal = Decimal("0")
+    maker_close_fee_rate: Optional[Decimal] = None
+    taker_close_fee_rate: Optional[Decimal] = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -45,7 +47,9 @@ class OutcomeParitySnapshot:
             "sell_complete_set_proceeds": self.sell_complete_set_proceeds,
             "sell_complete_set_edge": self.sell_complete_set_edge,
             "fee_status": self.fee_status,
-            "fee_rate": self.fee_rate,
+            "open_fee_rate": self.open_fee_rate,
+            "maker_close_fee_rate": self.maker_close_fee_rate,
+            "taker_close_fee_rate": self.taker_close_fee_rate,
             "research_only": True,
             "conversion_submission_disabled": True,
         }
@@ -54,11 +58,21 @@ class OutcomeParitySnapshot:
 class OutcomeParityAnalyzer:
     """Calculate executable two-leg prices; it has no venue client dependency."""
 
-    def __init__(self, requested_shares: Decimal = Decimal("10"), fee_rate: Optional[Decimal] = None) -> None:
+    def __init__(
+        self,
+        requested_shares: Decimal = Decimal("10"),
+        *,
+        maker_close_fee_rate: Optional[Decimal] = None,
+        taker_close_fee_rate: Optional[Decimal] = None,
+    ) -> None:
         if requested_shares <= 0:
             raise ValueError("requested_shares must be positive")
         self.requested_shares = requested_shares
-        self.fee_rate = fee_rate
+        for label, rate in (("maker_close_fee_rate", maker_close_fee_rate), ("taker_close_fee_rate", taker_close_fee_rate)):
+            if rate is not None and not Decimal("0") <= rate < Decimal("1"):
+                raise ValueError(f"{label} must be in [0, 1)")
+        self.maker_close_fee_rate = maker_close_fee_rate
+        self.taker_close_fee_rate = taker_close_fee_rate
 
     def analyze(
         self,
@@ -75,7 +89,15 @@ class OutcomeParityAnalyzer:
         sell_yes = _walk(yes_bids, self.requested_shares)
         sell_no = _walk(no_bids, self.requested_shares)
         buy_cost = (buy_cost_yes + buy_cost_no) if buy_cost_yes is not None and buy_cost_no is not None else None
-        sell_proceeds = (sell_yes + sell_no) if sell_yes is not None and sell_no is not None else None
+        gross_sell_proceeds = (sell_yes + sell_no) if sell_yes is not None and sell_no is not None else None
+        # HIP-4 outcome opens are zero-fee.  A passive complete-set unwind is
+        # a maker close, hence this is net of the observed maker close rate.
+        sell_proceeds = (
+            gross_sell_proceeds * (Decimal("1") - self.maker_close_fee_rate)
+            if gross_sell_proceeds is not None and self.maker_close_fee_rate is not None
+            else gross_sell_proceeds
+        )
+        close_rates_known = self.maker_close_fee_rate is not None and self.taker_close_fee_rate is not None
         return OutcomeParitySnapshot(
             outcome_id=market.outcome_id,
             requested_shares=self.requested_shares,
@@ -83,6 +105,10 @@ class OutcomeParityAnalyzer:
             buy_complete_set_edge=(self.requested_shares - buy_cost) if buy_cost is not None else None,
             sell_complete_set_proceeds=sell_proceeds,
             sell_complete_set_edge=(sell_proceeds - self.requested_shares) if sell_proceeds is not None else None,
-            fee_status="verified_included" if self.fee_rate is not None else "unverified_excluded",
-            fee_rate=self.fee_rate,
+            # Known entry/exit trading fees are included, but conversion and
+            # settlement have a separate evidence gate and remain unverified.
+            fee_status="open_zero_close_rates_included_settlement_unverified" if close_rates_known else "unverified_excluded",
+            open_fee_rate=Decimal("0"),
+            maker_close_fee_rate=self.maker_close_fee_rate,
+            taker_close_fee_rate=self.taker_close_fee_rate,
         )

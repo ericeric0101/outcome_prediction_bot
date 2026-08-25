@@ -35,11 +35,14 @@ class OutcomeMakerStateMachine:
         self.wallet = wallet
 
     @staticmethod
-    def _coin_balance(state: dict[str, Any], coin: str) -> Decimal:
+    def _coin_position(state: dict[str, Any], coin: str) -> tuple[Decimal, Decimal]:
+        # HIP-4 books use ``#<id>`` while spot-clearinghouse inventory is
+        # returned as ``+<id>``.  Fixtures may use either representation.
+        balance_coin = "+" + coin[1:] if coin.startswith("#") else coin
         for balance in state.get("balances", []):
-            if balance.get("coin") == coin:
-                return Decimal(str(balance.get("total", "0")))
-        return Decimal("0")
+            if balance.get("coin") in {coin, balance_coin}:
+                return Decimal(str(balance.get("total", "0"))), Decimal(str(balance.get("entryNtl", "0")))
+        return Decimal("0"), Decimal("0")
 
     def _orders(self, coin: str) -> list[dict[str, Any]]:
         return [order for order in self.account.get_open_orders_sync(self.wallet) if order.get("coin") == coin]
@@ -53,9 +56,25 @@ class OutcomeMakerStateMachine:
             raise RuntimeError(f"invalid best {label}: {price}")
         return price
 
-    def tick(self, *, market: OutcomeMarketSpec, side_index: int, entry_permitted: bool) -> MakerTickResult:
+    @staticmethod
+    def _target_sell_price(
+        *, avg_entry_price: Decimal, minimum_return_pct: Decimal | None, maker_close_fee_rate: Decimal | None,
+    ) -> Decimal | None:
+        if minimum_return_pct is None:
+            return None
+        if avg_entry_price <= 0 or minimum_return_pct < 0 or maker_close_fee_rate is None:
+            return None
+        target = avg_entry_price * (Decimal("1") + minimum_return_pct) / (Decimal("1") - maker_close_fee_rate)
+        if target >= Decimal("0.99999"):
+            return None
+        return target
+
+    def tick(
+        self, *, market: OutcomeMarketSpec, side_index: int, entry_permitted: bool,
+        minimum_return_pct: Decimal | None = None, maker_close_fee_rate: Decimal | None = None,
+    ) -> MakerTickResult:
         coin = self.gateway.outcome_coin(market, side_index)
-        inventory = self._coin_balance(self.account.get_spot_clearinghouse_state_sync(self.wallet), coin)
+        inventory, entry_notional = self._coin_position(self.account.get_spot_clearinghouse_state_sync(self.wallet), coin)
         orders = self._orders(coin)
         buys = [order for order in orders if order.get("side") == "B"]
         sells = [order for order in orders if order.get("side") == "A"]
@@ -72,11 +91,17 @@ class OutcomeMakerStateMachine:
                 return MakerTickResult("blocked", "cancelled unfilled buy remainder before protective sell", str(order["oid"]))
             book = self.gateway.fetch_order_book(market=market, side_index=side_index)
             ask = self._best(book["asks"], "ask")
+            target = self._target_sell_price(
+                avg_entry_price=(entry_notional / inventory) if inventory else Decimal("0"),
+                minimum_return_pct=minimum_return_pct, maker_close_fee_rate=maker_close_fee_rate,
+            )
+            if minimum_return_pct is not None and target is None:
+                return MakerTickResult("blocked", "calibration take-profit target is not executable; inventory requires explicit reconciliation")
             result = self.gateway.place_alo(
                 market=market,
                 side_index=side_index,
                 is_buy=False,
-                price=ask,
+                price=max(ask, target) if target is not None else ask,
                 requested_shares=inventory,
                 # ``inventory`` came from this tick's wallet reconciliation;
                 # allow the official SDK's documented residual-close exception.

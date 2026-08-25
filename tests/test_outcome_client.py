@@ -29,6 +29,19 @@ def test_sync_info_retries_transient_502_then_returns_payload(monkeypatch):
     assert responses == []
 
 
+def test_sync_user_fees_uses_the_official_read_only_info_request(monkeypatch):
+    client = OutcomeClient(OutcomeAuth(wallet_address="0x" + "a" * 40, is_testnet=True))
+    calls = []
+
+    def fake_post_info(payload, **_kwargs):
+        calls.append(payload)
+        return {"userSpotCrossRate": "0.0001", "userSpotAddRate": "0.00002"}
+
+    monkeypatch.setattr(client, "post_info_sync", fake_post_info)
+    assert client.get_user_fees_sync("0x" + "b" * 40)["userSpotCrossRate"] == "0.0001"
+    assert calls == [{"type": "userFees", "user": "0x" + "b" * 40}]
+
+
 @pytest.mark.anyio
 async def test_outcome_client_mock_requests(monkeypatch):
     test_eoa = Account.create()

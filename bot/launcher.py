@@ -208,7 +208,10 @@ def run_integrated_hyperliquid_bot(
     pricing = OutcomePricingState()
     # Live orders are only dispatched through the recovery-aware official SDK
     # runtime; this remains inert without both explicit execution gates.
-    live_journal = TradeJournalDB(os.getenv("OUTCOME_EXECUTION_JOURNAL_PATH", "./logs/outcome_execution.db"))
+    # P3 calibration shares the shadow journal so confirmed fills can be
+    # paired with its accepted v3 quote history for executable markouts.
+    default_execution_journal = "./logs/outcome_shadow.db" if os.getenv("OUTCOME_P3_CALIBRATION_ENABLED") == "1" else "./logs/outcome_execution.db"
+    live_journal = TradeJournalDB(os.getenv("OUTCOME_EXECUTION_JOURNAL_PATH", default_execution_journal))
     live_ws_recorder: OutcomeWebSocketRecorder | None = None
     ops_monitor = OutcomeOperationsMonitor(live_journal, f"outcome-ops-{uuid.uuid4().hex[:10]}")
     live_execution = OutcomeLiveExecutionRuntime(
@@ -361,8 +364,11 @@ def run_integrated_hyperliquid_bot(
             if phase == MarketPhase.ACTIVE:
                 if not simulation:
                     try:
-                        entry_side_index = 0 if active_side == "UP" else 1 if active_side == "DOWN" else None
-                        runtime_result = live_execution.tick_market(market=market, entry_side_index=entry_side_index)
+                        if live_execution.calibration_enabled():
+                            runtime_result = live_execution.tick_p3_calibration(market=market)
+                        else:
+                            entry_side_index = 0 if active_side == "UP" else 1 if active_side == "DOWN" else None
+                            runtime_result = live_execution.tick_market(market=market, entry_side_index=entry_side_index)
                         active_order_id = runtime_result.order_id if runtime_result.state in {"buy_placed", "buy_resting"} else None
                         logger.info(f"[LIVE OUTCOME RUNTIME] state={runtime_result.state} detail={runtime_result.detail} order={runtime_result.order_id}")
                     except Exception as e:

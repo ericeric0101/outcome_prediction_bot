@@ -5,7 +5,13 @@ from bot.outcome_research_report import p2_report, p3_report
 
 
 def _snapshot(period, *, fee="unverified_excluded", evidence="unverified_conversion_cost_excluded"):
-    return {"venue": "hyperliquid_outcome", "period": period, "buy_complete_set_cost": 9.9, "buy_complete_set_edge": 0.1, "sell_complete_set_proceeds": 10.1, "fee_status": fee, "fee_evidence": evidence}
+    return {
+        "venue": "hyperliquid_outcome", "p2_schema_version": 3, "period": period,
+        "snapshot_timestamp_ms": 1_000, "yes_l2": {"levels": [[], []]}, "no_l2": {"levels": [[], []]},
+        "capture_quality": {"status": "accepted"}, "buy_complete_set_cost": 9.9,
+        "buy_complete_set_edge": 0.1, "sell_complete_set_proceeds": 10.1,
+        "fee_status": fee, "fee_evidence": evidence,
+    }
 
 
 def test_p2_report_is_period_isolated_and_blocks_unknown_conversion_cost(tmp_path):
@@ -27,6 +33,19 @@ def test_p2_report_never_reuses_1d_snapshots_for_15m(tmp_path):
         payload = _snapshot("1d", fee="verified_included", evidence="official")
         conn.execute("INSERT INTO strategy_events VALUES (?, ?)", ("OUTCOME_P2_PARITY_SNAPSHOT", json.dumps(payload)))
     report = p2_report(db, periods=("15m",), min_snapshots=1)[0]
+    assert report.snapshot_count == 0 and not report.ready
+
+
+def test_p2_report_excludes_legacy_and_timing_rejected_rows(tmp_path):
+    db = tmp_path / "journal.db"
+    with sqlite3.connect(db) as conn:
+        conn.execute("CREATE TABLE strategy_events (event_type TEXT, payload_json TEXT)")
+        legacy = {"venue": "hyperliquid_outcome", "period": "1d", "buy_complete_set_cost": 9.9}
+        rejected = _snapshot("1d")
+        rejected["capture_quality"] = {"status": "rejected", "reason": "side_server_skew_exceeded"}
+        conn.execute("INSERT INTO strategy_events VALUES (?, ?)", ("OUTCOME_P2_PARITY_SNAPSHOT", json.dumps(legacy)))
+        conn.execute("INSERT INTO strategy_events VALUES (?, ?)", ("OUTCOME_P2_PARITY_SNAPSHOT", json.dumps(rejected)))
+    report = p2_report(db, periods=("1d",), min_snapshots=1)[0]
     assert report.snapshot_count == 0 and not report.ready
 
 

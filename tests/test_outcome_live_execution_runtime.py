@@ -3,6 +3,8 @@ from decimal import Decimal
 from bot.lifecycle.outcome_lifecycle import OutcomeMarketSpec
 from bot.outcome_live_execution_runtime import OutcomeLiveExecutionRuntime
 from bot.outcome_stream_health import OutcomeStreamHealth
+from bot.outcome_execution_ledger import OutcomeExecutionLedger
+from monitoring.trade_journal_db import TradeJournalDB
 
 
 def market(): return OutcomeMarketSpec(1153, "@1153", "#11530", "#11531", 1, 2, "priceBinary", "BTC", "20260824-1400", 1, 0, Decimal("1"), "15m", "")
@@ -12,6 +14,10 @@ class Account:
     def __init__(self, balances=None, orders=None): self.balances, self.orders = balances or [{"coin": "USDH", "total": "13", "hold": "0"}], orders or []
     def get_spot_clearinghouse_state_sync(self, _): return {"balances": self.balances}
     def get_open_orders_sync(self, _): return self.orders
+
+
+class CalibrationAccount(Account):
+    def get_user_fees_sync(self, _): return {"userSpotAddRate": "0.0004", "userSpotCrossRate": "0.0007"}
 
 
 class Gateway:
@@ -80,3 +86,33 @@ def test_runtime_can_cancel_existing_entry_when_ws_is_stale(monkeypatch):
     monkeypatch.setenv("OUTCOME_SDK_EXECUTION_ENABLED", "1")
     runtime = OutcomeLiveExecutionRuntime(account=Account(orders=[{"coin": "#11530", "side": "B", "oid": 7, "sz": "13"}]), wallet="w", gateway=Gateway())
     assert runtime.cancel_resting_buys(market=market()).state == "cancelled"
+
+
+def test_p3_calibration_requires_its_own_explicit_gate(monkeypatch, tmp_path):
+    monkeypatch.setenv("OUTCOME_AUTOMATED_EXECUTION_ENABLED", "1")
+    monkeypatch.setenv("OUTCOME_SDK_EXECUTION_ENABLED", "1")
+    runtime = OutcomeLiveExecutionRuntime(
+        account=CalibrationAccount(), wallet="w", gateway=Gateway(), stream_health=healthy_stream(),
+        ledger=OutcomeExecutionLedger(TradeJournalDB(tmp_path / "calibration.db"), "run"),
+    )
+    assert runtime.tick_p3_calibration(market=market()).state == "disabled"
+
+
+def test_p3_calibration_places_one_balanced_post_only_entry_and_logs_it(monkeypatch, tmp_path):
+    monkeypatch.setenv("OUTCOME_AUTOMATED_EXECUTION_ENABLED", "1")
+    monkeypatch.setenv("OUTCOME_SDK_EXECUTION_ENABLED", "1")
+    monkeypatch.setenv("OUTCOME_P3_CALIBRATION_ENABLED", "1")
+    journal = TradeJournalDB(tmp_path / "calibration.db")
+    class TrackingGateway(Gateway):
+        def __init__(self): self.calls = []
+        def place_alo(self, **kwargs):
+            self.calls.append(kwargs)
+            return {"orderId": "1"}
+    gateway = TrackingGateway()
+    runtime = OutcomeLiveExecutionRuntime(
+        account=CalibrationAccount(), wallet="w", gateway=gateway, stream_health=healthy_stream(),
+        ledger=OutcomeExecutionLedger(journal, "run"),
+    )
+    result = runtime.tick_p3_calibration(market=market())
+    assert result.state == "buy_placed"
+    assert gateway.calls[0]["is_buy"] is True
