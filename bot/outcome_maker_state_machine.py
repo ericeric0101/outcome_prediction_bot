@@ -69,9 +69,21 @@ class OutcomeMakerStateMachine:
             return None
         return target
 
+    @staticmethod
+    def _loss_reprice_floor(
+        *, avg_entry_price: Decimal, loss_reprice_pct: Decimal | None, maker_close_fee_rate: Decimal | None,
+    ) -> Decimal | None:
+        if loss_reprice_pct is None:
+            return None
+        if avg_entry_price <= 0 or loss_reprice_pct < 0 or maker_close_fee_rate is None:
+            return None
+        floor = avg_entry_price * (Decimal("1") - loss_reprice_pct) / (Decimal("1") - maker_close_fee_rate)
+        return floor if Decimal("0") < floor < Decimal("0.99999") else None
+
     def tick(
         self, *, market: OutcomeMarketSpec, side_index: int, entry_permitted: bool,
         minimum_return_pct: Decimal | None = None, maker_close_fee_rate: Decimal | None = None,
+        loss_reprice_pct: Decimal | None = None,
     ) -> MakerTickResult:
         coin = self.gateway.outcome_coin(market, side_index)
         inventory, entry_notional = self._coin_position(self.account.get_spot_clearinghouse_state_sync(self.wallet), coin)
@@ -80,8 +92,29 @@ class OutcomeMakerStateMachine:
         sells = [order for order in orders if order.get("side") == "A"]
 
         if inventory > 0:
+            avg_entry = (entry_notional / inventory) if inventory else Decimal("0")
+            profit_target = self._target_sell_price(
+                avg_entry_price=avg_entry, minimum_return_pct=minimum_return_pct, maker_close_fee_rate=maker_close_fee_rate,
+            )
+            loss_floor = self._loss_reprice_floor(
+                avg_entry_price=avg_entry, loss_reprice_pct=loss_reprice_pct, maker_close_fee_rate=maker_close_fee_rate,
+            )
+            if minimum_return_pct is not None and profit_target is None:
+                return MakerTickResult("blocked", "calibration take-profit target is not executable; inventory requires explicit reconciliation")
             covering = next((order for order in sells if Decimal(str(order.get("sz", "0"))) >= inventory), None)
             if covering:
+                # ALO cannot guarantee an immediate stop.  Once the midpoint
+                # has crossed the configured loss threshold, cancel the old
+                # profit quote once and let the next tick rest a new maker-only
+                # protection price.  Never cross the bid or submit a taker.
+                book = self.gateway.fetch_order_book(market=market, side_index=side_index)
+                bid, ask = self._best(book["bids"], "bid"), self._best(book["asks"], "ask")
+                midpoint = (bid + ask) / Decimal("2")
+                loss_triggered = loss_floor is not None and midpoint <= avg_entry * (Decimal("1") - loss_reprice_pct)
+                existing_price = Decimal(str(covering.get("limitPx", covering.get("px", "0"))))
+                if loss_triggered and existing_price > loss_floor:
+                    self.gateway.cancel_owned_order(market=market, side_index=side_index, order_id=str(covering["oid"]))
+                    return MakerTickResult("blocked", "loss threshold crossed; cancelled old profit sell for maker-only protection reprice", str(covering["oid"]))
                 return MakerTickResult("sell_resting", "inventory is protected by owned ALO sell", str(covering.get("oid")))
             if buys:
                 # Never add exposure after any fill.  The next tick will see
@@ -90,24 +123,24 @@ class OutcomeMakerStateMachine:
                 self.gateway.cancel_owned_order(market=market, side_index=side_index, order_id=str(order["oid"]))
                 return MakerTickResult("blocked", "cancelled unfilled buy remainder before protective sell", str(order["oid"]))
             book = self.gateway.fetch_order_book(market=market, side_index=side_index)
-            ask = self._best(book["asks"], "ask")
-            target = self._target_sell_price(
-                avg_entry_price=(entry_notional / inventory) if inventory else Decimal("0"),
-                minimum_return_pct=minimum_return_pct, maker_close_fee_rate=maker_close_fee_rate,
-            )
-            if minimum_return_pct is not None and target is None:
-                return MakerTickResult("blocked", "calibration take-profit target is not executable; inventory requires explicit reconciliation")
+            bid, ask = self._best(book["bids"], "bid"), self._best(book["asks"], "ask")
+            midpoint = (bid + ask) / Decimal("2")
+            loss_triggered = loss_floor is not None and midpoint <= avg_entry * (Decimal("1") - loss_reprice_pct)
+            target = loss_floor if loss_triggered else profit_target
+            assert target is not None or minimum_return_pct is None
+            target = target or ask
             result = self.gateway.place_alo(
                 market=market,
                 side_index=side_index,
                 is_buy=False,
-                price=max(ask, target) if target is not None else ask,
+                price=max(ask, target),
                 requested_shares=inventory,
                 # ``inventory`` came from this tick's wallet reconciliation;
                 # allow the official SDK's documented residual-close exception.
                 reduce_only=True,
             )
-            return MakerTickResult("sell_placed", "placed ALO sell for reconciled inventory", str(result["orderId"]))
+            detail = "placed maker-only loss-band protection sell" if loss_triggered else "placed net take-profit ALO sell for reconciled inventory"
+            return MakerTickResult("sell_placed", detail, str(result["orderId"]))
 
         if sells:
             return MakerTickResult("blocked", "wallet has sell order without inventory; reconcile explicitly", str(sells[0].get("oid")))

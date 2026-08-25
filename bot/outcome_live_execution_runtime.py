@@ -7,7 +7,6 @@ tick, so restart behaviour never depends on stale local order IDs.
 from __future__ import annotations
 
 import os
-import json
 import sqlite3
 from dataclasses import dataclass
 from decimal import Decimal
@@ -21,7 +20,7 @@ from bot.outcome_risk_gate import OutcomePreTradeRiskGate, OutcomeRiskLimits
 from bot.outcome_stream_health import OutcomeStreamHealth
 from bot.outcome_execution_ledger import OutcomeExecutionLedger
 from bot.outcome_research_gate import OutcomeResearchGate
-from bot.outcome_p3_calibration import OutcomeP3CalibrationConfig, choose_balanced_calibration_side
+from bot.outcome_p3_calibration import OutcomeP3CalibrationConfig, choose_consensus_calibration_side
 
 
 @dataclass(frozen=True)
@@ -74,27 +73,6 @@ class OutcomeLiveExecutionRuntime:
                 "SELECT COUNT(*) FROM strategy_events WHERE event_type='OUTCOME_P3_CALIBRATION_ENTRY_PLACED' AND date(ts)=date('now')"
             ).fetchone()
         return int(row[0] or 0)
-
-    def _calibration_fill_counts(self, *, market: OutcomeMarketSpec) -> dict[int, int]:
-        if not self.ledger:
-            return {0: 0, 1: 0}
-        with sqlite3.connect(self.ledger.journal.db_path) as conn:
-            rows = conn.execute("SELECT payload_json, side FROM order_events WHERE event_type='ORDER_FILLED'").fetchall()
-        counts = {0: 0, 1: 0}
-        for raw, order_side in rows:
-            try:
-                payload = json.loads(raw or "{}")
-                if (
-                    payload.get("actual_fill") is True
-                    and payload.get("period") == market.period
-                    and int(payload.get("outcome_id", -1)) == market.outcome_id
-                    and payload.get("liquidity_class") == "maker"
-                    and order_side == "BUY"
-                ):
-                    counts[int(payload["side_index"])] += 1
-            except (TypeError, ValueError, KeyError, json.JSONDecodeError):
-                continue
-        return counts
 
     def tick(self, *, market: OutcomeMarketSpec, side_index: int, entry_permitted: bool) -> LiveExecutionResult:
         if not self.enabled():
@@ -166,7 +144,7 @@ class OutcomeLiveExecutionRuntime:
 
         It can only be enabled by a third operator gate.  Existing inventory is
         always handled first; a new entry is one first-level ALO bid on the
-        least-sampled feasible side, subject to the daily cap and all normal
+        feasible side with the higher market midpoint consensus, subject to the daily cap and all normal
         account/stream/risk checks.  This intentionally bypasses *research*
         readiness because it is collecting the missing P3 evidence, not using
         it for strategy trading.
@@ -192,6 +170,7 @@ class OutcomeLiveExecutionRuntime:
             result = self.machine.tick(
                 market=market, side_index=side_index, entry_permitted=False,
                 minimum_return_pct=config.target_return_pct, maker_close_fee_rate=maker_close_fee,
+                loss_reprice_pct=config.loss_reprice_pct,
             )
             return self._record(market, side_index, result)
         if self._daily_calibration_entries() >= config.max_daily_entries:
@@ -206,8 +185,12 @@ class OutcomeLiveExecutionRuntime:
             side: Decimal(str(book["bids"][0]["price"]))
             for side, book in books.items() if book.get("bids")
         }
-        side_index = choose_balanced_calibration_side(
-            bids=bids, maker_fill_counts=self._calibration_fill_counts(market=market),
+        mids = {
+            side: (Decimal(str(book["bids"][0]["price"])) + Decimal(str(book["asks"][0]["price"]))) / Decimal("2")
+            for side, book in books.items() if book.get("bids") and book.get("asks")
+        }
+        side_index = choose_consensus_calibration_side(
+            mids=mids, entry_bids=bids,
             target_return_pct=config.target_return_pct, maker_close_fee_rate=maker_close_fee,
             tie_breaker=market.outcome_id,
         )
@@ -228,7 +211,8 @@ class OutcomeLiveExecutionRuntime:
                 "venue": "hyperliquid_outcome", "outcome_id": market.outcome_id, "period": market.period,
                 "side_index": side_index, "coin": self.machine.gateway.outcome_coin(market, side_index),
                 "price": str(price), "shares": shares, "target_return_pct": str(config.target_return_pct),
-                "maker_close_fee_rate": str(maker_close_fee), "directional_signal_used": False,
+                "loss_reprice_pct": str(config.loss_reprice_pct), "maker_close_fee_rate": str(maker_close_fee),
+                "sampling_policy": "market_mid_consensus", "directional_signal_used": False,
             })
         return self._record(market, side_index, result)
 

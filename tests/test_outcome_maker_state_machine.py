@@ -60,6 +60,21 @@ def test_calibration_inventory_uses_net_ten_percent_take_profit():
     assert gateway.calls[0][1]["price"] == (Decimal("10") / Decimal("13")) * Decimal("1.10") / Decimal("0.9996")
 
 
+def test_calibration_loss_band_cancels_old_profit_sell_without_taking():
+    class LossGateway(Gateway):
+        def fetch_order_book(self, **_): return {"bids": [{"price": "0.70"}], "asks": [{"price": "0.71"}]}
+    gateway = LossGateway()
+    account = Account("0", [{"coin": "#11530", "side": "A", "oid": 9, "sz": "13", "limitPx": "0.85"}])
+    account.get_spot_clearinghouse_state_sync = lambda _: {"balances": [{"coin": "+11530", "total": "13", "entryNtl": "10"}]}
+    result = OutcomeMakerStateMachine(account=account, gateway=gateway, wallet="w").tick(
+        market=market(), side_index=0, entry_permitted=False,
+        minimum_return_pct=Decimal("0.05"), maker_close_fee_rate=Decimal("0.0004"), loss_reprice_pct=Decimal("0.05"),
+    )
+    assert result.state == "blocked"
+    assert gateway.calls[0][0] == "cancel"
+    assert gateway.calls[0][1]["order_id"] == "9"
+
+
 def test_tick_cancels_partial_buy_before_sale():
     gateway = Gateway()
     result = OutcomeMakerStateMachine(account=Account("3", [{"coin": "#11530", "side": "B", "oid": 7, "sz": "10"}]), gateway=gateway, wallet="w").tick(market=market(), side_index=0, entry_permitted=True)
