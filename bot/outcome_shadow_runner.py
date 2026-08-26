@@ -24,6 +24,7 @@ from bot.lifecycle.outcome_lifecycle import (
     select_configured_btc_market,
     select_active_or_next_btc_market,
 )
+from bot.outcome_daily_scope import resolve_daily_outcome_scope
 from bot.models import SignalDecision
 from bot.outcome_account_sync import OutcomeAccountSynchronizer
 from bot.outcome_snapshot_bridge import build_outcome_market_snapshot
@@ -317,8 +318,7 @@ class OutcomeShadowRunner:
         if self.spec_audit and self._last_market:
             self.spec_audit.mark_pending_resolution(self._last_market, now_ts)
         meta = self.client.get_outcome_meta_sync(ttl_sec=0)
-        preferences = parse_period_preferences(os.environ.get("OUTCOME_MARKET_PERIODS"))
-        allow_fallback = os.environ.get("OUTCOME_MARKET_ALLOW_FALLBACK", "1").lower() not in {"0", "false", "no"}
+        preferences, allow_fallback = resolve_daily_outcome_scope(os.environ)
         market, status, _, _ = select_configured_btc_market(meta, period_preferences=preferences, allow_fallback=allow_fallback)
         account = self.account.fetch_snapshot()
         if market is None:

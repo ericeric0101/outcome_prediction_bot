@@ -258,8 +258,8 @@ def discover_btc_15m_markets(
     return all_btc
 
 
-def parse_period_preferences(value: str | None, *, default: tuple[str, ...] = ("15m", "1d", "1h", "daily", "24h")) -> tuple[str, ...]:
-    """Parse operator market-period preferences without requiring 15m to exist."""
+def parse_period_preferences(value: str | None, *, default: tuple[str, ...] = ("1d",)) -> tuple[str, ...]:
+    """Parse operator market-period preferences; Outcome research defaults to 1d."""
     if not value or not value.strip():
         return default
     periods = tuple(item.strip().lower() for item in value.split(",") if item.strip())

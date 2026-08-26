@@ -12,10 +12,10 @@ from monitoring.trade_journal_db import TradeJournalDB
 
 class ReadOnlyClient:
     def __init__(self):
-        expiry = datetime.now(timezone.utc) + timedelta(minutes=10)
+        expiry = datetime.now(timezone.utc) + timedelta(hours=12)
         self.description = (
             "class:priceBinary|underlying:BTC|expiry:"
-            f"{expiry.strftime('%Y%m%d-%H%M')}|targetPrice:70000|period:15m"
+            f"{expiry.strftime('%Y%m%d-%H%M')}|targetPrice:70000|period:1d"
         )
 
     def get_outcome_meta_sync(self, **_):

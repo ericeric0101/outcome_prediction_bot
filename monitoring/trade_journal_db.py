@@ -130,6 +130,37 @@ class TradeJournalDB:
         );
 
         CREATE INDEX IF NOT EXISTS idx_strategy_events_run_ts ON strategy_events(run_id, ts);
+
+        -- Append-only Binance USDⓈ-M observations for Outcome BTC 1d research.
+        -- A dedicated table avoids treating a historical REST backfill as if
+        -- it had been observable at the same latency as a live event.
+        CREATE TABLE IF NOT EXISTS binance_oi_observations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id TEXT NOT NULL,
+            source TEXT NOT NULL,
+            endpoint TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            exchange_timestamp_ms INTEGER NOT NULL,
+            local_received_at_ms INTEGER NOT NULL,
+            request_latency_ms REAL NOT NULL,
+            open_interest TEXT NOT NULL,
+            open_interest_value TEXT,
+            mark_price TEXT,
+            index_price TEXT,
+            taker_buy_notional TEXT,
+            taker_sell_notional TEXT,
+            taker_imbalance REAL,
+            backfilled INTEGER NOT NULL DEFAULT 0,
+            raw_payload_hash TEXT NOT NULL,
+            raw_payload_json TEXT NOT NULL,
+            context_json TEXT NOT NULL DEFAULT '{}',
+            UNIQUE(source, endpoint, symbol, exchange_timestamp_ms, raw_payload_hash)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_binance_oi_symbol_time
+            ON binance_oi_observations(symbol, exchange_timestamp_ms);
+        CREATE INDEX IF NOT EXISTS idx_binance_oi_run_time
+            ON binance_oi_observations(run_id, exchange_timestamp_ms);
         """
         try:
             with self._connect() as conn:
@@ -666,6 +697,62 @@ class TradeJournalDB:
                 conn.commit()
         except Exception as e:
             logger.debug(f"TradeJournalDB log_strategy_event failed: {e}")
+
+    def record_binance_oi_observation(
+        self,
+        *,
+        run_id: str,
+        source: str,
+        endpoint: str,
+        symbol: str,
+        exchange_timestamp_ms: int,
+        local_received_at_ms: int,
+        request_latency_ms: float,
+        open_interest: str,
+        raw_payload_hash: str,
+        raw_payload: Dict[str, Any],
+        open_interest_value: Optional[str] = None,
+        mark_price: Optional[str] = None,
+        index_price: Optional[str] = None,
+        taker_buy_notional: Optional[str] = None,
+        taker_sell_notional: Optional[str] = None,
+        taker_imbalance: Optional[float] = None,
+        backfilled: bool = False,
+        context: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """Durably append one validated public Binance OI observation.
+
+        The uniqueness key makes current polling and startup backfill safe to
+        repeat after a restart.  ``backfilled`` is intentionally immutable
+        provenance rather than a convenience flag for model code to ignore.
+        """
+        sql = """
+        INSERT OR IGNORE INTO binance_oi_observations (
+            run_id, source, endpoint, symbol, exchange_timestamp_ms,
+            local_received_at_ms, request_latency_ms, open_interest,
+            open_interest_value, mark_price, index_price,
+            taker_buy_notional, taker_sell_notional, taker_imbalance,
+            backfilled, raw_payload_hash, raw_payload_json, context_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """
+        try:
+            with self._connect() as conn:
+                cursor = conn.execute(
+                    sql,
+                    (
+                        run_id, source, endpoint, symbol, int(exchange_timestamp_ms),
+                        int(local_received_at_ms), float(request_latency_ms), str(open_interest),
+                        open_interest_value, mark_price, index_price,
+                        taker_buy_notional, taker_sell_notional, taker_imbalance,
+                        int(bool(backfilled)), raw_payload_hash, _json_dumps(raw_payload),
+                        _json_dumps(context or {}),
+                    ),
+                )
+                conn.commit()
+                return cursor.rowcount == 1
+        except Exception as e:
+            logger.debug(f"TradeJournalDB record_binance_oi_observation failed: {e}")
+            return False
 
     def log_order_event(
         self,

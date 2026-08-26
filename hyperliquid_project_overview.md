@@ -153,7 +153,7 @@ Runner 重啟時先做 account reconciliation：若已有相同 outcome 的 inve
 
 **P1 execution/data infrastructure 完成（2026-08-24）：**
 
-1. **P1-1 — 設定驅動市場選擇。** `OUTCOME_MARKET_PERIODS` 是逗號分隔的偏好順序，預設為 `15m,1d,1h,daily,24h`。`select_configured_btc_market()` 會選擇第一個實際存在的週期；因此 Outcome 尚無 15m 時，會安全地選取可用的 1d，不會把「15m 不存在」誤判為 API 故障。需要嚴格只跑 15m 時可設定 `OUTCOME_MARKET_PERIODS=15m OUTCOME_MARKET_ALLOW_FALLBACK=0`，此時沒有 15m 就只等待、不會錯選 1d。launcher、preflight、shadow runtime 都採用同一選擇規則。
+1. **P1-1 — 設定驅動市場選擇。** 原本的多週期選擇器保留為兼容／測試能力；自 2026-08-26 起，本 repo 的 Outcome research scope 已收斂為 BTC `1d`。launcher、preflight 與 shadow runtime 均經 `resolve_daily_outcome_scope()` 強制要求 `OUTCOME_MARKET_PERIODS=1d` 和 `OUTCOME_MARKET_ALLOW_FALLBACK=0`；缺少 daily market 時只等待，絕不切換 15m、1h 或其他 period。這不影響另一個獨立 15m bot。
 2. **P1-2 — venue pre-trade risk gate。** 新 entry 必須通過 `OutcomePreTradeRiskGate`：可用 `USDH/USDC`（`total-hold`）、整數 shares 後的真實名義金額、最多一筆 open order、及以每股 $1 worst-case 評價的 Outcome 庫存曝險。預設單筆與總曝險上限是 $11（而非機械寫 $10，避免整數 shares 在 0.77 等價格下 $10.01 被無故拒絕）；可用 `OUTCOME_MAX_ENTRY_NOTIONAL_USDC`、`OUTCOME_MAX_OUTCOME_EXPOSURE_USDC`、`OUTCOME_MAX_OPEN_ORDERS` 收緊。
 3. **P1-3 — WS freshness/gap fail-closed。** `OutcomeStreamHealth` 要求：連線正常、連線後已完成 REST resync、Yes/No 兩側都收到 L2、且兩側都在 3 秒內新鮮。disconnect、reconnect、reconnect exhausted、market rollover、任一側 missing/stale 都阻擋**新 entry**。這不阻擋 cancel 或既有倉位的保護處置，避免資料故障反而使風險暴露無法縮小。launcher 會在市場 rollover 重建 recorder，並把狀態交給 official runtime。
 4. **P1-4 — execution lifecycle ledger。** `OutcomeExecutionLedger` 將 official runtime 的 submit/resting/reconciled/blocked transition 寫入 `OUTCOME_EXECUTION_JOURNAL_PATH`（預設 `logs/outcome_execution.db`），並用 `userFills` 的 trade id 去重後回填既有 `ORDER_FILLED` schema。此 ledger 與 P0 account recovery 一起形成 restart/research 的交易所證據鏈，不依賴 terminal output 或一次性腳本。
@@ -161,7 +161,7 @@ Runner 重啟時先做 account reconciliation：若已有相同 outcome 的 inve
 
 **P1 驗證（2026-08-24）：** 完整 Python 回歸 **370 passed**，`outcome_sdk_sidecar npm run build` 通過。P1 完成的是 execution/data safety infrastructure，不是策略 edge 的驗證：P2/P3 的 parity、markout、fill-counterfactual 與各 period 獨立校準仍是自動策略實盤前的必要條件。`OUTCOME_AUTOMATED_EXECUTION_ENABLED=1` 和 `OUTCOME_SDK_EXECUTION_ENABLED=1` 仍未設定時，runtime 保持 disabled。
 
-**環境設定權威規則（2026-08-24）：** `.env.example` 與本機 `.env` 都必須包含 `OUTCOME_MARKET_PERIODS=15m,1d,1h,daily,24h` 及 `OUTCOME_MARKET_ALLOW_FALLBACK=1`。這是目前 Outcome 僅有 1d BTC market 時的安全預設：先偏好 15m，缺少時使用 1d。未來確認 15m 已上線且策略只允許 15m 時，operator 才可改為 `OUTCOME_MARKET_PERIODS=15m` 和 `OUTCOME_MARKET_ALLOW_FALLBACK=0`；缺少 15m 時 runtime 必須等待，不能交易不同週期。
+**環境設定權威規則（更新 2026-08-26）：** `.env.example` 與本機 `.env` 都必須包含 `OUTCOME_MARKET_PERIODS=1d` 及 `OUTCOME_MARKET_ALLOW_FALLBACK=0`。本 repo 只研究／交易 Outcome BTC daily；daily contract 暫時缺席時 runtime 必須等待，不能因 fallback 改跑 15m、1h 或其他 period。`resolve_daily_outcome_scope()` 會對任何其他值 fail-closed；未來若改變範圍，必須先在本文件建立新的 period-specific P2/P3/X-plan 與明確變更，再修改此設定。
 
 **P2/P3 研究規格與完成定義（2026-08-24）：**
 
@@ -238,8 +238,8 @@ Runner 重啟時先做 account reconciliation：若已有相同 outcome 的 inve
 
 | Milestone | 工作範圍 | 產出與驗收 | 與 P0–P3／下單權限的關係 |
 | :--- | :--- | :--- | :--- |
-| **X1 — 1d scope 與資料契約** | 將研究 universe 固定為實際 `period=1d` 的 Outcome BTC market；每個 instance 保存 market/outcome id、start/expiry、target、side mapping、quote token、原始 spec 與官方 resolution/payout evidence。定義 Binance `BTCUSDT` USDⓈ-M OI schema：exchange event time、local receive time、symbol、OI quantity、OI notional（若來源提供）、來源 endpoint、request latency、staleness/gap、raw payload hash。 | 任何非 1d market、symbol 不一致、缺 event time、過舊或 gap 未標記資料均不可進研究集；同一 daily instance 的 strike/expiry/side/resolution 必須符合 P0 truth table。文件、設定與 runtime 若仍偏好 15m，實作時必須一併收斂為 1d-only，未一致前視為 blocker。 | **延續 P0/P1，唯讀。** 不建立 prediction-venue adapter，不新增下單授權。 |
-| **X2 — Binance OI 唯讀 collector** | 建立正式、可重啟的 public-market-data collector；保存當前 OI 與可取得的歷史 OI。為避免錯讀 OI，只同步保存最低必要上下文：BTCUSDT futures price/return、signed aggregate trade 或 taker imbalance、mark/index price；funding/basis 可先原樣保存為研究 context，但不得成為本輪必要 entry signal。collector 必須有 backoff、server/local clock、dedupe、gap/stale evidence，並與 Outcome journal 以 source/run id 隔離。 | 重啟不重複資料；原始 payload 可重放；coverage、間隔、gap、latency 可由 report 稽核；Binance 中斷只使 OI feature `unavailable/stale`，不得阻擋既有 Outcome inventory 的 cancel／保護性 exit，也不得用舊值建立新 entry。 | **P1 data-quality extension，唯讀。** 不需要 Binance API key，不得連接 Binance account/trading endpoint。 |
+| **X1 — 1d scope 與資料契約（完成 2026-08-26）** | research universe 固定為實際 `period=1d` 的 Outcome BTC market；`bot/outcome_daily_scope.py` 使 launcher、preflight 與 shadow runtime 拒絕非 `1d` 或 fallback 設定。Binance `BTCUSDT` USDⓈ-M OI table contract 已建立：exchange/local timestamp、symbol、OI quantity/value、endpoint、request latency、backfilled、raw payload hash/json 與 context。 | 非 1d preference／fallback 在啟動前 fail-closed；OI parser 拒絕錯 symbol、空／非正 OI 與缺失 event time。 | **延續 P0/P1，唯讀。** 沒有新增下單授權。 |
+| **X2 — Binance OI 唯讀 collector（完成 2026-08-26）** | `bot/binance_oi.py`／`scripts/binance_oi_collector.py` 只呼叫 Binance public `openInterest`、`openInterestHist`、`premiumIndex`、`aggTrades`；不接受 API key、不含任何 Binance order/account path。current OI 保存 mark/index 與 aggressor-side taker imbalance；5m history 一律標 `backfilled=true`。journal 以 source/run id、endpoint/time/hash unique key 去重，並有 `scripts/binance_oi_report.py` 稽核 coverage、live/backfill count、live gap 與 latency。 | restart/backfill dedupe、錯 symbol rejection、taker-side direction、live/context persistence 由單元測試覆蓋；真實 public smoke 在隔離 DB 成功寫入 10 筆 historical + 1 筆 current BTCUSDT row。Binance 中斷只產生 read-only error event，不會接入 Outcome execution。 | **P1 data-quality extension，唯讀。** 不需要 Binance API key，不得連接 Binance account/trading endpoint。 |
 | **X3 — 1d OI feature／label pipeline** | 用 event-time `as-of` join 對齊 Outcome accepted L2 snapshot 與當時已可知的 Binance observation，禁止 future join。候選 feature 至少包含 `ΔOI`（5m/15m/1h）、OI return/z-score、`ΔOI × BTC return` 四象限、OI acceleration、price/OI divergence、taker imbalance，以及 time-left／moneyness／Outcome spread/depth。建立兩類 label：(a) 1/5/10/30/60m future executable Outcome bid/ask change與真實 maker fill markout；(b) official 1d resolution。 | 每列保存 feature event time、age、join direction、label time、market instance；缺失保持 unknown，不插值製造 OI。短期 label 必須使用 executable side，不只用 mid；resolution 只能來自 P0 official evidence。每個 daily market 的大量 snapshot 不得假裝成大量獨立 resolution。 | **供 P2/P3 研究。** OI 先作 telemetry／condition，不接 `OutcomeLiveExecutionRuntime`。 |
 | **X4 — market-only baseline 與 purged walk-forward** | 只比較兩層模型：A=`Outcome 自身狀態`；B=`A + Binance OI/context`。第一版使用可解釋且正則化的 logistic/linear/GAM 類模型，不以深度模型掩蓋樣本不足。train/validation/test 依完整 daily market instance／日期切割，禁止 random snapshot split；相鄰或重疊 horizon 使用 purge/embargo，標準誤與 bootstrap 以 market instance cluster。逐項做 feature ablation，避免多重試驗挑中偶然訊號。 | B 必須在未見過的 daily instances 對 A 呈現可重複增量：resolution 看 log loss/Brier/calibration；短期看 executable quote/markout error；交易層看全部已驗證 fee、slippage、fill/exit cost 後 EV 與 95% LCB。只有 accuracy/win-rate 變好、但 executable EV 未改善，判定失敗。 | **P2/P3 驗收的一部分，仍禁止策略實盤。** 不以 in-sample correlation 解鎖任何 bucket。 |
 | **X5 — OI policy gate 與受限接線** | 僅當 X1–X4 通過，且原 P0 resolution/payout、P2 fee-adjusted economics、P3 bucket-level actual-fill markout 同時通過，才建立 OI-aware policy adapter。第一版只允許 OI 改變已驗證 1d bucket 的 `quote/no-quote`、size 上限、cancel urgency 或 inventory limit；不得讓單一 OI threshold 直接選 UP/DOWN。若後續要讓模型選 side，須另有 resolution-level OOS 證據與獨立權威文件變更。 | live 前固定模型版本、feature schema、training cutoff、適用 bucket、最大 staleness、hard notional、kill switch；任何缺 feature、schema drift、模型過期、P0–P3 regression 或 OOS gate 失敗均回到 `no-new-entry`。P4 仍需操作者明確核准的小額 ALO canary。 | **不自動改變權限。** 完成研究程式不等於 X5 通過；P4 仍是人工授權。 |
@@ -255,7 +255,23 @@ Runner 重啟時先做 account reconciliation：若已有相同 outcome 的 inve
 
 #### 執行順序與當前狀態
 
-接下來只能依序完成 `X1 → X2 → X3 → X4 → X5`；每個 milestone 都需先更新本文件、加入測試並通過完整 regression，才可進下一步。**截至 2026-08-26，以上 X1–X5 均為已核准的研究計劃，尚未實作；本次僅收斂範圍與完成定義，沒有修改 collector、模型、環境變數或 live runtime，也沒有新增任何下單權限。** 既有 P3 calibration 產生的 fills 可繼續用於 execution/markout 校準，但不能作為 OI alpha 的歷史證明；只有 X2 上線後以正確 event-time 收集的新資料，才能進入 OI 增量研究。
+`X1 → X2` 已於 2026-08-26 完成，下一步是 **X3**；每個 milestone 都需先更新本文件、加入測試並通過完整 regression，才可進下一步。X2 collector 的正式啟動命令如下，預設對同一 journal 做 500 筆 5m backfill，之後每 30 秒保存一筆 current OI：
+
+```bash
+./.venv/bin/python -u scripts/binance_oi_collector.py \
+  --journal-path logs/outcome_shadow.db \
+  --interval-sec 30
+```
+
+以 `Ctrl-C` 正常停止；必須只運行一個 OI writer。以以下唯讀 report 檢查 collection quality：
+
+```bash
+./.venv/bin/python scripts/binance_oi_report.py --db logs/outcome_shadow.db
+```
+
+X2 上線前的 Outcome/P3 fills 只可用於 execution/markout 校準，不能作為 OI alpha 的歷史證明；只有 X2 上線後以正確 event-time 收集的新資料，才能進入 X3 OI 增量研究。X1/X2 僅完成資料與範圍基礎，沒有修改 `OutcomeLiveExecutionRuntime` 的 entry source、模型、P0/P2/P3/P4 gate 或任何下單權限。
+
+**X1/X2 驗證（2026-08-26）：** X1 market scope 與 shadow telemetry 測試 **6 passed**；X2 OI schema/contract/dedupe/report 加上 journal tests **12 passed**；真實 Binance public API smoke（隔離 `/private/tmp/binance_oi_x2_smoke.db`）寫入 **10** 筆標記 `backfilled=true` 的 historical 5m rows 與 **1** 筆 current row，current row 的 OI、mark price、index price、taker imbalance、exchange/local timestamp 與 latency 均非空。此 smoke DB 不是正式研究資料集，也沒有向 Outcome 或 Binance 提交任何交易。
 
 **唯一權威文件變更規則（2026-08-24）：** 從本次起，任何 Outcome 程式行為、環境變數、風控限制、官方 API 語意、測試結果、live smoke evidence 或未完成 blocker 的新增／修改／刪除，都必須在同一個變更中同步更新本文件，包含日期、涉及模組、實際測試結果與是否改變下單權限。未記錄於本文件的假設不得作為 live execution 依據；文件與代碼不一致時，視為 blocker，先修正再繼續。
 

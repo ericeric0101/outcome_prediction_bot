@@ -29,6 +29,7 @@ from bot.lifecycle.outcome_lifecycle import (
     select_active_or_next_btc_market,
     evaluate_outcome_market_phase,
 )
+from bot.outcome_daily_scope import resolve_daily_outcome_scope
 from bot.pricing.outcome_pricing import (
     OutcomePricingState,
     compute_min_shares_for_notional,
@@ -102,8 +103,7 @@ def run_hyperliquid_preflight_checks(simulation: bool) -> bool:
 
     try:
         meta = client.get_outcome_meta_sync()
-        preferences = parse_period_preferences(os.getenv("OUTCOME_MARKET_PERIODS"))
-        allow_fallback = os.getenv("OUTCOME_MARKET_ALLOW_FALLBACK", "1").strip().lower() not in {"0", "false", "no"}
+        preferences, allow_fallback = resolve_daily_outcome_scope(os.environ)
         selected, status, selected_period, fallback_used = select_configured_btc_market(meta, period_preferences=preferences, allow_fallback=allow_fallback)
         logger.info(f"Hyperliquid Outcome market preferences={preferences} selected_period={selected_period} fallback={fallback_used}")
         if selected:
@@ -260,8 +260,7 @@ def run_integrated_hyperliquid_bot(
 
     refresh_interval = 1.5 if not test_mode else 1.0
     last_log_time = 0.0
-    market_preferences = parse_period_preferences(os.getenv("OUTCOME_MARKET_PERIODS"))
-    market_allow_fallback = os.getenv("OUTCOME_MARKET_ALLOW_FALLBACK", "1").strip().lower() not in {"0", "false", "no"}
+    market_preferences, market_allow_fallback = resolve_daily_outcome_scope(os.environ)
 
     try:
         while True:
