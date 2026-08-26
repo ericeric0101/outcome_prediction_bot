@@ -186,6 +186,15 @@ class OutcomeMakerStateMachine:
                 order = buys[0]
                 self.gateway.cancel_owned_order(market=market, side_index=side_index, order_id=str(order["oid"]))
                 return MakerTickResult("blocked", "cancelled unfilled buy remainder before protective sell", str(order["oid"]), audit)
+            # There is no safe generic fallback sell.  In particular, using
+            # current best ask here can realize a loss while the journal calls
+            # it a take-profit.  Cancel any residual buy first, then require
+            # an explicit policy before creating a new sell.
+            if minimum_return_pct is None:
+                return MakerTickResult(
+                    "blocked", "inventory has no explicit verified exit policy; refusing best-ask fallback sell",
+                    audit=audit,
+                )
             book = self.gateway.fetch_order_book(market=market, side_index=side_index)
             bid, ask = self._best(book["bids"], "bid"), self._best(book["asks"], "ask")
             midpoint = (bid + ask) / Decimal("2")

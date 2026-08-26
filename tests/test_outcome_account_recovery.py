@@ -28,6 +28,14 @@ def test_recovery_blocks_unprotected_or_unknown_exposure():
     assert "no covering sell" in report.reason
 
 
+def test_recovery_normalizes_plus_prefixed_outcome_inventory():
+    account = Account([{"coin": "+11530", "total": "13"}], [])
+    report = OutcomeAccountRecovery(account=account, wallet="w").reconcile([market()])
+    assert not report.safe_for_new_entry
+    assert report.findings[0].coin == "#11530"
+    assert report.findings[0].state == "unprotected_inventory"
+
+
 def test_recovery_blocks_orphan_sell():
     account = Account([], [{"coin": "#11530", "side": "A", "oid": 8, "sz": "13"}])
     report = OutcomeAccountRecovery(account=account, wallet="w").reconcile([market()])

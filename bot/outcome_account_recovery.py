@@ -42,7 +42,15 @@ class OutcomeAccountRecovery:
 
     @staticmethod
     def _balances(snapshot: dict[str, Any]) -> dict[str, Decimal]:
-        return {str(row.get("coin")): Decimal(str(row.get("total", "0"))) for row in snapshot.get("balances", [])}
+        # Outcome spot balances use +<encoding>; books/orders use #<encoding>.
+        # Normalize at the recovery boundary so an unprotected real position
+        # cannot be mistaken for a flat market after a restart.
+        balances: dict[str, Decimal] = {}
+        for row in snapshot.get("balances", []):
+            coin = str(row.get("coin"))
+            normalized = "#" + coin[1:] if coin.startswith("+") and coin[1:].isdigit() else coin
+            balances[normalized] = balances.get(normalized, Decimal("0")) + Decimal(str(row.get("total", "0")))
+        return balances
 
     def reconcile(self, markets: Iterable[OutcomeMarketSpec]) -> RecoveryReport:
         markets = tuple(markets)

@@ -30,13 +30,12 @@ def test_tick_places_one_buy_without_waiting():
     assert [kind for kind, _ in gateway.calls] == ["place"]
 
 
-def test_tick_never_adds_to_filled_inventory_and_places_protective_sell():
+def test_tick_refuses_best_ask_fallback_for_inventory_without_exit_policy():
     gateway = Gateway()
     result = OutcomeMakerStateMachine(account=Account("13"), gateway=gateway, wallet="w").tick(market=market(), side_index=0, entry_permitted=True)
-    assert result.state == "sell_placed"
-    assert gateway.calls[0][1]["is_buy"] is False
-    assert gateway.calls[0][1]["requested_shares"] == Decimal("13")
-    assert gateway.calls[0][1]["reduce_only"] is True
+    assert result.state == "blocked"
+    assert "refusing best-ask fallback sell" in result.detail
+    assert not gateway.calls
 
 
 def test_tick_recognizes_hyperliquid_plus_prefixed_spot_inventory():
@@ -46,7 +45,8 @@ def test_tick_recognizes_hyperliquid_plus_prefixed_spot_inventory():
     result = OutcomeMakerStateMachine(account=account, gateway=gateway, wallet="w").tick(
         market=market(), side_index=0, entry_permitted=False,
     )
-    assert result.state == "sell_placed"
+    assert result.state == "blocked"
+    assert "no explicit verified exit policy" in result.detail
 
 
 def test_calibration_inventory_uses_net_ten_percent_take_profit():

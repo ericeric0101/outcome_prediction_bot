@@ -74,9 +74,79 @@ class OutcomeLiveExecutionRuntime:
             ).fetchone()
         return int(row[0] or 0)
 
+    def _persisted_p3_exit_policy(self, *, market: OutcomeMarketSpec, coin: str) -> OutcomeP3CalibrationConfig | None:
+        """Recover the policy that created a still-managed P3 inventory.
+
+        Entry and exit must not depend on which dispatcher happens to run on
+        the next tick.  The entry event is durable evidence of the approved
+        policy; malformed or absent evidence is deliberately not guessed.
+        """
+        if self.ledger is None:
+            return None
+        try:
+            with sqlite3.connect(self.ledger.journal.db_path) as conn:
+                row = conn.execute(
+                    """
+                    SELECT payload_json FROM strategy_events
+                    WHERE event_type='OUTCOME_P3_CALIBRATION_ENTRY_PLACED'
+                      AND CAST(json_extract(payload_json, '$.outcome_id') AS INTEGER)=?
+                      AND json_extract(payload_json, '$.coin')=?
+                    ORDER BY id DESC LIMIT 1
+                    """,
+                    (market.outcome_id, coin),
+                ).fetchone()
+            if not row:
+                return None
+            import json
+            payload = json.loads(row[0])
+            return OutcomeP3CalibrationConfig(
+                max_daily_entries=1,
+                target_return_pct=Decimal(str(payload["target_return_pct"])),
+                loss_reprice_pct=Decimal(str(payload["loss_reprice_pct"])),
+            )
+        except (KeyError, TypeError, ValueError, sqlite3.Error):
+            return None
+
+    def _persisted_p3_maker_fee(self, *, market: OutcomeMarketSpec, coin: str) -> Decimal | None:
+        if self.ledger is None:
+            return None
+        try:
+            with sqlite3.connect(self.ledger.journal.db_path) as conn:
+                row = conn.execute(
+                    """
+                    SELECT json_extract(payload_json, '$.maker_close_fee_rate')
+                    FROM strategy_events
+                    WHERE event_type='OUTCOME_P3_CALIBRATION_ENTRY_PLACED'
+                      AND CAST(json_extract(payload_json, '$.outcome_id') AS INTEGER)=?
+                      AND json_extract(payload_json, '$.coin')=?
+                    ORDER BY id DESC LIMIT 1
+                    """,
+                    (market.outcome_id, coin),
+                ).fetchone()
+            fee = Decimal(str(row[0])) if row and row[0] is not None else None
+            return fee if fee is not None and Decimal("0") <= fee < Decimal("1") else None
+        except (ArithmeticError, sqlite3.Error):
+            return None
+
+    def _advance_persisted_p3_exit(self, *, market: OutcomeMarketSpec, finding: object) -> LiveExecutionResult | None:
+        coin = str(getattr(finding, "coin", ""))
+        policy = self._persisted_p3_exit_policy(market=market, coin=coin)
+        fee = self._persisted_p3_maker_fee(market=market, coin=coin)
+        if policy is None or fee is None:
+            return None
+        side_index = 0 if coin == market.yes_coin else 1
+        result = self.machine.tick(
+            market=market, side_index=side_index, entry_permitted=False,
+            minimum_return_pct=policy.target_return_pct, maker_close_fee_rate=fee,
+            loss_reprice_pct=policy.loss_reprice_pct,
+        )
+        return self._record(market, side_index, result)
+
     def tick(self, *, market: OutcomeMarketSpec, side_index: int, entry_permitted: bool) -> LiveExecutionResult:
         if not self.enabled():
             return LiveExecutionResult("disabled", "automated execution requires OUTCOME_AUTOMATED_EXECUTION_ENABLED=1 and OUTCOME_SDK_EXECUTION_ENABLED=1")
+        if entry_permitted:
+            return LiveExecutionResult("blocked", "generic live entry has no explicit verified exit policy; use a dedicated policy runtime")
         if entry_permitted:
             health_error = self._stream_ready(market)
             if health_error:
@@ -104,9 +174,13 @@ class OutcomeLiveExecutionRuntime:
         if not self.enabled():
             return LiveExecutionResult("disabled", "automated execution requires OUTCOME_AUTOMATED_EXECUTION_ENABLED=1 and OUTCOME_SDK_EXECUTION_ENABLED=1")
         report = self.recovery.reconcile([market])
+        active = [finding for finding in report.findings if finding.state != "flat"]
+        if len(active) == 1:
+            persisted_exit = self._advance_persisted_p3_exit(market=market, finding=active[0])
+            if persisted_exit is not None:
+                return persisted_exit
         if not report.safe_for_new_entry:
             return LiveExecutionResult("blocked", f"account recovery blocked execution: {report.reason}")
-        active = [finding for finding in report.findings if finding.state != "flat"]
         if active:
             if len(active) != 1:
                 return LiveExecutionResult("blocked", "multiple live Outcome sides require explicit reconciliation")
@@ -115,26 +189,10 @@ class OutcomeLiveExecutionRuntime:
         elif entry_side_index is None:
             return LiveExecutionResult("flat", "no live exposure and no entry signal")
         else:
-            health_error = self._stream_ready(market)
-            if health_error:
-                return health_error
-            book = self.machine.gateway.fetch_order_book(market=market, side_index=entry_side_index)
-            if not book.get("bids"):
-                return LiveExecutionResult("blocked", "risk gate: no executable best bid")
-            price = Decimal(str(book["bids"][0]["price"]))
-            shares = whole_share_size(price)
-            account = self.recovery.account
-            balance_state = account.get_spot_clearinghouse_state_sync(self.recovery.wallet)
-            risk = self.risk_gate.evaluate(
-                balances=balance_state.get("balances", []), open_orders=account.get_open_orders_sync(self.recovery.wallet),
-                price=price, shares=shares,
-            )
-            if not risk.allowed:
-                return LiveExecutionResult("blocked", f"risk gate: {risk.reason}")
-            research = self.research_gate.check(market.period)
-            if not research.allowed:
-                return LiveExecutionResult("blocked", research.reason)
-            result = self.machine.tick(market=market, side_index=entry_side_index, entry_permitted=True)
+            # This generic method has no exit-policy parameters.  It may keep
+            # observing/reconciling existing orders, but cannot create a buy
+            # that would later be forced into a best-ask fallback sell.
+            return LiveExecutionResult("blocked", "generic live entry has no explicit verified exit policy; use a dedicated policy runtime")
         side_index = 0 if result.state == "flat" and entry_side_index is None else (side_index if active else entry_side_index)
         assert side_index is not None
         return self._record(market, side_index, result)
@@ -157,10 +215,14 @@ class OutcomeLiveExecutionRuntime:
         if health_error:
             return health_error
         report = self.recovery.reconcile([market])
-        if not report.safe_for_new_entry:
-            return LiveExecutionResult("blocked", f"account recovery blocked calibration: {report.reason}")
         config = OutcomeP3CalibrationConfig.from_env()
         active = [finding for finding in report.findings if finding.state != "flat"]
+        if len(active) == 1:
+            persisted_exit = self._advance_persisted_p3_exit(market=market, finding=active[0])
+            if persisted_exit is not None:
+                return persisted_exit
+        if not report.safe_for_new_entry:
+            return LiveExecutionResult("blocked", f"account recovery blocked calibration: {report.reason}")
         if active:
             if len(active) != 1:
                 return LiveExecutionResult("blocked", "multiple live Outcome sides require explicit reconciliation")
@@ -212,6 +274,7 @@ class OutcomeLiveExecutionRuntime:
                 "side_index": side_index, "coin": self.machine.gateway.outcome_coin(market, side_index),
                 "price": str(price), "shares": shares, "target_return_pct": str(config.target_return_pct),
                 "loss_reprice_pct": str(config.loss_reprice_pct), "maker_close_fee_rate": str(maker_close_fee),
+                "order_id": result.order_id,
                 "sampling_policy": "market_mid_consensus", "directional_signal_used": False,
             })
         return self._record(market, side_index, result)

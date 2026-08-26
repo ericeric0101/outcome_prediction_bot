@@ -14,6 +14,7 @@ class Account:
     def __init__(self, balances=None, orders=None): self.balances, self.orders = balances or [{"coin": "USDH", "total": "13", "hold": "0"}], orders or []
     def get_spot_clearinghouse_state_sync(self, _): return {"balances": self.balances}
     def get_open_orders_sync(self, _): return self.orders
+    def get_user_fills_sync(self, _): return []
 
 
 class CalibrationAccount(Account):
@@ -67,18 +68,27 @@ def test_tick_market_advances_existing_buy_without_needing_signal(monkeypatch):
     assert runtime.tick_market(market=market(), entry_side_index=None).state == "buy_resting"
 
 
-def test_tick_market_blocks_unfunded_entry_before_order_submission(monkeypatch):
+def test_tick_market_blocks_generic_entry_before_order_submission(monkeypatch):
     monkeypatch.setenv("OUTCOME_AUTOMATED_EXECUTION_ENABLED", "1")
     monkeypatch.setenv("OUTCOME_SDK_EXECUTION_ENABLED", "1")
     runtime = OutcomeLiveExecutionRuntime(account=Account(balances=[{"coin": "USDH", "total": "1", "hold": "0"}]), wallet="w", gateway=Gateway(), stream_health=healthy_stream())
-    assert runtime.tick_market(market=market(), entry_side_index=0).detail == "risk gate: insufficient_available_collateral"
+    assert "no explicit verified exit policy" in runtime.tick_market(market=market(), entry_side_index=0).detail
 
 
-def test_runtime_blocks_new_entry_without_ws_health_even_with_execution_gates(monkeypatch):
+def test_tick_market_refuses_generic_entry_without_exit_policy(monkeypatch):
+    monkeypatch.setenv("OUTCOME_AUTOMATED_EXECUTION_ENABLED", "1")
+    monkeypatch.setenv("OUTCOME_SDK_EXECUTION_ENABLED", "1")
+    runtime = OutcomeLiveExecutionRuntime(account=Account(), wallet="w", gateway=Gateway(), stream_health=healthy_stream())
+    result = runtime.tick_market(market=market(), entry_side_index=0)
+    assert result.state == "blocked"
+    assert "no explicit verified exit policy" in result.detail
+
+
+def test_runtime_blocks_generic_entry_without_exit_policy_even_without_ws_health(monkeypatch):
     monkeypatch.setenv("OUTCOME_AUTOMATED_EXECUTION_ENABLED", "1")
     monkeypatch.setenv("OUTCOME_SDK_EXECUTION_ENABLED", "1")
     runtime = OutcomeLiveExecutionRuntime(account=Account(), wallet="w", gateway=Gateway())
-    assert runtime.tick_market(market=market(), entry_side_index=0).detail == "market-data gate: ws_health_not_configured"
+    assert "no explicit verified exit policy" in runtime.tick_market(market=market(), entry_side_index=0).detail
 
 
 def test_runtime_can_cancel_existing_entry_when_ws_is_stale(monkeypatch):
@@ -116,3 +126,30 @@ def test_p3_calibration_places_one_balanced_post_only_entry_and_logs_it(monkeypa
     result = runtime.tick_p3_calibration(market=market())
     assert result.state == "buy_placed"
     assert gateway.calls[0]["is_buy"] is True
+
+
+def test_generic_recovery_restores_persisted_p3_exit_policy(monkeypatch, tmp_path):
+    monkeypatch.setenv("OUTCOME_AUTOMATED_EXECUTION_ENABLED", "1")
+    monkeypatch.setenv("OUTCOME_SDK_EXECUTION_ENABLED", "1")
+    journal = TradeJournalDB(tmp_path / "calibration.db")
+    journal.log_strategy_event("run", "OUTCOME_P3_CALIBRATION_ENTRY_PLACED", {
+        "outcome_id": 1153, "coin": "#11530", "target_return_pct": "0.05",
+        "loss_reprice_pct": "0.05", "maker_close_fee_rate": "0.0004", "order_id": "buy-1",
+    })
+    class FilledAccount(Account):
+        def get_user_fills_sync(self, _):
+            return [{"coin": "#11530", "side": "B", "px": "0.67329", "sz": "15", "time": 1}]
+    class TrackingGateway(Gateway):
+        def __init__(self): self.calls = []
+        def fetch_order_book(self, **_): return {"bids": [{"price": "0.67"}], "asks": [{"price": "0.68"}]}
+        def place_alo(self, **kwargs): self.calls.append(kwargs); return {"orderId": "sell-1"}
+    gateway = TrackingGateway()
+    account = FilledAccount(balances=[{"coin": "+11530", "total": "15", "entryNtl": "10.09935"}])
+    runtime = OutcomeLiveExecutionRuntime(
+        account=account, wallet="w", gateway=gateway, stream_health=healthy_stream(),
+        ledger=OutcomeExecutionLedger(journal, "restarted-run"),
+    )
+    result = runtime.tick_market(market=market(), entry_side_index=None)
+    assert result.state == "sell_placed"
+    assert gateway.calls[0]["is_buy"] is False
+    assert gateway.calls[0]["price"] == Decimal("0.67329") * Decimal("1.05") / Decimal("0.9996")
