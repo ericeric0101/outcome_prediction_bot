@@ -161,6 +161,46 @@ class TradeJournalDB:
             ON binance_oi_observations(symbol, exchange_timestamp_ms);
         CREATE INDEX IF NOT EXISTS idx_binance_oi_run_time
             ON binance_oi_observations(run_id, exchange_timestamp_ms);
+
+        -- X3 research rows.  Snapshot rows are recomputable derived data, but
+        -- retain the exact source ids/timestamps used for each as-of join.
+        CREATE TABLE IF NOT EXISTS outcome_oi_feature_rows (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            feature_schema_version INTEGER NOT NULL,
+            outcome_snapshot_event_id INTEGER NOT NULL,
+            outcome_id INTEGER NOT NULL,
+            period TEXT NOT NULL,
+            snapshot_timestamp_ms INTEGER NOT NULL,
+            oi_observation_id INTEGER,
+            oi_exchange_timestamp_ms INTEGER,
+            oi_local_received_at_ms INTEGER,
+            oi_age_ms INTEGER,
+            oi_join_direction TEXT NOT NULL,
+            oi_backfilled INTEGER NOT NULL DEFAULT 0,
+            features_json TEXT NOT NULL,
+            labels_json TEXT NOT NULL,
+            market_context_json TEXT NOT NULL,
+            generated_at TEXT NOT NULL,
+            UNIQUE(feature_schema_version, outcome_snapshot_event_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_outcome_oi_features_market_time
+            ON outcome_oi_feature_rows(outcome_id, period, snapshot_timestamp_ms);
+
+        CREATE TABLE IF NOT EXISTS outcome_oi_fill_feature_rows (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            feature_schema_version INTEGER NOT NULL,
+            fill_order_event_id INTEGER NOT NULL,
+            outcome_id INTEGER NOT NULL,
+            period TEXT NOT NULL,
+            fill_timestamp_ms INTEGER NOT NULL,
+            oi_observation_id INTEGER,
+            oi_local_received_at_ms INTEGER,
+            oi_age_ms INTEGER,
+            features_json TEXT NOT NULL,
+            actual_markouts_json TEXT NOT NULL,
+            generated_at TEXT NOT NULL,
+            UNIQUE(feature_schema_version, fill_order_event_id)
+        );
         """
         try:
             with self._connect() as conn:
@@ -698,6 +738,65 @@ class TradeJournalDB:
         except Exception as e:
             logger.debug(f"TradeJournalDB log_strategy_event failed: {e}")
 
+    def upsert_outcome_oi_feature_row(self, *, feature_schema_version: int, outcome_snapshot_event_id: int,
+                                      outcome_id: int, period: str, snapshot_timestamp_ms: int,
+                                      oi_observation_id: int | None, oi_exchange_timestamp_ms: int | None,
+                                      oi_local_received_at_ms: int | None, oi_age_ms: int | None,
+                                      oi_join_direction: str, oi_backfilled: bool, features: Dict[str, Any],
+                                      labels: Dict[str, Any], market_context: Dict[str, Any]) -> bool:
+        """Persist a derived X3 row without making it part of execution state."""
+        sql = """
+        INSERT INTO outcome_oi_feature_rows (
+          feature_schema_version,outcome_snapshot_event_id,outcome_id,period,snapshot_timestamp_ms,
+          oi_observation_id,oi_exchange_timestamp_ms,oi_local_received_at_ms,oi_age_ms,
+          oi_join_direction,oi_backfilled,features_json,labels_json,market_context_json,generated_at
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(feature_schema_version,outcome_snapshot_event_id) DO UPDATE SET
+          oi_observation_id=excluded.oi_observation_id, oi_exchange_timestamp_ms=excluded.oi_exchange_timestamp_ms,
+          oi_local_received_at_ms=excluded.oi_local_received_at_ms, oi_age_ms=excluded.oi_age_ms,
+          oi_join_direction=excluded.oi_join_direction, oi_backfilled=excluded.oi_backfilled,
+          features_json=excluded.features_json, labels_json=excluded.labels_json,
+          market_context_json=excluded.market_context_json, generated_at=excluded.generated_at
+        """
+        try:
+            with self._connect() as conn:
+                conn.execute(sql, (feature_schema_version, outcome_snapshot_event_id, outcome_id, period,
+                    snapshot_timestamp_ms, oi_observation_id, oi_exchange_timestamp_ms,
+                    oi_local_received_at_ms, oi_age_ms, oi_join_direction, int(oi_backfilled),
+                    _json_dumps(features), _json_dumps(labels), _json_dumps(market_context), _utc_now_iso()))
+                conn.commit()
+            return True
+        except Exception as e:
+            logger.debug(f"TradeJournalDB upsert_outcome_oi_feature_row failed: {e}")
+            return False
+
+    def upsert_outcome_oi_fill_feature_row(self, *, feature_schema_version: int, fill_order_event_id: int,
+                                           outcome_id: int, period: str, fill_timestamp_ms: int,
+                                           oi_observation_id: int | None, oi_local_received_at_ms: int | None,
+                                           oi_age_ms: int | None, features: Dict[str, Any],
+                                           actual_markouts: Dict[str, Any]) -> bool:
+        """Persist fill-time OI conditioning plus only exchange-confirmed P3 markouts."""
+        sql = """
+        INSERT INTO outcome_oi_fill_feature_rows (
+          feature_schema_version,fill_order_event_id,outcome_id,period,fill_timestamp_ms,
+          oi_observation_id,oi_local_received_at_ms,oi_age_ms,features_json,actual_markouts_json,generated_at
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(feature_schema_version,fill_order_event_id) DO UPDATE SET
+          oi_observation_id=excluded.oi_observation_id,oi_local_received_at_ms=excluded.oi_local_received_at_ms,
+          oi_age_ms=excluded.oi_age_ms,features_json=excluded.features_json,
+          actual_markouts_json=excluded.actual_markouts_json,generated_at=excluded.generated_at
+        """
+        try:
+            with self._connect() as conn:
+                conn.execute(sql, (feature_schema_version, fill_order_event_id, outcome_id, period, fill_timestamp_ms,
+                    oi_observation_id, oi_local_received_at_ms, oi_age_ms, _json_dumps(features),
+                    _json_dumps(actual_markouts), _utc_now_iso()))
+                conn.commit()
+            return True
+        except Exception as e:
+            logger.debug(f"TradeJournalDB upsert_outcome_oi_fill_feature_row failed: {e}")
+            return False
+
     def record_binance_oi_observation(
         self,
         *,
@@ -850,6 +949,57 @@ class TradeJournalDB:
         except Exception as e:
             logger.debug(f"TradeJournalDB log_outcome_fill_once failed: {e}")
             return False
+
+    def repair_duplicate_outcome_fills(self, *, run_id: str, dry_run: bool = True) -> Dict[str, int]:
+        """Remove only proven duplicate HIP-4 fill rows, preserving the first fact.
+
+        This maintenance action is intentionally explicit: callers must stop
+        live writers before applying it.  P3 markouts key by exchange trade id
+        and are retained because one per horizon is still the same fact.
+        """
+        duplicate_ids: list[int] = []
+        try:
+            with self._connect() as conn:
+                rows = conn.execute("""
+                    SELECT id, json_extract(payload_json, '$.trade_id') AS trade_id
+                    FROM order_events
+                    WHERE event_type='ORDER_FILLED'
+                      AND json_extract(payload_json, '$.venue')='hyperliquid_outcome'
+                      AND COALESCE(json_extract(payload_json, '$.trade_id'), '') <> ''
+                    ORDER BY trade_id, id
+                """).fetchall()
+                seen: set[str] = set()
+                for event_id, trade_id in rows:
+                    if str(trade_id) in seen:
+                        duplicate_ids.append(int(event_id))
+                    else:
+                        seen.add(str(trade_id))
+                if not dry_run and duplicate_ids:
+                    marks = ",".join("?" for _ in duplicate_ids)
+                    conn.execute(f"DELETE FROM outcome_oi_fill_feature_rows WHERE fill_order_event_id IN ({marks})", duplicate_ids)
+                    conn.execute(f"DELETE FROM order_events WHERE id IN ({marks})", duplicate_ids)
+                conn.commit()
+            self.log_strategy_event(run_id, "OUTCOME_FILL_DEDUPE_REPAIR", {
+                "venue": "hyperliquid_outcome", "dry_run": dry_run,
+                "duplicate_order_event_ids": duplicate_ids, "removed_count": 0 if dry_run else len(duplicate_ids),
+                "preserved_rule": "lowest_order_events.id_per_exchange_trade_id",
+            })
+            return {"duplicate_count": len(duplicate_ids), "removed_count": 0 if dry_run else len(duplicate_ids)}
+        except Exception as e:
+            logger.warning(f"TradeJournalDB repair_duplicate_outcome_fills failed: {e}")
+            return {"duplicate_count": 0, "removed_count": 0}
+
+    def last_binance_live_received_at_ms(self, *, symbol: str = "BTCUSDT") -> Optional[int]:
+        try:
+            with self._connect() as conn:
+                row = conn.execute("""
+                    SELECT MAX(local_received_at_ms) FROM binance_oi_observations
+                    WHERE symbol=? AND backfilled=0
+                """, (symbol,)).fetchone()
+            return int(row[0]) if row and row[0] is not None else None
+        except Exception as e:
+            logger.debug(f"TradeJournalDB last_binance_live_received_at_ms failed: {e}")
+            return None
 
     def load_recent_buy_submits(self, instrument_id: str, limit: int = 20) -> list[Dict[str, Any]]:
         if not instrument_id:

@@ -39,6 +39,7 @@ from bot.outcome_settlement import OutcomeSettlementAdapter
 from bot.outcome_ws_recorder import OutcomeWebSocketRecorder
 from bot.outcome_execution_ledger import OutcomeExecutionLedger
 from bot.outcome_operations_monitor import OutcomeOperationsMonitor
+from bot.outcome_research_capture import OutcomeResearchCapture
 from monitoring.trade_journal_db import TradeJournalDB
 from bot.enums import MarketPhase
 from bot.app_config import AppConfig
@@ -213,6 +214,12 @@ def run_integrated_hyperliquid_bot(
     default_execution_journal = "./logs/outcome_shadow.db" if os.getenv("OUTCOME_P3_CALIBRATION_ENABLED") == "1" else "./logs/outcome_execution.db"
     live_journal = TradeJournalDB(os.getenv("OUTCOME_EXECUTION_JOURNAL_PATH", default_execution_journal))
     live_ws_recorder: OutcomeWebSocketRecorder | None = None
+    # This is a venue-read-only capture path.  It shares the live journal but
+    # never owns /exchange submission; the live runtime remains the sole
+    # wallet writer.
+    research_capture = OutcomeResearchCapture(
+        client=client, wallet_address=auth.wallet_address, journal=live_journal,
+    ) if not simulation else None
     ops_monitor = OutcomeOperationsMonitor(live_journal, f"outcome-ops-{uuid.uuid4().hex[:10]}")
     live_execution = OutcomeLiveExecutionRuntime(
         account=client, wallet=auth.wallet_address,
@@ -289,6 +296,9 @@ def run_integrated_hyperliquid_bot(
             current_market = market
 
             # 2. Update pricing feeds
+            book_yes: dict[str, Any] | None = None
+            book_no: dict[str, Any] | None = None
+            yes_received_at_ms = no_received_at_ms = capture_complete_at_ms = 0
             try:
                 all_mids = client.get_all_mids_sync()
                 btc_mark_str = all_mids.get("BTC", "0")
@@ -297,7 +307,10 @@ def run_integrated_hyperliquid_bot(
                     pricing.update_btc_mark_price(btc_mark)
 
                 book_yes = client.get_l2_book_sync(market.yes_coin)
+                yes_received_at_ms = int(time.time() * 1000)
                 book_no = client.get_l2_book_sync(market.no_coin)
+                no_received_at_ms = int(time.time() * 1000)
+                capture_complete_at_ms = int(time.time() * 1000)
                 pricing.update_l2_book(market.yes_coin, book_yes)
                 pricing.update_l2_book(market.no_coin, book_no)
             except Exception as e:
@@ -330,6 +343,26 @@ def run_integrated_hyperliquid_bot(
                         f"auto_execution={operational.automated_execution_enabled}"
                     )
                     last_log_time = time.time()
+                if research_capture and book_yes is not None and book_no is not None:
+                    try:
+                        research = research_capture.capture_if_due(
+                            market=market, yes_book=book_yes, no_book=book_no,
+                            yes_local_received_at_ms=yes_received_at_ms,
+                            no_local_received_at_ms=no_received_at_ms,
+                            capture_complete_at_ms=capture_complete_at_ms,
+                        )
+                        if research.captured:
+                            logger.debug(
+                                f"[OUTCOME RESEARCH CAPTURE] accepted={research.accepted} "
+                                f"p3_markouts={research.p3_markouts_written}"
+                            )
+                    except Exception as e:
+                        live_journal.log_strategy_event("outcome-research-error", "OUTCOME_RESEARCH_CAPTURE_ERROR", {
+                            "venue": "hyperliquid_outcome", "read_only": True,
+                            "error_type": type(e).__name__, "error": str(e),
+                            "action": "capture_skipped_will_retry_next_interval",
+                        })
+                        logger.warning(f"Outcome research capture failed; execution remains fail-closed: {e}")
 
             phase = evaluate_outcome_market_phase(market)
             time_left = market.time_to_expiry_sec()

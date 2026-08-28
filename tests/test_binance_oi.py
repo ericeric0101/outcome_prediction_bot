@@ -75,3 +75,19 @@ def test_collector_persists_deduped_live_and_backfilled_observations(tmp_path):
     assert report.live_count == 1
     assert report.backfilled_count == 1
     assert report.symbols == ("BTCUSDT",)
+
+
+def test_collector_records_gap_alert_and_heartbeat(tmp_path, monkeypatch):
+    monkeypatch.setenv("BINANCE_OI_HEARTBEAT_SEC", "1")
+    monkeypatch.setenv("BINANCE_OI_GAP_ALERT_SEC", "1")
+    db = TradeJournalDB(tmp_path / "journal.db")
+    assert db.record_binance_oi_observation(
+        run_id="old", source="old", endpoint="/old", symbol="BTCUSDT", exchange_timestamp_ms=1_699_999_000_000,
+        local_received_at_ms=1_699_999_000_000, request_latency_ms=1, open_interest="1", raw_payload_hash="old", raw_payload={},
+    )
+    collector = BinanceOiCollector(journal=db, run_id="oi-run", client=FakeBinanceClient())
+    collector.collect_current()
+    with sqlite3.connect(db.db_path) as conn:
+        events = [row[0] for row in conn.execute("SELECT event_type FROM strategy_events")]
+    assert "BINANCE_OI_GAP_ALERT" in events
+    assert "BINANCE_OI_HEARTBEAT" in events

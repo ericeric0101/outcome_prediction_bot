@@ -209,7 +209,7 @@ Runner 重啟時先做 account reconciliation：若已有相同 outcome 的 inve
 1. **P2 成本修正（已完成；不下單）：** `OutcomeParityAnalyzer` 現在將 `open_fee_rate=0`、maker close `userSpotAddRate`、taker close `userSpotCrossRate` 分開持久化；complete-set passive sell proceeds 已扣 maker close fee。`fee_status=open_zero_close_rates_included_settlement_unverified` 明確表示已納入交易費、但 payout/conversion 尚未驗證，P2 report 仍 fail-closed。
 2. **持續 P2 shadow（操作者可自行執行；唯讀）：** 僅開一個 collector 寫入 DB，例如 `./.venv/bin/python -u scripts/outcome_shadow.py --interval-sec 5 --ws --journal-path logs/outcome_shadow.db`；以 `Ctrl-C` 正常結束。不得同時啟兩個 writer。完成後以 `./.venv/bin/python -m bot.outcome_research_report --db logs/outcome_shadow.db --periods 1d,15m` 檢查 accepted snapshots 和所有 blocker。
 3. **P3 校準上限、side 與 exit policy（已實作；預設停用；2026-08-25 修正）：** `OUTCOME_P3_CALIBRATION_MAX_DAILY_ENTRIES=10` 是每日最多 10 個**新 maker buy order**，不是同時 10 倉；`OUTCOME_MAX_OPEN_ORDERS=1`、`OUTCOME_MAX_OUTCOME_EXPOSURE_USDC=11` 維持一筆約 $10–11 的未結算曝險上限。舊的「actual maker fill 較少的一側」規則已移除，因為它會在 Up 高機率時錯誤地強迫買 Down。新 policy 是 `market_mid_consensus`：先以兩側 `(best_bid + best_ask)/2` 較高者決定唯一 consensus side；只有該 side 的 fee 後 +5% target 合法才 entry，**不可行時直接 flat，絕不 fallback 到互補的低 consensus side**。它不讀取 BTC、fair、ForecastState 或 SignalEngine，但這是明確的 consensus-following sampling policy，不可聲稱無方向或已有 alpha。`OUTCOME_P3_CALIBRATION_TARGET_RETURN_PCT=0.05`，以 `entry × 1.05 / (1-maker_close_fee)` 計算 net +5% ALO take-profit；高於約 0.951 的 entry 不選，因為合法 price 上限無法達成該 target。若 fill 後 midpoint 跌至 entry 的 -5%（`OUTCOME_P3_CALIBRATION_LOSS_REPRICE_PCT=0.05`），runtime 取消舊 profit sell，下一 tick 以 `max(best_ask, net -5% floor)` 掛新的 ALO protection sell。這是**重新報價，不是保證 stop-loss**：post-only 價格不得跨 best bid，故市況已穿越 -5% 時仍可能無法成交並會繼續持倉；絕不因此轉成 taker。
-4. **啟動 P3 校準 canary（正式 runtime；每次需要操作者明確開關）：** 它只在 `OUTCOME_AUTOMATED_EXECUTION_ENABLED=1`、`OUTCOME_SDK_EXECUTION_ENABLED=1`、`OUTCOME_P3_CALIBRATION_ENABLED=1` 三個 gate 同時為真時運作，且仍要求 WS health、account reconciliation、collateral／open-order／exposure risk gate。runtime 在健康雙側 book 以第一檔 maker bid 掛入校準 order；fill 後立即回讀 official `userFills`／balances／open orders。每次 buy submit、cancel、fill、exit 都寫入正式 journal。P3 calibration 在 launcher live mode 會使用 `logs/outcome_shadow.db` 作預設 execution journal，以便 confirmed fills 與 accepted v3 quote history 產生 1/5/10/30s executable markout；只可有一個 shadow collector 同時寫入該 DB。
+4. **啟動 P3 校準 canary（正式 runtime；每次需要操作者明確開關）：** 它只在 `OUTCOME_AUTOMATED_EXECUTION_ENABLED=1`、`OUTCOME_SDK_EXECUTION_ENABLED=1`、`OUTCOME_P3_CALIBRATION_ENABLED=1` 三個 gate 同時為真時運作，且仍要求 WS health、account reconciliation、collateral／open-order／exposure risk gate。runtime 在健康雙側 book 以第一檔 maker bid 掛入校準 order；fill 後立即回讀 official `userFills`／balances／open orders。每次 buy submit、cancel、fill、exit 都寫入正式 journal。P3 calibration 在 launcher live mode 使用 `logs/outcome_shadow.db` 作預設 execution journal；**2026-08-28 起 launcher 自己擁有唯一的 read-only P2/P3 capture stream**，持續產生 accepted v3 quote history 與 1/5/10/30s executable markout。因此不得再為同一 journal 另啟 shadow runtime；同一 wallet 永遠只有 launcher 這一個 execution writer。
 5. **驗收 P3（工程與操作者共同完成）：** 每個 `period × time-left × side × spread/depth` bucket 至少 30 個**獨立** maker fills（不可把同一瞬間的分拆成交灌成 30 筆），且費後 EV 的 95% LCB 為正；不符合的 bucket 永遠不啟用。1d 樣本不能外推到未來 15m，15m 上線後必須以同一架構重做 15m-specific P2/P3。
 6. **驗證結算（需一次獨立、明確的持倉到期授權）：** 受限 canary 的一筆已成交庫存須由操作者決定 hold-to-redeem，逐期比對 raw spec、winning side、spot balance/payout、fee 與 journal。只有取得這項實證才可將 `conversion_settlement_evidence_verified` 設為 true；此步與 direction alpha 無關，但涉及真實到期風險，不能自動進行。
 7. **最後才討論策略自動化：** 只有 P0 resolution/payout、P2 fee-adjusted parity、P3 bucket-level adverse-selection 三者都通過後，才接入 `ForecastState`／`SignalEngine`。初始只能啟用已驗證的一個 bucket、同一 side、硬名義上限與 kill switch；其他 period/bucket 預設拒絕。
@@ -221,6 +221,73 @@ Runner 重啟時先做 account reconciliation：若已有相同 outcome 的 inve
 1. **跨 runtime fill 去重（已修正）：** live runtime 與 shadow/P3 collector 同時回讀同一 official `userFills` trade 時，舊的 process-local dedupe 會讓同一 exchange `trade_id` 重複寫進 `ORDER_FILLED`。`TradeJournalDB.outcome_fill_registry` 現在以 SQLite transaction 原子 claim 每個 trade id；`OutcomeJournalBridge`、`OutcomeExecutionLedger` 與 `OutcomeP3Pipeline` 都使用同一條正式寫入路徑。啟動時 registry 會從舊 journal seed，重啟不會再寫入歷史 fill。已以兩個獨立 ledger 競態寫同一 trade id 的測試驗證，只有一列可落盤。現有 `logs/outcome_shadow.db` 已先備份為 `logs/outcome_shadow.pre-fill-dedupe-20260826.db`，再只移除 19 列可證明重複的 Outcome `ORDER_FILLED`；修復後 market 1153 為 4/4、market 1169 為 16/16（fill rows / unique trade ids）。未修改 P2 snapshots、FILL_MARKOUT 或非 Outcome 資料。
 2. **take-profit 定價證據（已修正）：** calibration exit 不再直接用 `spotClearinghouseState.entryNtl / total` 當交易成本。`OutcomeMakerStateMachine` 會從 official `userFills` 以 FIFO 重建仍持有庫存的 exchange-confirmed fill VWAP，並以它計算 fee-adjusted take-profit / loss floor。每個正式 sell transition journal 都記錄 `account_entry_vwap`、`fill_entry_vwap`、`pricing_basis`、`take_profit_price`、`loss_reprice_floor`、`requested_price` 與 exit mode。P3 calibration 若無法以 fills 完整重建現有 inventory，會 fail-closed 並要求 explicit reconciliation，絕不把未驗證的 `entryNtl` 賣價標為「+5% take-profit」。這是為了修復首次資料中「標為 take-profit、實際卻低於實際 buy fill +5%」的稽核缺口；它不宣稱已驗證策略獲利。
 3. **主動 maker sell cancel/replace（已列入正式待辦，尚未實作）：** 現行 runtime 僅在初始 fee-adjusted take-profit 掛單後維持原價；當 midpoint 跌破 -5% 才會取消一次並掛 maker-only loss-band protection，**不會**隨新的 order book 主動優化或加速退出。後續必須把它實作為正式、可重啟對帳的 cancel/replace state machine，而非臨時腳本：只在同一 wallet inventory 與 owned ALO sell 完整對應時運作；每次改價先確認舊單仍存在並成功取消，才可送一張取代單；任何 unknown order/fill/cancel race 都 fail-closed。它需支援兩個明確、不可混淆的模式：(a) **profit improvement**：在不降低已驗證費後最低目標與不跨 bid 的前提下，提高 maker sell 報價；(b) **risk reduction**：依已校準的時間、markout、loss 或流動性條件，以仍為 ALO/post-only 的可成交最佳 ask 附近報價降低庫存風險。兩種模式都須有最小改價幅度、最小重掛間隔、每倉 cancel/requote 上限、stale-book/WS health gate、partial-fill reconciliation、hard exposure cap 與完整 journal audit（old/new order id、BBO、原因、target/floor、cancel/fill race）。在 P3 尚無足夠 bucket-level evidence 前，不得以「立即止損」為由跨 bid 或 fallback 為 taker。
+
+### 下一輪正式計劃：Outcome ALO Exit Cancel/Replace State Machine（E0–E3 完成；E4–E5 尚未實作；2026-08-28）
+
+**研究來源與移植判讀。** 本輪重新審閱兩個既有 Polymarket 實作：本機 `/Users/cheng-kaihuang/poly-maker-main`（remote: [`poly-LPbot`](https://github.com/ericeric0101/poly-LPbot)）及 `/Users/cheng-kaihuang/Polymarket-BTC-15-Minute-Trading-Bot-main`（remote: [`Polymarket-15m-BTC-bot`](https://github.com/ericeric0101/Polymarket-15m-BTC-bot)）。前者提供實戰 maker guard、取消後重讀盤與 fill-markout/toxicity 經驗；後者提供較模組化的 `QuoteService`/`QuoteRuntime`、quote version、TTL/hysteresis、sell reservation、exit audit 與 recovery state 規格。兩 repo 僅是**行為規格與測試參考**，沒有 runtime import 關係；不得直接複製其 CLOB client、Polymarket token/allowance/redeem、Gamma/Chainlink data source、或任何 FAK/IOC/taker exit。
+
+**現況與缺口。** `OutcomeMakerStateMachine` 已能：以 official `userFills` FIFO VWAP 計算費後 target、用 ALO 建立保護性 sell、確認 wallet inventory、取消 owned order，並在現有 `-loss_reprice_pct` 觸發時取消一次舊 sell。然而它尚未確認取消後的 exchange open-order truth、未在取消後重新讀 L2 再被動限價、沒有 replacement lock/attempt budget，也沒有處理 partial-fill 或 cancel/fill race 的 durable state。因此它不是完整的動態出場系統；未完成前不得將目前單次 -5% reprice 誤解為止損保證。
+
+#### 可移植的規格與刻意不移植的行為
+
+| 類別 | 可借用的既有規格 | Outcome 對應決定 |
+| :--- | :--- | :--- |
+| 被動價格保護 | buy 嚴格低於 best ask、sell 嚴格高於 best bid；取消後再讀一次 book 並重新 clamp。 | **移植。** 每次 replacement 在最新、健康的 Outcome L2 上重新驗證；不符合被動條件即 `BLOCKED_STALE_OR_CROSSING`，絕不跨 bid。 |
+| 重掛節流 | target version、最小 tick 變化、最短 order age、TTL、token-bucket/最大重掛數。 | **移植概念，不沿用數值。** 所有門檻先設定為 disabled/保守並寫 journal；只由 1d P3/P2 evidence 校準，不能使用 15m 常數。 |
+| 持倉賣單 ownership | recovery sell reservation，正常 TP 與 recovery 不可同時支配同一賣單。 | **移植。** 每個 `(wallet, market, outcome coin)` 只有一個 exit lifecycle owner；未證實本 bot 擁有的 order 一律不可取消。 |
+| trailing／invalidation | 峰值利潤—回撤、持續確認、波動尺度與失效條件。 | **移植為 quote-policy input。** 它只可以建議縮窄或拉高被動賣價；ALO 不保證成交，故不得命名或宣稱為 market stop。 |
+| adverse-selection telemetry | fill markout、spread、microprice、book imbalance、bid depletion、取消原因。 | **移植資料模型。** Outcome P3 現有 1/5/10/30s markout 是起點；新增特徵須先以 period=1d 的真實 fills 校準，不能直接變成 entry signal。 |
+| recovery execution | 15m recovery ladder 的 passive→FAK/IOC/taker。 | **不移植。** Outcome 本輪永久 ALO/post-only；任何路徑都不得因 urgent/risk-off 而關閉 post-only 或送 marketable order。 |
+| venue/結算細節 | Polymarket CLOB、token ID、Polygon CTF/allowance/redeem、Chainlink/TWAP、rebate。 | **不移植。** Outcome 必須只經 official TypeScript SDK sidecar、HIP-4 account/book/fee/settlement evidence。 |
+
+#### 目標狀態與不可違反不變量
+
+```text
+SELL_RESTING
+  → REQUOTE_PROPOSED
+  → CANCEL_SUBMITTED
+  → CANCEL_CONFIRMED
+  → BOOK_REFRESHED_AND_PASSIVE
+  → REPLACEMENT_SUBMITTED
+  → SELL_RESTING
+
+任一 account/order/fill/book 不一致 → RECONCILE_REQUIRED（不送 replacement）
+```
+
+1. 只有 wallet 實際 inventory、official `userFills` 可重建的 VWAP、及本 bot owned ALO sell 三者一致時才可改價；無 policy、unknown order 或未知 inventory 一律 fail-closed。
+2. 每次先取消舊單，再以 `frontendOpenOrders`／官方回覆確認該 `order_id` 已不存在；取消不確定、timeout、或發現 fill 都必須先重新同步 inventory/fills，禁止直接補送新單。
+3. cancel 確認後重新取得 fresh L2；sell replacement 必須 tick-align 且嚴格 `price > best_bid`，仍使用 official SDK `timeInForce=ALO`。若 market 已移動造成 crossing，放棄本次改價而不是以 taker 補救。
+4. partial fill 以剩餘 inventory 和 FIFO VWAP 重算 size/target；cancel/fill race、restart、重複 callback 與 order-id 不一致均進入 `RECONCILE_REQUIRED`，不得假設未成交。
+5. 每倉具最小 price delta、最短重掛間隔、最大 replacement attempts、hard loss floor、stale book/WS gap/heartbeat gate 與 single-flight lock。任何上限耗盡後保留已確認的賣單；若無確認賣單，僅告警並要求 reconciliation，不得偷偷改為 taker。
+6. journal 必須保存 decision regime、舊/新 order id、inventory/VWAP、BBO 與 timestamps、target/floor、取消 acknowledgment、post-only check、partial/fill-race 結果、reprice count、block reason；這是未來 P3 markout 與策略檢定的必要資料。
+
+#### 實作與驗收里程碑（依序；完成一項才進下一項）
+
+| Milestone | 實作範圍 | 必測驗收 | 下單權限 |
+| :--- | :--- | :--- |
+| **E0 — 純 planner／資料契約** | 新增純函式 `OutcomeExitQuotePlanner` 與 `ExitQuotePlan`：輸入 verified inventory/VWAP、owned sell、fresh L2、time-left、volatility/markout regime；輸出 `KEEP`、`CANCEL_REPLACE`、`BLOCK`，不呼叫 exchange。先僅保留 fixed +5%／既有 loss-floor 相容模式。 | unit tests：費後 floor、tick alignment、passivity、無 policy/舊資料/不明 order block、hysteresis、最短間隔、attempt cap；無網路／無下單。 | 禁止。 |
+| **E1 — durable exit ownership/recovery** | 為 `(wallet, market, coin)` 建立 durable exit lifecycle record；以 account truth 恢復 `SELL_RESTING` 或 `RECONCILE_REQUIRED`，串接既有 execution ledger，不新增一次性 script。 | restart、existing owned sell、unknown sell、partial inventory、重複 event、existing buy remainder 等 fixture tests；確認不會取消非 owned order。 | 禁止。 |
+| **E2 — cancel-confirm-rebook-replace adapter** | 在 official-SDK-only gateway 加入受 ownership 保護的 cancel confirmation/readback；state machine 取得 single-flight lock，取消成功後才 reread L2、再送 ALO replacement。 | fake-sidecar integration tests：cancel 成功、cancel timeout、cancel rejects、fill during cancel、book crossing、stale health、replacement rejects；斷言「沒有 cancel confirmation 絕不 place」。 | 預設禁止；只能 test double。 |
+| **E3 — telemetry-only shadow replay** | 由 live/shadow 已收集的 P2/P3 history 重播 planner，產生 counterfactual `EXIT_REQUOTE_*` journal，不能發 cancellation 或 order。比較 KEEP/replace 次數、預期被動性、距 BBO、markout，按 1d regime 分桶。 | deterministic replay、look-ahead guard、同一輸入同一 plan、無 execution call；報表明列樣本/未知資料。 | 禁止。 |
+| **E4 — disabled production gate** | 將 E0–E3 接入正式 `OutcomeLiveExecutionRuntime`，但預設 `OUTCOME_EXIT_REQUOTE_ENABLED=0`；所有 E0–E3 gate/P0/P2/P3 heartbeat/freshness 必須綠燈才可由操作者顯式啟用。 | full regression、SDK sidecar build、live-like fake account test；啟用 flag 缺失時斷言零 cancel/replace。 | 預設禁止。 |
+| **E5 — 人工核准小額 ALO canary** | 僅在 P3 有足夠同一 1d bucket fill/markout 和 E4 全數驗收後，單一既有持倉、單一 replacement、硬 notional/attempt 上限的人工觀察測試。 | 實際 open-order cancellation、replacement ALO resting、partial/cancel-fill race、journal/DB/account 對帳一致；任一不一致立即關閉 flag。 | 需獨立人工核准；不是本計劃自動授權。 |
+
+#### 未來 policy 的研究範圍（不是目前啟用參數）
+
+- **低波動／橫盤：** 僅在 P3 證據顯示較窄的 fee-after target 有正 executable EV 時，planner 才可把 +5% 收窄至候選的 +2%～+3%；不能以 UI mid 的單次跳動決定。
+- **持續趨勢且流動性健康：** 可以由 peak profit、volatility、book depth 與 markout bucket 支持較高 target 或 trailing quote；每次仍是 passive replacement，不是保證的 trailing stop。
+- **走弱／下行：** -2%～-5% 的 risk-reduction 需要持續時間、多次 observation、波動尺度、book deterioration 和最小重掛間隔共同確認；單一 mid 跌破不足以撤掉已存在保護單。
+- **校準原則：** 先在 period=1d、同側、time-left/spread/depth/volatility regime 分桶；1d 結果絕不直接套用至未來 15m。OI 僅可在 X4/X5 成功後作為 quote/no-quote、size、cancel urgency 的輔助條件，不得單獨決定 side 或 exit。
+
+**完成定義。** E0–E4 完成只代表 Outcome 已具安全、可審計、disabled-by-default 的動態被動出場 infrastructure；不代表盈利、也不解除 P0 settlement、P2 fee/conversion 或 P3 bucket evidence gate。E5 的真實 canary 也只驗證 lifecycle correctness，不能用單筆成功推論策略可以擴大資金。
+
+**E0–E3 實作與驗證（完成 2026-08-28；不改變下單權限）：**
+
+1. **E0 — pure planner（完成）：** 新增 `bot/outcome_exit_quote_planner.py`。`OutcomeExitQuotePlanner` 不 import SDK、account、journal 或 clock；只根據 verified fill VWAP、close fee、explicit policy、owned resting sell、fresh BBO、hysteresis／interval／attempt cap 輸出 `KEEP`、`CANCEL_REPLACE` 或 fail-closed `BLOCK`。它以 fee-after +5% target 和既有 loss floor 保持相容，並在任何 stale/invalid/crossing/out-of-bounds 情況拒絕 proposal。
+2. **E1 — durable ownership/recovery（完成）：** 新增 `bot/outcome_exit_lifecycle.py`。每個 `(wallet, outcome_id, coin)` 的 managed sell order id、inventory、target、replacement count 與 lifecycle state 以 `OUTCOME_EXIT_LIFECYCLE` journal event 持久化；restart recovery 必須同時由 wallet inventory 和 official open order 的 `oid/coin/side/size` 證實。未紀錄的手動 order、missing/partial order 或帳戶不一致都變成 `RECONCILE_REQUIRED`，不可取消或接管。
+3. **E2 — cancel-confirm-rebook-replace controller（完成但尚未接入 runtime）：** 新增 `bot/outcome_exit_requote_controller.py`。controller 先寫 `CANCEL_SUBMITTED`、提交既有 ownership-checked cancel、重讀 account open orders 確認舊 `oid` 消失、重讀 inventory 檢查 cancel/fill race，再讀 L2 並以 `price > best_bid` 的 tick-aligned ALO reduce-only sell 送 replacement。任何 cancel timeout/reject、old order 仍在、inventory 改變、book 無效/crossing、或 replacement reject 都只記 `RECONCILE_REQUIRED`，不補送單也不走 taker。它尚未被 `OutcomeLiveExecutionRuntime` import 或呼叫。
+4. **E3 — telemetry-only replay（完成）：** 新增 `bot/outcome_exit_requote_replay.py` 與 `scripts/replay_outcome_exit_quotes.py`。它只讀既有 `OUTCOME_P2_PARITY_SNAPSHOT` 和 actual `ORDER_FILLED`，並寫入標明 `read_only=true`、`counterfactual=true`、`execution_submitted=false` 的 `OUTCOME_EXIT_REQUOTE_REPLAY` events；不建構 gateway、sidecar、private key 或 exchange action。正式 DB 讀取 1d historical evidence 的一次 replay 寫入 **8,197** 個 counterfactual plans（KEEP **1,894**、CANCEL_REPLACE **6,303**、BLOCK **0**）。此結果僅反映目前固定 policy 對歷史 BBO 的機械提案頻率，**不是** fill、PnL、速度或盈利證據，不能據此啟用 E4。
+5. **測試與安全界線：** E0 targeted 加既有 maker/gateway regression **19 passed**；E1 targeted **9 passed**；E2 targeted **21 passed**；E3 新增 suite **14 passed**；完整 Python regression **423 passed**。新增測試包括：fee floor、tick/passivity、stale book、hysteresis/interval/attempt cap、restart ownership、unrecorded order、cancel-confirm ordering、partial fill/cancel race、invalid rebook、replacement reject、period isolation 和 `execution_submitted=false`。沒有提交 Outcome cancel/order，沒有新增環境變數，也沒有把 `OUTCOME_EXIT_REQUOTE_ENABLED` 寫入 runtime；E4 仍是下一個、預設 disabled 的 integration milestone。
 4. **generic live exit bypass（已修正，2026-08-26）：** market 1177 曾出現實際 fill VWAP `0.68912`、卻由 `OutcomeLiveExecutionRuntime.tick_market()` 的 generic path 掛出 `0.68074` ALO sell。journal 證據顯示此路徑沒有傳入 `minimum_return_pct`，故舊 state machine 將 `best_ask` 當作 fallback sell，並錯誤標記為 take-profit；這不是 exchange 行為，也不是 P3 calibration 的 +5% policy。現在 generic `tick()` / `tick_market()` 不得建立新 entry，除非呼叫端提供 dedicated verified exit-policy runtime；持倉在沒有明確 policy 時只會 `blocked`，絕不 fallback 至 best ask。若 partial fill 同時仍有 owned buy remainder，仍先取消 remainder 以防增加曝險，之後才 fail-closed。這個修正不會自動取消已存在的真實掛單；程序必須重啟才會載入新碼，現有 order 的取消仍須操作者明確指示或使用正式 ownership-checked cancel adapter。
 5. **P3 policy persistence across entry/fill/restart（已修正，2026-08-26）：** market 1177 隨後另有一筆 P3 calibration buy fill `0.67329 × 15`；該 entry event 正確記錄 `target_return_pct=0.05`，但後續持倉 tick 走到 generic dispatcher 後只得到 fail-closed block，因 policy 沒有被當成持倉狀態恢復。正確行為不是等價格先上漲 5% 才掛賣單，而是在 exchange-confirmed fill 後立即掛 `fill_VWAP × 1.05 / (1-maker_close_fee)` 的 ALO sell；此例費後 target 約為 `0.7072`，若當時 best ask 更高，則以較高且仍 post-only 的 ask 掛出。現在 P3 entry journal 同時保存 `order_id`、target/loss percentages 與 maker fee；`tick_market()` 與 `tick_p3_calibration()` 在處理既有庫存時，先從同一 market/coin 的 durable entry evidence 恢復 policy，再呼叫 state machine。此規則也在 account recovery 將 HIP-4 spot balance `+<encoding>` 正規化至 book/order coin `#<encoding>` 後套用，故重啟不會把已持倉誤判 flat。沒有可驗證 policy 的非 P3 inventory 仍維持 blocked，不能藉由這個恢復機制獲得任意賣出權限。
 
@@ -240,7 +307,7 @@ Runner 重啟時先做 account reconciliation：若已有相同 outcome 的 inve
 | :--- | :--- | :--- | :--- |
 | **X1 — 1d scope 與資料契約（完成 2026-08-26）** | research universe 固定為實際 `period=1d` 的 Outcome BTC market；`bot/outcome_daily_scope.py` 使 launcher、preflight 與 shadow runtime 拒絕非 `1d` 或 fallback 設定。Binance `BTCUSDT` USDⓈ-M OI table contract 已建立：exchange/local timestamp、symbol、OI quantity/value、endpoint、request latency、backfilled、raw payload hash/json 與 context。 | 非 1d preference／fallback 在啟動前 fail-closed；OI parser 拒絕錯 symbol、空／非正 OI 與缺失 event time。 | **延續 P0/P1，唯讀。** 沒有新增下單授權。 |
 | **X2 — Binance OI 唯讀 collector（完成 2026-08-26）** | `bot/binance_oi.py`／`scripts/binance_oi_collector.py` 只呼叫 Binance public `openInterest`、`openInterestHist`、`premiumIndex`、`aggTrades`；不接受 API key、不含任何 Binance order/account path。current OI 保存 mark/index 與 aggressor-side taker imbalance；5m history 一律標 `backfilled=true`。journal 以 source/run id、endpoint/time/hash unique key 去重，並有 `scripts/binance_oi_report.py` 稽核 coverage、live/backfill count、live gap 與 latency。 | restart/backfill dedupe、錯 symbol rejection、taker-side direction、live/context persistence 由單元測試覆蓋；真實 public smoke 在隔離 DB 成功寫入 10 筆 historical + 1 筆 current BTCUSDT row。Binance 中斷只產生 read-only error event，不會接入 Outcome execution。 | **P1 data-quality extension，唯讀。** 不需要 Binance API key，不得連接 Binance account/trading endpoint。 |
-| **X3 — 1d OI feature／label pipeline** | 用 event-time `as-of` join 對齊 Outcome accepted L2 snapshot 與當時已可知的 Binance observation，禁止 future join。候選 feature 至少包含 `ΔOI`（5m/15m/1h）、OI return/z-score、`ΔOI × BTC return` 四象限、OI acceleration、price/OI divergence、taker imbalance，以及 time-left／moneyness／Outcome spread/depth。建立兩類 label：(a) 1/5/10/30/60m future executable Outcome bid/ask change與真實 maker fill markout；(b) official 1d resolution。 | 每列保存 feature event time、age、join direction、label time、market instance；缺失保持 unknown，不插值製造 OI。短期 label 必須使用 executable side，不只用 mid；resolution 只能來自 P0 official evidence。每個 daily market 的大量 snapshot 不得假裝成大量獨立 resolution。 | **供 P2/P3 研究。** OI 先作 telemetry／condition，不接 `OutcomeLiveExecutionRuntime`。 |
+| **X3 — 1d OI feature／label pipeline（完成 2026-08-27）** | `bot/outcome_oi_features.py` 以 event-time `as-of` join 對齊 Outcome accepted `p2_schema_version=3` 1d L2 snapshot 與 Binance observation；預設只接受 `backfilled=false`、`exchange_timestamp_ms <= local_received_at_ms <= snapshot_timestamp_ms` 的最新 row，禁止 exchange-time 看似較早、但本機尚未收到的 future data。每 snapshot 保存 `ΔOI`（5m/15m/1h）、OI return/zscore、OI acceleration、Binance mark return、price/OI regime/divergence、taker imbalance 與 YES/NO executable BBO/spread/depth。另以 `outcome_oi_fill_feature_rows` 在真實 maker fill 時點建立同樣 as-of OI overlay，且只附著 official `FILL_MARKOUT`。 | `outcome_oi_feature_rows` 保存 source snapshot event id、market instance、join direction、source ids/timestamps/age、feature/label JSON；缺資料保持 unknown，絕不插值。1/5/10/30/60m labels 只用同一 outcome 的未來 accepted L2：long 為 `future bid - entry ask`、short 為 `entry bid - future ask`，且最多容許 120 秒 label lag，絕不用 mid 或跨 market instance。historical OI 只能以 explicit `--include-backfilled` 研究 override 使用，provenance 仍保留，不能當 live evidence。official 1d resolution 仍只可來自 P0 evidence，X3 不推論 resolution。 | **供 P2/P3 研究，仍唯讀。** 不接 `OutcomeLiveExecutionRuntime`，不改變任何 entry/exit、P0–P4 或下單權限。 |
 | **X4 — market-only baseline 與 purged walk-forward** | 只比較兩層模型：A=`Outcome 自身狀態`；B=`A + Binance OI/context`。第一版使用可解釋且正則化的 logistic/linear/GAM 類模型，不以深度模型掩蓋樣本不足。train/validation/test 依完整 daily market instance／日期切割，禁止 random snapshot split；相鄰或重疊 horizon 使用 purge/embargo，標準誤與 bootstrap 以 market instance cluster。逐項做 feature ablation，避免多重試驗挑中偶然訊號。 | B 必須在未見過的 daily instances 對 A 呈現可重複增量：resolution 看 log loss/Brier/calibration；短期看 executable quote/markout error；交易層看全部已驗證 fee、slippage、fill/exit cost 後 EV 與 95% LCB。只有 accuracy/win-rate 變好、但 executable EV 未改善，判定失敗。 | **P2/P3 驗收的一部分，仍禁止策略實盤。** 不以 in-sample correlation 解鎖任何 bucket。 |
 | **X5 — OI policy gate 與受限接線** | 僅當 X1–X4 通過，且原 P0 resolution/payout、P2 fee-adjusted economics、P3 bucket-level actual-fill markout 同時通過，才建立 OI-aware policy adapter。第一版只允許 OI 改變已驗證 1d bucket 的 `quote/no-quote`、size 上限、cancel urgency 或 inventory limit；不得讓單一 OI threshold 直接選 UP/DOWN。若後續要讓模型選 side，須另有 resolution-level OOS 證據與獨立權威文件變更。 | live 前固定模型版本、feature schema、training cutoff、適用 bucket、最大 staleness、hard notional、kill switch；任何缺 feature、schema drift、模型過期、P0–P3 regression 或 OOS gate 失敗均回到 `no-new-entry`。P4 仍需操作者明確核准的小額 ALO canary。 | **不自動改變權限。** 完成研究程式不等於 X5 通過；P4 仍是人工授權。 |
 
@@ -255,7 +322,7 @@ Runner 重啟時先做 account reconciliation：若已有相同 outcome 的 inve
 
 #### 執行順序與當前狀態
 
-`X1 → X2` 已於 2026-08-26 完成，下一步是 **X3**；每個 milestone 都需先更新本文件、加入測試並通過完整 regression，才可進下一步。X2 collector 的正式啟動命令如下，預設對同一 journal 做 500 筆 5m backfill，之後每 30 秒保存一筆 current OI：
+`X1 → X3` 已完成；下一步是 **X4 market-only baseline 與 purged walk-forward**。X3 只完成可稽核資料與 labels，不代表 OI 有 alpha，也不解鎖交易。每個 milestone 都需先更新本文件、加入測試並通過完整 regression，才可進下一步。X2 collector 的正式啟動命令如下，預設對同一 journal 做 500 筆 5m backfill，之後每 30 秒保存一筆 current OI：
 
 ```bash
 ./.venv/bin/python -u scripts/binance_oi_collector.py \
@@ -268,6 +335,49 @@ Runner 重啟時先做 account reconciliation：若已有相同 outcome 的 inve
 ```bash
 ./.venv/bin/python scripts/binance_oi_report.py --db logs/outcome_shadow.db
 ```
+
+X3 是離線建構，沒有網路或交易呼叫；collector 持續寫入後可安全重跑（同一 schema/source snapshot 會 upsert）：
+
+```bash
+./.venv/bin/python scripts/build_outcome_oi_features.py --db logs/outcome_shadow.db
+./.venv/bin/python scripts/outcome_oi_feature_report.py --db logs/outcome_shadow.db
+```
+
+**X3 驗證（2026-08-27）：** anti-lookahead、backfill exclusion/explicit provenance、同一 market-instance label、executable-side label 與 actual-maker-fill overlay tests **6 passed**；完整 Python regression **406 passed**。對正式 `logs/outcome_shadow.db` 的 build 寫入 **7,538** accepted 1d snapshot feature rows；其中 **1,527** rows 有 live as-of OI join，age 範圍 **10–33,040ms**，backfilled join 為 **0**。future executable label coverage 分別為 1m **7,514**、5m **7,438**、10m **7,362**、30m **7,062**、60m **6,690**。journal 內有 **32** actual maker-fill overlay rows，但 **0** rows 有 fill-time live OI join：這些 fills 都早於 X2 collector 的第一筆 live OI，因此不得拿來宣稱 OI 對真實 maker fill 的歷史 alpha；只能從 collector 上線後的新 fills 開始累積。X3 未建立 official resolution label，因 P0 resolution/payout evidence 尚未完成。
+
+**X3 live-data checkpoint（2026-08-27；非策略通過）：** audit 時 `binance_oi_observations` 有 **2,304** live、**596** clearly-marked backfilled BTCUSDT rows；live window 為 2026-08-26 14:52 至 2026-08-27 11:46 UTC，request latency 最大 **2,985ms**。在此 window 內，Outcome P2 snapshot 有 **4,021 accepted**、**396 rejected**（皆為 `side_server_skew_exceeded`）；X3 只使用前者並產出 **4,021** locally-known live OI joins，median/p90/p99 OI age 為 **16,280/29,266/32,256ms**，5m/1h OI return feature coverage 為 **4,002/3,825** rows。偵測到一次 **262,300ms** live OI gap（2026-08-26 22:47 UTC），且沒有 `BINANCE_OI_COLLECTION_ERROR` event；其根因未明，該段不插值、不作 latency evidence，之後須維持單一 collector 並監控 gap。以 5m executable YES long markout 初步檢驗：3,962 heavily-overlapping rows 的 OI-return Pearson 為 **-0.035**；降低重疊後的 249 個 `(market instance, 5m bucket)` rows 為 **-0.020**，OI 對 YES-mid 5m change 為 **0.054**、對 YES-minus-NO executable markout 為 **-0.016**。四個 price/OI regimes 的 non-overlapping mean YES markout 皆為負（約 -0.0041 至 -0.0110/share），overall 為 **-0.00866/share**、正 markout 比率 **32.9%**。這些數字只表示目前樣本中**未發現** OI 5m incremental executable edge，不能證明 OI 永遠無效；更不能解鎖 X4、X5、directional entry 或真實 maker-fill calibration。由於只跨兩個 daily market instances、snapshot labels 高度重疊、沒有 OI-era actual maker fills，下一步仍必須先累積多個完整 1d instances，再依 X4 做 purged/embargoed walk-forward。
+
+### 近五日週報（截至 2026-08-28 00:10 Asia/Taipei；journal 截止 2026-08-27 15:08 UTC）
+
+**範圍與帳務：** 此報告只使用 `logs/outcome_shadow.db` 的 exchange trade id 去重後 Outcome fills；它不以 UI 餘額推斷 PnL。共有 **47** unique Outcome fills、**23** matched buy→sell exits、**17** profitable / **6** losing exits；matched cost **$233.2767**、sell proceeds **$239.8098**、已記錄 sell fees **$0.09209**、FIFO fee-net realized PnL **+$6.44103**，平均每 completed exit **+$0.28004**。仍有 `#11850` **12 shares / $10.27968 cost** open，不可列為已實現收益。UI 截圖的 8/23、8/25–8/27 daily positive amounts合計約 **+$7.05**（8/24 = $0）；與 journal 的同日 fee-net matched sum **+$6.44103** 不同 **+$0.60897**。由於 journal 沒有 `MARKET_SETTLEMENT`／redeem reconciliation rows，差額可能是 UI 計算口徑、rebate、未記錄 settlement 或其他帳務項，現在不可歸因，也不可將 UI 數字當 PnL authority。
+
+**交易行為觀察：** 8/23 的手動/canary兩個完整 cycles去重後為約 **+$2.099**；P3 calibration 的 8/25–8/27為 **+$4.34204**（daily：+$1.24236、+$1.48103、+$1.61865）。這是小額、受限 maker execution 的正 realized 結果，**不是** directional strategy evidence：entry policy journal 明確標記 `sampling_policy=market_mid_consensus`、`directional_signal_used=false`；同一資料的 P3 executable markout buckets 多數 fee-adjusted mean 與 95% LCB 為負，且最大的 bucket 在任一 horizon 僅 **10** actual fills，遠低於每 bucket 30 independent fills 的 gate。原始 journal 仍有兩組 duplicate official trade id（各 2 rows：`697173232907308`、`696963348405044`）；本週報已在分析時去重，但資料庫本體仍需作正式 duplicate repair / regression check，否則 P3 計數與 PnL 會被高估。
+
+**Outcome market-data品質：** 目前有 **10,032** eligible P2 1d snapshots，覆蓋 markets 1161/1169/1177/1185；當前 X3 snapshot source 最後一筆為 2026-08-27 11:46 UTC。該時間後仍有 live P3 actual fills（最晚 15:06 UTC）及 WS events（最晚 15:08 UTC），但沒有新的 P2 snapshots，故這段 fills 沒有可用的 future executable book labels；重建後雖有 **45** raw maker-fill overlay rows、**13** rows有 fill-time live OI，卻沒有可附著的 P3 `FILL_MARKOUT`。**這是 P0 data-integrity blocker：** 現行 live launcher 未持續寫入 X3/P3 所需 P2 snapshot，而單獨 shadow runtime 才會。先前「live calibration 時不要同時開 shadow」的操作建議在這個架構下撤回；在完成正式整合前，若要收集可用 P3/OI資料，必須啟動唯一的 snapshot writer（或把相同 durable P2 capture 移入 live launcher），同時仍保持只有一個 wallet execution writer。
+
+**Binance OI品質與結果：** 現有 OI table 為 **2,454** live + **778** backfilled BTCUSDT rows；所有 X3 live join 均排除 backfill。發現 live gaps **74.65min**（8/27 13:59 UTC）、**52.52min**（8/27 12:39 UTC）與 **262.3s**（8/26 22:47 UTC），沒有相應 collection-error event，不能將 gaps 視為普通 30s sampling；gap期間資料不可插值且必須排除 latency-sensitive研究。對 5m future executable label 的 reduced-overlap sample（249 `(market instance,5m bucket)` observations、只跨 1177/1185）中，OI return 對 YES long markout Pearson **-0.020**、對 YES-minus-NO directional markout **-0.016**；無可用 alpha。OI-era actual maker fills只有 13 raw / 11 unique 量級，且仍無 markout label，完全不足以測驗 OI 對真實 fill adverse selection 的影響。
+
+**下週優先順序與禁止事項：** (1) **先修資料完整性，不新增策略。** 把 durable P2 snapshot / P3 markout capture 正式併入 live launcher，或明確以一個 read-only snapshot writer 與一個 wallet writer 的方式運行；加入 single-writer ownership、startup/heartbeat、gap alert、並修復兩個 duplicate fills後測試。 (2) 以連續 collector / snapshot writer 收集至少多個完整 1d instances；每次重跑 X3 build/report，確認 OI join、fill-time OI join與 FILL_MARKOUT 都持續增加。 (3) 同時完成 P0 official resolution/payout 與 P2 settlement/conversion fee evidence；未完成前不以正 PnL 放寬 gate。 (4) 只有資料連續、P3有足夠 independent actual fills與 X3有多 instance data後，才開始 X4 market-only vs OI purged walk-forward。**禁止**把目前 +$6.44／UI +$7.05、OI 或單一正 regime 解讀為自動選 UP/DOWN 或擴大 notional 的授權。
+
+### P0 data-integrity repairs（完成 2026-08-28）
+
+1. **Live P2/P3 capture ownership（完成）：** 新增 `bot/outcome_research_capture.py`，由 `bot.launcher` 在 live mode 以已讀取的雙側 L2 book／本機 receive timestamps 寫入 `OUTCOME_P2_PARITY_SNAPSHOT` v3；它以同一 wallet 的 official `userFills` 寫入 actual fill provenance，並立刻重放 accepted quote history 產生 P3 1/5/10/30s executable markout。capture 預設每 **5 秒**，只呼叫 read-only info/account endpoints；沒有 gateway、private key signing 或 `/exchange` submission。`OutcomeLiveExecutionRuntime` 仍是唯一 order writer。這修復了先前 live launcher 有 WS/account event、卻沒有 P2 snapshots，導致後段 fills 無法 label 的資料缺口。
+2. **Heartbeat / gap alerts（完成）：** live capture 每 60 秒寫 `OUTCOME_RESEARCH_CAPTURE_HEARTBEAT`；相鄰成功 captures 超過 30 秒時寫 `OUTCOME_RESEARCH_CAPTURE_GAP_ALERT`，不插值。Binance collector 對應寫 `BINANCE_OI_HEARTBEAT`（60 秒）與 `BINANCE_OI_GAP_ALERT`（90 秒）。設定值位於 `.env.example`：`OUTCOME_RESEARCH_CAPTURE_INTERVAL_SEC`、`OUTCOME_RESEARCH_HEARTBEAT_SEC`、`OUTCOME_RESEARCH_GAP_ALERT_SEC`、`BINANCE_OI_HEARTBEAT_SEC`、`BINANCE_OI_GAP_ALERT_SEC`；全部只影響資料品質監控，**不授權下單**。操作者可用以下唯讀 command 檢查 freshness/gaps：
+
+```bash
+./.venv/bin/python scripts/outcome_collection_health_report.py \
+  --db logs/outcome_shadow.db \
+  --stale-sec 120
+```
+
+3. **Historical duplicate fill repair（完成）：** `TradeJournalDB.repair_duplicate_outcome_fills()` 與正式 maintenance script `scripts/repair_outcome_fill_duplicates.py` 對同一 `venue=hyperliquid_outcome` 的 exchange `trade_id` 保留最早 `ORDER_FILLED` row，並移除其他已證明重複的本機 rows；P3 markouts 按 trade id/horizon 保留，不會觸及交易所、wallet 或資產。正式 DB 先以 SQLite consistent backup 建立 `logs/outcome_shadow.pre-fill-dedupe-20260828.db`，再移除 IDs **2827、2835**（trade ids `697173232907308`、`696963348405044`）；repair 後 dry-run 確認 **0** remaining duplicates。任何未來 repair 必須先停止所有 Outcome writers，先 dry-run，再 explicit `--apply`，例如：
+
+```bash
+./.venv/bin/python scripts/repair_outcome_fill_duplicates.py --db logs/outcome_shadow.db
+./.venv/bin/python scripts/repair_outcome_fill_duplicates.py --db logs/outcome_shadow.db --apply
+```
+
+4. **驗證與現況：** live capture/P3 provenance/heartbeat-gap/duplicate-repair/Binance collector targeted tests **23 passed**；完整 Python regression **409 passed**；`py_compile` 通過。repair 後 X3 rebuild 有 **43** actual maker fill rows（由 45 raw rows去除兩筆重複）；snapshot/OI及 P2/P3 economics gate 仍沒有通過，且本次資料完整性修復**不改變**任何 execution gate、entry policy或 notional limit。部署新碼後，正式運行組合為：一個 Binance OI collector + 一個 launcher live calibration；不要再啟動 `scripts/outcome_shadow.py`。首次運行後必須確認 health report 的兩個 heartbeat 都在 120 秒內、gap alert count 沒有增加，且 `OUTCOME_P2_PARITY_SNAPSHOT`/`FILL_MARKOUT` 隨 captures/fills 成長；否則停止 P3 calibration，先修 data path。
 
 X2 上線前的 Outcome/P3 fills 只可用於 execution/markout 校準，不能作為 OI alpha 的歷史證明；只有 X2 上線後以正確 event-time 收集的新資料，才能進入 X3 OI 增量研究。X1/X2 僅完成資料與範圍基礎，沒有修改 `OutcomeLiveExecutionRuntime` 的 entry source、模型、P0/P2/P3/P4 gate 或任何下單權限。
 

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import time
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
@@ -241,6 +242,11 @@ class BinanceOiCollector:
         self.run_id = run_id
         self.client = client
         self.symbol = symbol.upper()
+        self.heartbeat_sec = float(os.environ.get("BINANCE_OI_HEARTBEAT_SEC", "60"))
+        self.gap_alert_sec = float(os.environ.get("BINANCE_OI_GAP_ALERT_SEC", "90"))
+        if self.heartbeat_sec <= 0 or self.gap_alert_sec <= 0:
+            raise ValueError("Binance OI heartbeat/gap alert intervals must be positive")
+        self._last_heartbeat_ms = 0
 
     def _write(self, observation: BinanceOiObservation) -> bool:
         context = dict(observation.context or {})
@@ -291,6 +297,15 @@ class BinanceOiCollector:
         observation = BinanceOiObservation.from_current_payload(
             oi_payload, local_received_at_ms=oi_received, request_latency_ms=oi_latency, context=context,
         )
+        previous_received = self.journal.last_binance_live_received_at_ms(symbol=self.symbol)
+        if previous_received is not None and observation.local_received_at_ms - previous_received > int(self.gap_alert_sec * 1000):
+            self.journal.log_strategy_event(self.run_id, "BINANCE_OI_GAP_ALERT", {
+                "source": BINANCE_USDM_SOURCE, "symbol": self.symbol, "read_only": True,
+                "previous_local_received_at_ms": previous_received,
+                "current_local_received_at_ms": observation.local_received_at_ms,
+                "gap_ms": observation.local_received_at_ms - previous_received,
+                "threshold_ms": int(self.gap_alert_sec * 1000), "action": "gap_recorded_no_interpolation",
+            })
         written = self._write(observation)
         self.journal.log_strategy_event(self.run_id, "BINANCE_OI_CURRENT", {
             "source": BINANCE_USDM_SOURCE, "symbol": self.symbol,
@@ -300,4 +315,12 @@ class BinanceOiCollector:
             "written": written, "read_only": True,
             "context_status": "complete",
         })
+        if observation.local_received_at_ms - self._last_heartbeat_ms >= int(self.heartbeat_sec * 1000):
+            self.journal.log_strategy_event(self.run_id, "BINANCE_OI_HEARTBEAT", {
+                "source": BINANCE_USDM_SOURCE, "symbol": self.symbol, "read_only": True,
+                "last_local_received_at_ms": observation.local_received_at_ms,
+                "request_latency_ms": observation.request_latency_ms,
+                "interval_sec": self.heartbeat_sec, "gap_alert_sec": self.gap_alert_sec,
+            })
+            self._last_heartbeat_ms = observation.local_received_at_ms
         return written
