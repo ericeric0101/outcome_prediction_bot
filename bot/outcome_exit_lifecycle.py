@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from datetime import datetime
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any
@@ -26,6 +27,7 @@ class OutcomeExitLifecycle:
     replacement_count: int
     state: str
     updated_event_id: int | None = None
+    updated_at_ts: float | None = None
 
 
 class OutcomeExitLifecycleStore:
@@ -48,7 +50,7 @@ class OutcomeExitLifecycleStore:
             with sqlite3.connect(self.journal.db_path) as conn:
                 row = conn.execute(
                     """
-                    SELECT id, payload_json FROM strategy_events
+                    SELECT id, ts, payload_json FROM strategy_events
                     WHERE event_type=?
                       AND json_extract(payload_json, '$.venue')='hyperliquid_outcome'
                       AND json_extract(payload_json, '$.wallet')=?
@@ -59,7 +61,7 @@ class OutcomeExitLifecycleStore:
                 ).fetchone()
             if not row:
                 return None
-            payload = json.loads(row[1])
+            payload = json.loads(row[2])
             if not isinstance(payload, dict) or payload.get("state") not in {"SELL_RESTING", "CANCEL_SUBMITTED", "RECONCILE_REQUIRED"}:
                 return None
             return OutcomeExitLifecycle(
@@ -67,6 +69,7 @@ class OutcomeExitLifecycleStore:
                 order_id=str(payload["order_id"]), inventory=Decimal(str(payload["inventory"])),
                 target_price=Decimal(str(payload["target_price"])), replacement_count=int(payload.get("replacement_count", 0)),
                 state=str(payload["state"]), updated_event_id=int(row[0]),
+                updated_at_ts=datetime.fromisoformat(str(row[1])).timestamp(),
             )
         except (KeyError, TypeError, ValueError, sqlite3.Error, json.JSONDecodeError):
             return None

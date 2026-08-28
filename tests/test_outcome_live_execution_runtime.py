@@ -4,6 +4,9 @@ from bot.lifecycle.outcome_lifecycle import OutcomeMarketSpec
 from bot.outcome_live_execution_runtime import OutcomeLiveExecutionRuntime
 from bot.outcome_stream_health import OutcomeStreamHealth
 from bot.outcome_execution_ledger import OutcomeExecutionLedger
+from bot.outcome_exit_lifecycle import OutcomeExitLifecycle, OutcomeExitLifecycleStore
+from bot.outcome_exit_quote_planner import OutcomeExitQuotePlanner, OutcomeExitQuotePlannerConfig
+from bot.outcome_exit_requote_controller import ExitRequoteResult
 from monitoring.trade_journal_db import TradeJournalDB
 
 
@@ -153,3 +156,64 @@ def test_generic_recovery_restores_persisted_p3_exit_policy(monkeypatch, tmp_pat
     assert result.state == "sell_placed"
     assert gateway.calls[0]["is_buy"] is False
     assert gateway.calls[0]["price"] == Decimal("0.67329") * Decimal("1.05") / Decimal("0.9996")
+
+
+def _managed_exit_runtime(tmp_path, monkeypatch, *, enabled: bool):
+    monkeypatch.setenv("OUTCOME_AUTOMATED_EXECUTION_ENABLED", "1")
+    monkeypatch.setenv("OUTCOME_SDK_EXECUTION_ENABLED", "1")
+    monkeypatch.setenv("OUTCOME_EXIT_REQUOTE_ENABLED", "1" if enabled else "0")
+    journal = TradeJournalDB(tmp_path / "requote.db")
+    journal.log_strategy_event("run", "OUTCOME_P3_CALIBRATION_ENTRY_PLACED", {
+        "outcome_id": 1153, "coin": "#11530", "target_return_pct": "0.05",
+        "loss_reprice_pct": "0.05", "maker_close_fee_rate": "0.0004", "order_id": "buy-1",
+    })
+    ledger = OutcomeExecutionLedger(journal, "run")
+    store = OutcomeExitLifecycleStore(journal, "run")
+    lifecycle = OutcomeExitLifecycle("w", 1153, "#11530", "old-sell", Decimal("13"), Decimal("0.85"), 0, "SELL_RESTING")
+    store.record(lifecycle, reason="fixture")
+    class FilledAccount(Account):
+        def get_user_fills_sync(self, _): return [{"coin": "#11530", "side": "B", "px": "0.80", "sz": "13", "time": 1}]
+    class LossGateway(Gateway):
+        def __init__(self): self.calls = []
+        def fetch_order_book(self, **_): self.calls.append("book"); return {"bids": [{"price": "0.70"}], "asks": [{"price": "0.71"}]}
+        def cancel_owned_order(self, **_): self.calls.append("cancel"); return {}
+    class SpyController:
+        def __init__(self): self.calls = 0
+        def execute(self, **_): self.calls += 1; return ExitRequoteResult("sell_resting", "fake replacement", "old-sell", "new-sell")
+    gateway, controller = LossGateway(), SpyController()
+    runtime = OutcomeLiveExecutionRuntime(
+        account=FilledAccount(balances=[{"coin": "+11530", "total": "13", "entryNtl": "10.4"}], orders=[{"coin": "#11530", "side": "A", "oid": "old-sell", "sz": "13"}]),
+        wallet="w", gateway=gateway, ledger=ledger, exit_lifecycle_store=store, exit_requote_controller=controller,
+        exit_planner=OutcomeExitQuotePlanner(OutcomeExitQuotePlannerConfig(min_requote_interval_sec=0)),
+    )
+    return runtime, controller, gateway, store
+
+
+def test_e4_flag_off_never_calls_cancel_replace_controller(monkeypatch, tmp_path):
+    runtime, controller, gateway, _ = _managed_exit_runtime(tmp_path, monkeypatch, enabled=False)
+    result = runtime.tick_market(market=market(), entry_side_index=None)
+    assert controller.calls == 0
+    assert "inventory is protected" in result.detail
+    assert gateway.calls == ["book"]
+
+
+def test_e4_flag_on_requires_managed_lifecycle_then_calls_controller(monkeypatch, tmp_path):
+    runtime, controller, _, _ = _managed_exit_runtime(tmp_path, monkeypatch, enabled=True)
+    result = runtime.tick_market(market=market(), entry_side_index=None)
+    assert controller.calls == 1
+    assert result.order_id == "new-sell"
+
+
+def test_e4_new_sell_is_written_as_durable_owned_lifecycle(monkeypatch, tmp_path):
+    monkeypatch.setenv("OUTCOME_AUTOMATED_EXECUTION_ENABLED", "1")
+    monkeypatch.setenv("OUTCOME_SDK_EXECUTION_ENABLED", "1")
+    journal = TradeJournalDB(tmp_path / "runtime.db")
+    journal.log_strategy_event("run", "OUTCOME_P3_CALIBRATION_ENTRY_PLACED", {
+        "outcome_id": 1153, "coin": "#11530", "target_return_pct": "0.05", "loss_reprice_pct": "0.05", "maker_close_fee_rate": "0.0004",
+    })
+    class FilledAccount(Account):
+        def get_user_fills_sync(self, _): return [{"coin": "#11530", "side": "B", "px": "0.80", "sz": "13", "time": 1}]
+    runtime = OutcomeLiveExecutionRuntime(account=FilledAccount(balances=[{"coin": "+11530", "total": "13", "entryNtl": "10.4"}]), wallet="w", gateway=Gateway(), ledger=OutcomeExecutionLedger(journal, "run"))
+    assert runtime.tick_market(market=market(), entry_side_index=None).state == "sell_placed"
+    restored = runtime.exit_lifecycle_store.recover(wallet="w", outcome_id=1153, coin="#11530")
+    assert restored is not None and restored.order_id == "1"

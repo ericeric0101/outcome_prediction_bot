@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import time
 from dataclasses import dataclass
 from decimal import Decimal
 
@@ -21,6 +22,9 @@ from bot.outcome_stream_health import OutcomeStreamHealth
 from bot.outcome_execution_ledger import OutcomeExecutionLedger
 from bot.outcome_research_gate import OutcomeResearchGate
 from bot.outcome_p3_calibration import OutcomeP3CalibrationConfig, choose_consensus_calibration_side
+from bot.outcome_exit_lifecycle import OutcomeExitLifecycle, OutcomeExitLifecycleStore
+from bot.outcome_exit_quote_planner import ExitQuoteInput, OutcomeExitQuotePlanner
+from bot.outcome_exit_requote_controller import OutcomeExitRequoteController
 
 
 @dataclass(frozen=True)
@@ -31,7 +35,7 @@ class LiveExecutionResult:
 
 
 class OutcomeLiveExecutionRuntime:
-    def __init__(self, *, account: OutcomeClient, wallet: str, gateway: OutcomeExecutionGateway | None = None, risk_gate: OutcomePreTradeRiskGate | None = None, stream_health: OutcomeStreamHealth | None = None, ledger: OutcomeExecutionLedger | None = None, research_gate: OutcomeResearchGate | None = None) -> None:
+    def __init__(self, *, account: OutcomeClient, wallet: str, gateway: OutcomeExecutionGateway | None = None, risk_gate: OutcomePreTradeRiskGate | None = None, stream_health: OutcomeStreamHealth | None = None, ledger: OutcomeExecutionLedger | None = None, research_gate: OutcomeResearchGate | None = None, exit_planner: OutcomeExitQuotePlanner | None = None, exit_lifecycle_store: OutcomeExitLifecycleStore | None = None, exit_requote_controller: OutcomeExitRequoteController | None = None) -> None:
         self.recovery = OutcomeAccountRecovery(account=account, wallet=wallet)
         self.machine = OutcomeMakerStateMachine(account=account, gateway=gateway or OutcomeExecutionGateway(), wallet=wallet)
         self.risk_gate = risk_gate or OutcomePreTradeRiskGate(OutcomeRiskLimits(
@@ -42,6 +46,12 @@ class OutcomeLiveExecutionRuntime:
         self.stream_health = stream_health
         self.ledger = ledger
         self.research_gate = research_gate or OutcomeResearchGate()
+        self.exit_planner = exit_planner or OutcomeExitQuotePlanner()
+        self.exit_lifecycle_store = exit_lifecycle_store or (OutcomeExitLifecycleStore(ledger.journal, ledger.run_id) if ledger else None)
+        self.exit_requote_controller = exit_requote_controller or (
+            OutcomeExitRequoteController(account=account, gateway=self.machine.gateway, store=self.exit_lifecycle_store, wallet=wallet)
+            if self.exit_lifecycle_store else None
+        )
 
     def _record(self, market: OutcomeMarketSpec, side_index: int, result: MakerTickResult) -> LiveExecutionResult:
         coin = self.machine.gateway.outcome_coin(market, side_index)
@@ -49,6 +59,15 @@ class OutcomeLiveExecutionRuntime:
             self.ledger.record_transition(market_id=market.outcome_id, coin=coin, result=result)
             fills = getattr(self.recovery.account, "get_user_fills_sync", lambda _user: [])(self.recovery.wallet)
             self.ledger.sync_fills(fills=fills, market_key=f"outcome:{market.outcome_id}", period=market.period)
+        if result.state == "sell_placed" and self.exit_lifecycle_store and result.order_id and result.audit:
+            try:
+                self.exit_lifecycle_store.record(OutcomeExitLifecycle(
+                    wallet=self.recovery.wallet, outcome_id=market.outcome_id, coin=coin, order_id=str(result.order_id),
+                    inventory=Decimal(str(result.audit["inventory"])), target_price=Decimal(str(result.audit["requested_price"])),
+                    replacement_count=0, state="SELL_RESTING",
+                ), reason="initial_verified_alo_sell", extra={"pricing_basis": result.audit.get("pricing_basis"), "exit_mode": result.audit.get("exit_mode")})
+            except (KeyError, ValueError):
+                pass
         return LiveExecutionResult(result.state, result.detail, result.order_id)
 
     @staticmethod
@@ -64,6 +83,11 @@ class OutcomeLiveExecutionRuntime:
             OutcomeLiveExecutionRuntime.enabled()
             and os.environ.get("OUTCOME_P3_CALIBRATION_ENABLED") == "1"
         )
+
+    @staticmethod
+    def exit_requote_enabled() -> bool:
+        """E4's explicit fourth gate; false is the safe default."""
+        return OutcomeLiveExecutionRuntime.enabled() and os.environ.get("OUTCOME_EXIT_REQUOTE_ENABLED") == "1"
 
     def _daily_calibration_entries(self) -> int:
         if not self.ledger:
@@ -128,6 +152,47 @@ class OutcomeLiveExecutionRuntime:
         except (ArithmeticError, sqlite3.Error):
             return None
 
+    def _maybe_requote_p3_exit(self, *, market: OutcomeMarketSpec, finding: object) -> LiveExecutionResult | None:
+        """E4 integration, disabled unless all execution gates include reprice.
+
+        It only manages a sell lifecycle recorded by this runtime after E4;
+        manual and legacy orders cannot be adopted merely because they appear
+        in the configured wallet.
+        """
+        if not self.exit_requote_enabled() or not self.exit_lifecycle_store or not self.exit_requote_controller:
+            return None
+        coin = str(getattr(finding, "coin", ""))
+        policy = self._persisted_p3_exit_policy(market=market, coin=coin)
+        fee = self._persisted_p3_maker_fee(market=market, coin=coin)
+        if policy is None or fee is None:
+            return LiveExecutionResult("blocked", "exit reprice requires persisted verified P3 policy")
+        lifecycle = self.exit_lifecycle_store.recover(wallet=self.recovery.wallet, outcome_id=market.outcome_id, coin=coin)
+        if lifecycle is None:
+            return LiveExecutionResult("blocked", "exit reprice refuses unrecorded sell ownership")
+        inventory = Decimal(str(getattr(finding, "inventory", "0")))
+        vwap = self.machine._fill_vwap_for_inventory(coin=coin, inventory=inventory)
+        if vwap is None:
+            return LiveExecutionResult("blocked", "exit reprice cannot verify fill VWAP", lifecycle.order_id)
+        side_index = 0 if coin == market.yes_coin else 1
+        try:
+            book = self.machine.gateway.fetch_order_book(market=market, side_index=side_index)
+            bid = Decimal(str(book["bids"][0]["price"])); ask = Decimal(str(book["asks"][0]["price"]))
+        except (IndexError, KeyError, TypeError, ValueError):
+            return LiveExecutionResult("blocked", "exit reprice book unavailable", lifecycle.order_id)
+        plan = self.exit_planner.plan(ExitQuoteInput(
+            inventory=inventory, fill_vwap=vwap, maker_close_fee_rate=fee,
+            minimum_return_pct=policy.target_return_pct, loss_reprice_pct=policy.loss_reprice_pct,
+            existing_order_id=lifecycle.order_id, existing_price=lifecycle.target_price,
+            best_bid=bid, best_ask=ask, book_age_sec=0.0, now_ts=time.time(),
+            last_requote_ts=lifecycle.updated_at_ts, replacement_count=lifecycle.replacement_count,
+        ))
+        if plan.action.value == "KEEP":
+            return LiveExecutionResult("sell_resting", f"exit reprice keep: {plan.reason}", lifecycle.order_id)
+        if plan.action.value == "BLOCK":
+            return LiveExecutionResult("blocked", f"exit reprice blocked: {plan.reason}", lifecycle.order_id)
+        result = self.exit_requote_controller.execute(market=market, side_index=side_index, lifecycle=lifecycle, plan=plan)
+        return LiveExecutionResult(result.state, result.detail, result.new_order_id or result.old_order_id)
+
     def _advance_persisted_p3_exit(self, *, market: OutcomeMarketSpec, finding: object) -> LiveExecutionResult | None:
         coin = str(getattr(finding, "coin", ""))
         policy = self._persisted_p3_exit_policy(market=market, coin=coin)
@@ -138,7 +203,10 @@ class OutcomeLiveExecutionRuntime:
         result = self.machine.tick(
             market=market, side_index=side_index, entry_permitted=False,
             minimum_return_pct=policy.target_return_pct, maker_close_fee_rate=fee,
-            loss_reprice_pct=policy.loss_reprice_pct,
+            # The former one-shot loss cancellation is itself a dynamic
+            # cancel/replace behavior.  E4 keeps it dormant until the new
+            # confirmation/rebook controller is explicitly enabled.
+            loss_reprice_pct=policy.loss_reprice_pct if self.exit_requote_enabled() else None,
         )
         return self._record(market, side_index, result)
 
@@ -176,6 +244,9 @@ class OutcomeLiveExecutionRuntime:
         report = self.recovery.reconcile([market])
         active = [finding for finding in report.findings if finding.state != "flat"]
         if len(active) == 1:
+            requote = self._maybe_requote_p3_exit(market=market, finding=active[0])
+            if requote is not None:
+                return requote
             persisted_exit = self._advance_persisted_p3_exit(market=market, finding=active[0])
             if persisted_exit is not None:
                 return persisted_exit
@@ -218,6 +289,9 @@ class OutcomeLiveExecutionRuntime:
         config = OutcomeP3CalibrationConfig.from_env()
         active = [finding for finding in report.findings if finding.state != "flat"]
         if len(active) == 1:
+            requote = self._maybe_requote_p3_exit(market=market, finding=active[0])
+            if requote is not None:
+                return requote
             persisted_exit = self._advance_persisted_p3_exit(market=market, finding=active[0])
             if persisted_exit is not None:
                 return persisted_exit
