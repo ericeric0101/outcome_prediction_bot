@@ -26,6 +26,16 @@ def test_planner_proposes_passive_loss_band_replacement():
     assert plan.target_price >= plan.floor_price
 
 
+def test_zero_loss_policy_only_reprices_to_fee_inclusive_break_even():
+    plan = OutcomeExitQuotePlanner().plan(_input(
+        loss_reprice_pct=Decimal("0"), best_bid=Decimal("0.70"), best_ask=Decimal("0.71"), existing_price=Decimal("0.85"),
+    ))
+    break_even = Decimal("0.80") / Decimal("0.9996")
+    assert plan.action is ExitQuoteAction.CANCEL_REPLACE
+    assert plan.exit_mode == "loss_band"
+    assert plan.target_price >= break_even
+
+
 def test_planner_blocks_missing_policy_and_stale_book():
     assert OutcomeExitQuotePlanner().plan(_input(minimum_return_pct=None)).reason == "missing_verified_exit_policy"
     assert OutcomeExitQuotePlanner().plan(_input(book_age_sec=16)).reason == "stale_book"

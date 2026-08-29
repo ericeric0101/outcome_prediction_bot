@@ -35,6 +35,7 @@ from bot.pricing.outcome_pricing import (
     compute_min_shares_for_notional,
 )
 from bot.outcome_live_execution_runtime import OutcomeLiveExecutionRuntime
+from bot.outcome_live_strategy import OutcomeOiEntryGate
 from bot.outcome_settlement import OutcomeSettlementAdapter
 from bot.outcome_ws_recorder import OutcomeWebSocketRecorder
 from bot.outcome_execution_ledger import OutcomeExecutionLedger
@@ -211,7 +212,10 @@ def run_integrated_hyperliquid_bot(
     # runtime; this remains inert without both explicit execution gates.
     # P3 calibration shares the shadow journal so confirmed fills can be
     # paired with its accepted v3 quote history for executable markouts.
-    default_execution_journal = "./logs/outcome_shadow.db" if os.getenv("OUTCOME_P3_CALIBRATION_ENABLED") == "1" else "./logs/outcome_execution.db"
+    default_execution_journal = "./logs/outcome_shadow.db" if (
+        os.getenv("OUTCOME_P3_CALIBRATION_ENABLED") == "1"
+        or os.getenv("OUTCOME_LIVE_STRATEGY_ENABLED") == "1"
+    ) else "./logs/outcome_execution.db"
     live_journal = TradeJournalDB(os.getenv("OUTCOME_EXECUTION_JOURNAL_PATH", default_execution_journal))
     live_ws_recorder: OutcomeWebSocketRecorder | None = None
     # This is a venue-read-only capture path.  It shares the live journal but
@@ -225,6 +229,7 @@ def run_integrated_hyperliquid_bot(
         account=client, wallet=auth.wallet_address,
         ledger=OutcomeExecutionLedger(live_journal, f"outcome-live-{uuid.uuid4().hex[:10]}"),
     )
+    live_strategy_gate = OutcomeOiEntryGate(live_journal.db_path) if live_execution.live_strategy_enabled() else None
     settlement_adapter = OutcomeSettlementAdapter()
 
     dashboard_state = DashboardState(
@@ -396,7 +401,16 @@ def run_integrated_hyperliquid_bot(
             if phase == MarketPhase.ACTIVE:
                 if not simulation:
                     try:
-                        if live_execution.calibration_enabled():
+                        if live_strategy_gate is not None:
+                            decision = live_strategy_gate.evaluate(
+                                spot_price=Decimal(str(spot_px)) if spot_px > 0 else None,
+                                strike_price=Decimal(str(strike_px)) if strike_px > 0 else None,
+                            )
+                            runtime_result = live_execution.tick_live_strategy(
+                                market=market, entry_side_index=decision.side_index,
+                                entry_reason=decision.reason, entry_evidence=decision.evidence,
+                            )
+                        elif live_execution.calibration_enabled():
                             runtime_result = live_execution.tick_p3_calibration(market=market)
                         else:
                             entry_side_index = 0 if active_side == "UP" else 1 if active_side == "DOWN" else None

@@ -132,6 +132,45 @@ def test_p3_calibration_places_one_balanced_post_only_entry_and_logs_it(monkeypa
     assert gateway.calls[0]["is_buy"] is True
 
 
+def test_s0_live_strategy_logs_explicit_oi_policy_entry(monkeypatch, tmp_path):
+    monkeypatch.setenv("OUTCOME_AUTOMATED_EXECUTION_ENABLED", "1")
+    monkeypatch.setenv("OUTCOME_SDK_EXECUTION_ENABLED", "1")
+    monkeypatch.setenv("OUTCOME_LIVE_STRATEGY_ENABLED", "1")
+    journal = TradeJournalDB(tmp_path / "strategy.db")
+    class TrackingGateway(Gateway):
+        def __init__(self): self.calls = []
+        def place_alo(self, **kwargs): self.calls.append(kwargs); return {"orderId": "strategy-buy"}
+    gateway = TrackingGateway()
+    runtime = OutcomeLiveExecutionRuntime(
+        account=CalibrationAccount(), wallet="w", gateway=gateway, stream_health=healthy_stream(),
+        ledger=OutcomeExecutionLedger(journal, "run"),
+    )
+    result = runtime.tick_live_strategy(market=market(), entry_side_index=1,
+        entry_reason="down_spot_mark_oi_confirmed", entry_evidence={"oi_age_ms": 10})
+    assert result.state == "buy_placed"
+    assert gateway.calls[0]["is_buy"] is True
+    import sqlite3
+    with sqlite3.connect(journal.db_path) as conn:
+        payload = conn.execute("SELECT payload_json FROM strategy_events WHERE event_type='OUTCOME_LIVE_STRATEGY_ENTRY_PLACED'").fetchone()[0]
+    assert '"sampling_policy": "oi_spot_mark_confirmation"' in payload
+
+
+def test_s0_exit_tiers_are_anchored_to_entry_not_replacement(monkeypatch, tmp_path):
+    journal = TradeJournalDB(tmp_path / "tiers.db")
+    journal.log_strategy_event("run", "OUTCOME_LIVE_STRATEGY_ENTRY_PLACED", {
+        "outcome_id": 1153, "coin": "#11530", "target_return_pct": "0.05", "loss_reprice_pct": "0",
+        "maker_close_fee_rate": "0.0004", "narrow_after_sec": 10, "narrow_return_pct": "0.03",
+        "floor_after_sec": 20, "floor_return_pct": "0.02",
+    })
+    runtime = OutcomeLiveExecutionRuntime(account=Account(), wallet="w", gateway=Gateway(), ledger=OutcomeExecutionLedger(journal, "run"))
+    import bot.outcome_live_execution_runtime as runtime_module
+    base = runtime_module.time.time()
+    monkeypatch.setattr(runtime_module.time, "time", lambda: base + 11)
+    assert runtime._strategy_exit_tier(market=market(), coin="#11530") == (Decimal("0.03"), Decimal("0"))
+    monkeypatch.setattr(runtime_module.time, "time", lambda: base + 21)
+    assert runtime._strategy_exit_tier(market=market(), coin="#11530") == (Decimal("0.02"), Decimal("0"))
+
+
 def test_generic_recovery_restores_persisted_p3_exit_policy(monkeypatch, tmp_path):
     monkeypatch.setenv("OUTCOME_AUTOMATED_EXECUTION_ENABLED", "1")
     monkeypatch.setenv("OUTCOME_SDK_EXECUTION_ENABLED", "1")
