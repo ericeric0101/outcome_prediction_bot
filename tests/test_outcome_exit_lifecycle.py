@@ -34,3 +34,12 @@ def test_unrecorded_open_order_is_never_owned(tmp_path):
     store = OutcomeExitLifecycleStore(TradeJournalDB(tmp_path / "journal.db"), "run-a")
     assert store.reconcile_owned_sell(wallet="0xwallet", outcome_id=1153, coin="#11530", inventory=Decimal("13"),
         open_orders=[{"oid": "manual", "coin": "#11530", "side": "A", "sz": "13"}]) is None
+
+
+def test_flat_inventory_and_absent_owned_order_close_lifecycle(tmp_path):
+    store = OutcomeExitLifecycleStore(TradeJournalDB(tmp_path / "journal.db"), "run-a")
+    store.record(_lifecycle(), reason="initial_protection")
+    assert store.reconcile_owned_sell(wallet="0xwallet", outcome_id=1153, coin="#11530", inventory=Decimal("0"), open_orders=[]) is None
+    # CLOSED is terminal: a future restart cannot mistake it for a resting
+    # sell or gain cancellation ownership from it.
+    assert store.recover(wallet="0xwallet", outcome_id=1153, coin="#11530") is None

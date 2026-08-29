@@ -1,7 +1,7 @@
 # Hyperliquid Outcome (HIP-4) BTC 15-Minute Prediction Market Trading Bot — Current Authority
 
-> **權威架構版本 (Authority Version)**：2.1.0 (Hyperliquid Outcome HIP-4 Migration Baseline)
-> **建立與審計日期**：2026-08-23  
+> **權威架構版本 (Authority Version)**：2.1.1 (Hyperliquid Outcome HIP-4 Liquidity-Aware Scaling Baseline)
+> **建立與審計日期**：2026-08-23；最近修訂：2026-08-28
 > **目標系統**：Hyperliquid HyperCore L1 原生預測市場 — Outcome (HIP-4 協議標準)  
 > **單一權威聲明**：本文件取代原 `project_overview.md`，為系統唯一的設計、架構、量化模型與執行權威規範。
 
@@ -297,7 +297,13 @@ SELL_RESTING
 
 **E5 canary preflight（完成 2026-08-28；本次無交易所 mutation）：** 已以 `./.venv/bin/python scripts/outcome_sell_preflight.py --profit-pct 5` 對配置 wallet 執行 read-only account snapshot；結果為 **No sellable Outcome inventory found**。因此本次不存在能同時滿足「actual inventory、E4 後 `OUTCOME_EXIT_LIFECYCLE` ownership、matching official open ALO sell」的 canary target。依本節不變量，系統/操作者不得為了測試自行新增 entry 或接管手動舊單；本次 E5 記為 **blocked-by-no-managed-inventory**，而不是成功或失敗的 execution canary。未送 cancel、replacement、order 或任何 `/exchange` action。
 
-**下次 E5 的唯一操作條件：** 先在 E4 已部署且 `OUTCOME_EXIT_REQUOTE_ENABLED=0` 的狀態下，由既有受限 P3 lifecycle 取得一筆新 fill，並由 runtime 成功建立/記錄其第一張 ALO sell；再做 read-only preflight 確認 `OUTCOME_EXIT_LIFECYCLE` 與 official account 完整一致。只有在操作者再次明確確認該 order id、notional 和一次 replacement 上限後，才暫時設 `OUTCOME_EXIT_REQUOTE_ENABLED=1` 讓正常 live runtime 對該一筆持倉執行一個 cancel-confirm-rebook-ALO replacement；完成或任一 mismatch 後立即回設 `0`。此流程仍不允許 taker 或新 entry 作為測試前提。
+**成交 sell lifecycle close reconciliation（修正 2026-08-28）：** 發現 E4 初次 live P3 run 中，已實際成交的 managed sell 在 `OUTCOME_EXIT_LIFECYCLE` 保留為歷史 `SELL_RESTING`，雖不會授予未記錄 order 的 ownership，卻會使 journal 狀態誤導後續 E5 preflight。`OutcomeExitLifecycleStore.reconcile_owned_sell()` 現在只在兩個 fresh official account 事實同時成立時寫 terminal `CLOSED`：該 coin inventory 為 `0`，且 recorded sell `oid` 已不在 `frontendOpenOrders`；僅有其中一個事實時仍寫 `RECONCILE_REQUIRED`，絕不推論成交。`OutcomeLiveExecutionRuntime.tick_market()` 和 `tick_p3_calibration()` 每次 account recovery 後都執行這個 read-only reconciliation。它不會取消、下單或接管手動 order；部署後需重啟 runtime 才會讓歷史已成交 lifecycle 補寫 `CLOSED`。store/runtime regression **23 passed**，且新增 flat-and-order-absent、terminal-no-recover 與 runtime reconciliation coverage。
+
+**簡化後 E5 one-shot canary（修訂 2026-08-28）：** E5 的目的只驗證 E2 的 **cancel → official confirmation → rebook → ALO replacement** 原子流程；buy→fill→首次 ALO sell 已另行驗證，不能再把 E5 描述成「測試能否賣出」。因此不等待 -5% loss、volatility regime、手動挑 order 或人工改 target。只要本次 process 的受限 P3 lifecycle 出現一筆新 fill，並成功建立/記錄第一張 managed ALO sell，runtime 在額外明確 flag 下等待 `OUTCOME_EXIT_REQUOTE_CANARY_MIN_AGE_SEC`（預設 15 秒，讓 account/open-order state 穩定），就對該**同一張** sell 做一次固定的「原 target + 1 tick」replacement。這不降低 fee-after target、不提高 size、不跨 bid、不用 taker，完成或失敗後都從 process-local eligibility set 移除，絕不自動重試。
+
+**E5 首張保護性賣單順序修正（2026-08-29）：** 實盤 journal 顯示 managed sell `530234178868` 成交並正確記為 `CLOSED` 後，下一輪 P3 buy `530244849353` 成交時，E4/E5 曾將「有 inventory、尚未有 sell」誤送入 ownership 檢查，回報 `exit reprice refuses unrecorded sell ownership`，並提前 return，導致既有 state machine 無法建立第一張保護性 ALO sell。此訊息不代表交易所拒絕或手動 order 被接管；它是 runtime 順序缺陷。現在 `_maybe_requote_p3_exit()` 僅在 recovery finding 已有 official `sell_order_ids` 時才執行 E4/E5 ownership/requote；resting buy 或剛成交、尚未建 sell 的 inventory 一律回到 persisted P3 exit path，先以 fill VWAP、費率及 policy 建立並記錄首張 ALO sell，之後才有 E5 eligibility。新增 regression 覆蓋 E4 開啟時的新成交 inventory 必須 `sell_placed` 並建立 durable lifecycle；targeted **25 passed**、完整 Python regression **430 passed**。
+
+啟用此 one-shot 測試仍需要四個 operator gate：`OUTCOME_AUTOMATED_EXECUTION_ENABLED=1`、`OUTCOME_SDK_EXECUTION_ENABLED=1`、`OUTCOME_EXIT_REQUOTE_ENABLED=1`、`OUTCOME_EXIT_REQUOTE_CANARY_ENABLED=1`。`OUTCOME_EXIT_REQUOTE_CANARY_ENABLED` 預設 `0`，且只對本次 process 新建立的 lifecycle 有效；重啟、manual/legacy sell、unrecorded order、無 inventory、或任何 account mismatch 都不具 eligibility。這保留真正需要的安全前提，但免除不必要的市場條件與人工 order 選擇。E5 test 覆蓋 second flag、minimum age、exactly-one execution、+1 tick target 與 completion-once semantics；正常 runtime 仍應維持兩個 reprice flags 為 `0`。
 4. **generic live exit bypass（已修正，2026-08-26）：** market 1177 曾出現實際 fill VWAP `0.68912`、卻由 `OutcomeLiveExecutionRuntime.tick_market()` 的 generic path 掛出 `0.68074` ALO sell。journal 證據顯示此路徑沒有傳入 `minimum_return_pct`，故舊 state machine 將 `best_ask` 當作 fallback sell，並錯誤標記為 take-profit；這不是 exchange 行為，也不是 P3 calibration 的 +5% policy。現在 generic `tick()` / `tick_market()` 不得建立新 entry，除非呼叫端提供 dedicated verified exit-policy runtime；持倉在沒有明確 policy 時只會 `blocked`，絕不 fallback 至 best ask。若 partial fill 同時仍有 owned buy remainder，仍先取消 remainder 以防增加曝險，之後才 fail-closed。這個修正不會自動取消已存在的真實掛單；程序必須重啟才會載入新碼，現有 order 的取消仍須操作者明確指示或使用正式 ownership-checked cancel adapter。
 5. **P3 policy persistence across entry/fill/restart（已修正，2026-08-26）：** market 1177 隨後另有一筆 P3 calibration buy fill `0.67329 × 15`；該 entry event 正確記錄 `target_return_pct=0.05`，但後續持倉 tick 走到 generic dispatcher 後只得到 fail-closed block，因 policy 沒有被當成持倉狀態恢復。正確行為不是等價格先上漲 5% 才掛賣單，而是在 exchange-confirmed fill 後立即掛 `fill_VWAP × 1.05 / (1-maker_close_fee)` 的 ALO sell；此例費後 target 約為 `0.7072`，若當時 best ask 更高，則以較高且仍 post-only 的 ask 掛出。現在 P3 entry journal 同時保存 `order_id`、target/loss percentages 與 maker fee；`tick_market()` 與 `tick_p3_calibration()` 在處理既有庫存時，先從同一 market/coin 的 durable entry evidence 恢復 policy，再呼叫 state machine。此規則也在 account recovery 將 HIP-4 spot balance `+<encoding>` 正規化至 book/order coin `#<encoding>` 後套用，故重啟不會把已持倉誤判 flat。沒有可驗證 policy 的非 P3 inventory 仍維持 blocked，不能藉由這個恢復機制獲得任意賣出權限。
 
@@ -496,9 +502,78 @@ Outcome 支援多週期 BTC 預測市場規格格式：
 - **Min Notional 限制**：Hyperliquid 協議要求開倉名義價值 $\text{price} \times \text{shares} \ge 10\text{ USDC}$。
 - **動態股數計算**：
   $$\text{shares} = \max\left(\text{target\_shares}, \left\lceil \frac{10.0}{\text{price}} \right\rceil\right)$$
+- **目前正式實作限制（2026-08-28）**：`OutcomeMakerStateMachine` 的 BUY 呼叫未傳入 `requested_shares`，`OutcomeExecutionGateway.whole_share_size()` 因而只建立滿足最小 10 USDC 的整數股數。`OUTCOME_MAX_ENTRY_NOTIONAL_USDC` 與 `OUTCOME_MAX_OUTCOME_EXPOSURE_USDC` 現在是**拒單上限**，不是目標下單額；單純把兩者從 `11` 改成 `20` 或 `100`，不會讓正式 runtime 自動擴量，也不得被當作已完成擴量。
 - **費率模型**：
   - 交易、builder 與 settlement fee 必須以每期官方 evidence 讀取／記錄；testing 階段的零交易費不可視為永久假設。
   - 在 P0 尚無可驗證 settlement fee 前，任何 `robust_net` 都只能作研究指標，不得作 live entry gate。
+
+### 4. $20／$100 擴量、流動性與 Toxic-Flow 權威規格（2026-08-28）
+
+**結論與狀態。** 目前約 10–11 USDC 的單筆 maker canary 上限維持不變。20 USDC 只能作下一階段、受控的尺寸實驗；100 USDC 必須定義為單一市場的**總目標曝險／entry campaign budget**，不可直接成為一張固定 best-bid ALO。下列規格是未來擴量的必要 gate，不是目前的 live 授權；在程式、測試與 P3 真實 fill evidence 完成前，禁止只修改環境變數提高名義金額。
+
+#### 本地 L2 實證基線
+
+資料來源為 `logs/outcome_shadow.db` 最近 5,000 筆 `OUTCOME_P2_PARITY_SNAPSHOT`，每筆同時保存 YES/NO 各最多 20 檔 bid/ask。統計使用第一檔 `px × sz` 作 touch notional，並另計算前五檔 bid 累積 notional；這是 2026-08-28 的歷史觀察，不是未來成交或退出保證。Hyperliquid 官方 [`/info l2Book`](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint) 最多回傳每側 20 levels；WS [`WsBook`](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/websocket/subscriptions) 是 book snapshot update，不提供可依賴的逐筆 sequence，因此本地資料可作流動性／markout 研究，但不能宣稱能嚴格重建 L3 queue。
+
+| Outcome bid | P10 touch notional | P25 | 中位數 |
+| :--- | ---: | ---: | ---: |
+| YES | 10.96 USDC | 15.60 USDC | 27.64 USDC |
+| NO | 17.57 USDC | 33.35 USDC | 40.31 USDC |
+
+- 合併 10,000 個 YES/NO 觀察，**23.8%** 的 best-bid touch notional 低於 20 USDC，**75.7%** 低於 100 USDC。
+- 前五檔 bid 累積 notional 中位數為 YES 348.32 USDC、NO 343.86 USDC；但仍有 **11.4%** 的 YES 與 **2.6%** 的 NO 低於 100 USDC。
+- 第一檔深度包含排在本 bot 前方的既有 queue。對 ALO BUY 而言，深盤不代表立即可成交；它可能表示較長等待。薄盤則可能讓本 bot 成為 touch 的主要可見流動性，成交較快但 adverse-selection 與可辨識性更高。
+- 前五檔累積 bid 只表示假設立即 SELL 時的顯示容量；實際取消、競爭者先成交、延遲、到期跳價與 hidden/stale liquidity 都可能使可退出量更低。
+
+#### Toxic flow、可辨識性與 ALO 的邊界
+
+[`ALO`](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/exchange-endpoint)（Add Liquidity Only／post-only）只保證訂單若會立即 crossing 就取消，不能防止 resting quote 在 stale 或 fair value 已惡化時被 informed taker 成交。主要風險不是單純的進場滑價，而是「無毒時排隊不成交、有毒時被選擇性成交」，以及成交後庫存無法在原假設價格退出。
+
+公開 L2 包含每個價位的 `px`、聚合 `sz` 與 order count `n`；公開 trades 亦提供可供市場參與者分析的成交資訊。單一 100 USDC 掛單經常大於既有 touch，重複使用固定尺寸、固定價位、固定時間與固定 cancel/requote 節奏，可能被其他 bot 以 book 變化與成交行為推測。這不等於必然遭到特定身分攻擊；更常見的實際損失來源仍是 stale quote、queue competition、被搶一個 tick、以及 maker adverse selection。
+
+#### 擴量前置 gate 與動態尺寸公式
+
+未來的 liquidity-aware sizing 必須同時使用 entry book、可退出 book、行情新鮮度、時間到期與既有庫存，不得只看 collateral 或靜態 notional cap。初期保守 sizing 規格為：
+
+```text
+child_order_notional <= min(
+    remaining_entry_campaign_budget,
+    20%–25% × same-side touch displayed notional,
+    10%–20% × executable bid notional inside the configured exit-slippage band,
+    remaining_per-market_exposure,
+    remaining_account_outcome_exposure
+)
+```
+
+上述比例是未來 canary 的保守起點，不是已校準常數；必須由 period × time-left × side × spread/depth bucket 的 P3 fill/markout evidence 調整。計算時必須以 shares 走訪 bid levels 得到真實 executable VWAP，不能以 `sum(px × sz)` 取代指定持倉股數的滑價計算。
+
+每次新 entry 至少必須通過：
+
+1. **Fresh/coherent book gate**：雙側 book server/local age、side skew、WS lifecycle 與 REST resync 均合格；任何 reconnect、stale snapshot 或 `capture_quality.status != accepted` 都禁止增加曝險。
+2. **Touch participation gate**：child order 不得成為未經驗證的大比例 touch liquidity；同時計入同 wallet 已存在的 resting BUY，禁止以多張 order 規避比例上限。
+3. **Exit capacity gate**：以持倉 shares 對當前 bids 做 bounded walk，檢查設定滑價帶內可完整退出的數量、VWAP 與 worst price；若只能靠超出 band 的第六檔以後流動性，fail-closed。
+4. **Edge-after-toxicity gate**：預期 edge 必須覆蓋 close fee、預估退出滑價、fill 後 adverse markout 與不成交／持倉成本；maker rebate 或 post-only 身分不能單獨形成進場理由。
+5. **Market-state gate**：BTC mark velocity、spot-vs-strike、spread、book imbalance、bid depletion、aggressive trade burst、距到期時間與價格跳躍異常任一超標時縮單或取消，不得在資料延遲時維持舊 quote。
+6. **Inventory/race gate**：未成交 BUY、已成交 inventory、partial fills、covering SELL 與最壞情境全部成交曝險合併計算；未知 cancel/fill race 進入 `RECONCILE_REQUIRED`。
+
+#### 分階段擴量與執行方式
+
+1. **10–11 USDC（目前）**：維持單一最小名義 ALO canary；完成現有 P3 bucket markout 與 settlement evidence，作為擴量基線。
+2. **20 USDC（下一階段）**：只在上述 liquidity/toxicity gates 實作並通過測試後，對合格 bucket 啟用。即使目標為 20 USDC，薄盤時仍須縮回最小可下單額或直接 `flat`；不得硬湊 20 USDC。
+3. **40–50 USDC（中間階段）**：20 USDC out-of-sample 樣本的 fee-adjusted EV、1/5/10/30/60s markout、fill probability、退出 VWAP 與最大不利偏移通過後才可進入；不得從 20 直接跳 100。
+4. **100 USDC（總 campaign budget）**：拆成多個約 10–25 USDC 的 child clips；每一 clip 送出前重新計算 book、edge、inventory 與 remaining budget。前一 clip 成交不代表必須補滿 100；任何 gate 惡化即停止。不得一次暴露完整 100 USDC，也不得用同價多單偽裝成拆單。
+
+目前「單一市場一次性進場」不變量仍有效。未來 clipping 只有在新增 durable `entry_campaign_id`、child-order budget ledger、跨 restart reconciliation、總曝險原子 claim 與對應測試後，才可把多個 child orders 視為同一個受控 entry campaign；在此之前，每市場仍只准一張最小 BUY。
+
+為降低可預測性，可以在已通過所有風控 gate 的範圍內使用小幅 size/timing variation，但不得用 spoofing、layering、虛假流動性或大量無意成交的撤掛單。保留 queue priority 與限制 cancel rate 的重要性高於形式上的隨機化。
+
+#### 擴量驗收指標與 kill switch
+
+- 按 `period × outcome side × time-left × spread × touch-depth × volatility regime × order-size bucket` 保存 submit、rest、cancel、partial fill、full fill、exit 與 settlement。
+- 每筆 confirmed maker fill 計算 1s、5s、10s、30s、60s executable mid／bid markout；BUY 成交後價格持續下跌視為 adverse selection，不得只以最終勝負判斷 toxic flow。
+- 報表至少輸出 fill probability、queue wait、cancel-to-fill race、fee-adjusted realized PnL、exit VWAP/slippage、最大持倉時間、worst adverse markout、book participation ratio 與 concentration。
+- 任一尺寸 bucket 的 adverse markout、退出滑價、資料 stale rate、cancel/fill race 或曝險 reconciliation 超過已核准門檻，立即退回前一尺寸或 10–11 USDC；kill switch 必須能禁止新 entry，但仍保留已驗證的 inventory reconciliation／被動退出能力。
+- 20、40–50、100 USDC 各自是獨立實驗 bucket；小額結果不得線性外推，大額也不得沿用另一 period 或另一 side 的深度分布。
 
 ---
 
@@ -507,26 +582,27 @@ Outcome 支援多週期 BTC 預測市場規格格式：
 ```mermaid
 flowchart TD
     BUY["Maker BUY (Post-Only ALO GTC)"] --> FILL["成交進入持倉 Inventory"]
-    FILL --> TP["掛單 Tail-Protect TP (Passive GTC @ 0.97)"]
-    FILL --> MON["即時風控與 Invalidation 監控"]
-    
-    MON -->|勝率跌破 / 價格反轉| INV["觸發 Invalidation Recovery Ladder"]
-    INV --> STAGE1["Stage 1: 撤銷 TP，提交 Passive Recovery SELL (GTC)"]
-    STAGE1 -->|超時未成交 / 尾盤跌破| STAGE2["Stage 2: 升級為 IOC Marketable SELL 立即止損"]
-    
+    FILL --> TP["依 confirmed fill VWAP 掛費後目標 ALO SELL"]
+    FILL --> MON["即時風控、book freshness 與 Invalidation 監控"]
+    MON -->|目標或風險條件改變| RQ["ALO Exit Cancel/Replace Controller"]
+    RQ --> CANCEL["確認 owned order 後取消"]
+    CANCEL --> SYNC["重讀 fills / inventory / open orders / fresh L2"]
+    SYNC -->|一致且仍為 passive| REPLACE["提交 replacement ALO SELL"]
+    SYNC -->|不一致或 crossing| RECON["RECONCILE_REQUIRED；不送 replacement"]
     FILL -->|持倉至到期| SETTLE["等待官方結算 evidence"]
     SETTLE -->|official resolution confirms winner| WIN["確認 payout 後才錄入 MARKET_SETTLEMENT"]
     SETTLE -->|evidence unavailable| BLOCK["維持 blocked；不得自行推論"]
 ```
 
 1. **Maker BUY 下單**：
-   - 提交 GTC Post-Only (`tif="Alo"`)，確保 100% 享受 Maker 費率且不穿越盤口。
+   - 提交 Post-Only (`tif="Alo"`)，確保初次送單不穿越盤口；ALO 不能保證之後不會因 stale quote 遭 adverse selection。
    - 報價重掛機制（Requote Hysteresis）：若價格變動小於門檻跳數，維持原單佇列優先權（Queue Priority）。
 2. **獲利止盈 (Take-Profit)**：
-   - 預設掛於 `0.97` GTC 限價賣單，直至到期或觸發出場。
-3. **失效止損階梯 (Invalidation Recovery Ladder)**：
-   - **階段一（被動掛單）**：即時撤銷 TP，提交 `RECOVERY_EXIT_PASSIVE_TTL_SEC` 之 GTC 被動限價賣單。
-   - **階段二（主動市價）**：若超時或在尾盤急跌，立即發送 `IOC` (Immediate-Or-Cancel) 賣單全數離場。
+   - 以 official `userFills` FIFO 重建仍持有庫存的 confirmed fill VWAP，計算 fee-adjusted target；不得把聚合帳戶成本或固定 `0.97` 假裝成每筆真實 take-profit。
+3. **失效／風險降低 (Maker-Only Risk Reduction)**：
+   - 現行 Outcome 正式 runtime 只允許 ALO/post-only。達到 loss、time、markout 或流動性條件時，只能依 E0–E4 cancel/replace state machine 重新掛被動 SELL；它不是 guaranteed stop-loss。
+   - 每次 replacement 必須先確認舊單已取消、重新同步 partial fills／inventory／open orders，並在 fresh L2 上驗證 `sell price > best_bid`。任何 cancel/fill race、stale book 或 crossing 均 fail-closed。
+   - **IOC／FAK／marketable SELL 目前禁止。** 若未來要加入 taker emergency exit，必須另立 authority revision、獨立操作者 gate、可接受滑價的 depth-walk、P3 真實 evidence 與完整測試；不得由「緊急」或「放大到 100 USDC」自行推導授權。
 
 ---
 
@@ -590,6 +666,9 @@ flowchart TD
 | `HL_AGENT_PRIVATE_KEY` | `0x...` (選填) | 專用 Agent Key 私鑰 (若留空則程式自動生成暫態 Key) |
 | `HL_TESTNET` | `0` (主網) / `1` (測試網) | 是否連線至 Hyperliquid Testnet |
 | `HL_MIN_NOTIONAL_USDC` | `10.0` | 最小開倉名義價值 (USDC) |
+| `OUTCOME_MAX_ENTRY_NOTIONAL_USDC` | `11` | 每筆 Outcome entry 的拒單上限；不是目標下單額，未完成 liquidity-aware sizing 前不得提高 |
+| `OUTCOME_MAX_OUTCOME_EXPOSURE_USDC` | `11` | Outcome 總曝險上限；必須包含 inventory 與可能成交的 resting BUY，未完成 campaign ledger 前不得提高 |
+| `OUTCOME_MAX_OPEN_ORDERS` | `1` | Outcome 同時 open orders 上限；不得以提高此值迴避單一市場 entry／exit ownership |
 | `HL_REFERRAL_CODE` | `""` | 推薦碼 (享受 4% 手續費返還折扣) |
 | `ENTRY_SCORE_MIN` | `0.20` | 強方向性進場最低分數門檻 |
 | `FIRST_ENTRY_SCORE_MIN` | `0.22` | 首筆進場嚴格分數門檻 |

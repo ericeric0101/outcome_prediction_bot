@@ -23,7 +23,7 @@ from bot.outcome_execution_ledger import OutcomeExecutionLedger
 from bot.outcome_research_gate import OutcomeResearchGate
 from bot.outcome_p3_calibration import OutcomeP3CalibrationConfig, choose_consensus_calibration_side
 from bot.outcome_exit_lifecycle import OutcomeExitLifecycle, OutcomeExitLifecycleStore
-from bot.outcome_exit_quote_planner import ExitQuoteInput, OutcomeExitQuotePlanner
+from bot.outcome_exit_quote_planner import ExitQuoteAction, ExitQuoteInput, ExitQuotePlan, OutcomeExitQuotePlanner
 from bot.outcome_exit_requote_controller import OutcomeExitRequoteController
 
 
@@ -52,6 +52,9 @@ class OutcomeLiveExecutionRuntime:
             OutcomeExitRequoteController(account=account, gateway=self.machine.gateway, store=self.exit_lifecycle_store, wallet=wallet)
             if self.exit_lifecycle_store else None
         )
+        # E5 is deliberately process-local.  A restart must never resume a
+        # canary against an old position without a new explicit operator run.
+        self._e5_canary_eligible_order_ids: set[str] = set()
 
     def _record(self, market: OutcomeMarketSpec, side_index: int, result: MakerTickResult) -> LiveExecutionResult:
         coin = self.machine.gateway.outcome_coin(market, side_index)
@@ -66,6 +69,7 @@ class OutcomeLiveExecutionRuntime:
                     inventory=Decimal(str(result.audit["inventory"])), target_price=Decimal(str(result.audit["requested_price"])),
                     replacement_count=0, state="SELL_RESTING",
                 ), reason="initial_verified_alo_sell", extra={"pricing_basis": result.audit.get("pricing_basis"), "exit_mode": result.audit.get("exit_mode")})
+                self._e5_canary_eligible_order_ids.add(str(result.order_id))
             except (KeyError, ValueError):
                 pass
         return LiveExecutionResult(result.state, result.detail, result.order_id)
@@ -88,6 +92,11 @@ class OutcomeLiveExecutionRuntime:
     def exit_requote_enabled() -> bool:
         """E4's explicit fourth gate; false is the safe default."""
         return OutcomeLiveExecutionRuntime.enabled() and os.environ.get("OUTCOME_EXIT_REQUOTE_ENABLED") == "1"
+
+    @staticmethod
+    def exit_requote_canary_enabled() -> bool:
+        """One explicit additional gate for an automated, single E5 replacement."""
+        return OutcomeLiveExecutionRuntime.exit_requote_enabled() and os.environ.get("OUTCOME_EXIT_REQUOTE_CANARY_ENABLED") == "1"
 
     def _daily_calibration_entries(self) -> int:
         if not self.ledger:
@@ -161,6 +170,13 @@ class OutcomeLiveExecutionRuntime:
         """
         if not self.exit_requote_enabled() or not self.exit_lifecycle_store or not self.exit_requote_controller:
             return None
+        # A resting entry or a just-filled position has no protective sell yet.
+        # It must continue to the normal state machine, which is responsible
+        # for creating that first ALO sell.  Treating every non-flat recovery
+        # finding as an exit caused E4 to block this essential transition with
+        # the misleading "unrecorded sell ownership" message.
+        if not tuple(getattr(finding, "sell_order_ids", ())):
+            return None
         coin = str(getattr(finding, "coin", ""))
         policy = self._persisted_p3_exit_policy(market=market, coin=coin)
         fee = self._persisted_p3_maker_fee(market=market, coin=coin)
@@ -179,6 +195,24 @@ class OutcomeLiveExecutionRuntime:
             bid = Decimal(str(book["bids"][0]["price"])); ask = Decimal(str(book["asks"][0]["price"]))
         except (IndexError, KeyError, TypeError, ValueError):
             return LiveExecutionResult("blocked", "exit reprice book unavailable", lifecycle.order_id)
+        if (
+            self.exit_requote_canary_enabled()
+            and lifecycle.order_id in self._e5_canary_eligible_order_ids
+            and lifecycle.replacement_count == 0
+        ):
+            min_age = max(1.0, float(os.environ.get("OUTCOME_EXIT_REQUOTE_CANARY_MIN_AGE_SEC", "15")))
+            if lifecycle.updated_at_ts is not None and time.time() - lifecycle.updated_at_ts >= min_age:
+                # This is deliberately not a strategy repricing decision:
+                # one tick upward preserves/raises the original target and
+                # lets E2 prove cancel-confirm-rebook-ALO end to end.
+                canary_plan = ExitQuotePlan(
+                    ExitQuoteAction.CANCEL_REPLACE, "e5_one_tick_upward_canary",
+                    lifecycle.target_price + self.exit_planner.config.tick_size,
+                    lifecycle.target_price, inventory, "e5_canary",
+                )
+                result = self.exit_requote_controller.execute(market=market, side_index=side_index, lifecycle=lifecycle, plan=canary_plan)
+                self._e5_canary_eligible_order_ids.discard(lifecycle.order_id)
+                return LiveExecutionResult(result.state, result.detail, result.new_order_id or result.old_order_id)
         plan = self.exit_planner.plan(ExitQuoteInput(
             inventory=inventory, fill_vwap=vwap, maker_close_fee_rate=fee,
             minimum_return_pct=policy.target_return_pct, loss_reprice_pct=policy.loss_reprice_pct,
@@ -237,11 +271,34 @@ class OutcomeLiveExecutionRuntime:
             return LiveExecutionResult("blocked", f"market-data gate: {stream.reason}")
         return None
 
+    def _reconcile_exit_lifecycles(self, *, market: OutcomeMarketSpec, report: object) -> None:
+        """Close durable sell ownership only from fresh account truth.
+
+        This is read-only against the exchange.  It prevents a filled sell
+        from remaining forever as ``SELL_RESTING`` in the journal and never
+        adopts a manual order.
+        """
+        if self.exit_lifecycle_store is None:
+            return
+        try:
+            open_orders = self.recovery.account.get_open_orders_sync(self.recovery.wallet)
+            for finding in getattr(report, "findings", ()):
+                self.exit_lifecycle_store.reconcile_owned_sell(
+                    wallet=self.recovery.wallet, outcome_id=market.outcome_id,
+                    coin=str(getattr(finding, "coin", "")),
+                    inventory=Decimal(str(getattr(finding, "inventory", "0"))), open_orders=open_orders,
+                )
+        except Exception:
+            # The normal recovery report remains the execution gate.  Do not
+            # infer a close from a failed read.
+            return
+
     def tick_market(self, *, market: OutcomeMarketSpec, entry_side_index: int | None) -> LiveExecutionResult:
         """Advance existing exposure first; only a flat market accepts a signal."""
         if not self.enabled():
             return LiveExecutionResult("disabled", "automated execution requires OUTCOME_AUTOMATED_EXECUTION_ENABLED=1 and OUTCOME_SDK_EXECUTION_ENABLED=1")
         report = self.recovery.reconcile([market])
+        self._reconcile_exit_lifecycles(market=market, report=report)
         active = [finding for finding in report.findings if finding.state != "flat"]
         if len(active) == 1:
             requote = self._maybe_requote_p3_exit(market=market, finding=active[0])
@@ -286,6 +343,7 @@ class OutcomeLiveExecutionRuntime:
         if health_error:
             return health_error
         report = self.recovery.reconcile([market])
+        self._reconcile_exit_lifecycles(market=market, report=report)
         config = OutcomeP3CalibrationConfig.from_env()
         active = [finding for finding in report.findings if finding.state != "flat"]
         if len(active) == 1:

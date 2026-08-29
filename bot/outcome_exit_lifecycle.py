@@ -80,6 +80,12 @@ class OutcomeExitLifecycleStore:
         if lifecycle is None:
             return None
         matching = [row for row in open_orders if str(row.get("oid")) == lifecycle.order_id and row.get("coin") == coin and row.get("side") == "A"]
+        # A closed lifecycle needs two independent account facts: no remaining
+        # inventory and absence of the owned order.  Either fact alone can be
+        # a partial-fill/cancel race and must remain reconciliation-only.
+        if inventory <= 0 and not matching:
+            self.record(lifecycle, reason="inventory_flat_and_owned_sell_absent", extra={"state": "CLOSED"})
+            return None
         if len(matching) != 1 or inventory <= 0 or Decimal(str(matching[0].get("sz", "0"))) < inventory:
             self.record(lifecycle, reason="account_truth_does_not_match_owned_sell", extra={"state": "RECONCILE_REQUIRED"})
             return None

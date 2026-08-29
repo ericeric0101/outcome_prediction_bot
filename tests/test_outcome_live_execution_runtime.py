@@ -1,4 +1,5 @@
 from decimal import Decimal
+import time
 
 from bot.lifecycle.outcome_lifecycle import OutcomeMarketSpec
 from bot.outcome_live_execution_runtime import OutcomeLiveExecutionRuntime
@@ -178,8 +179,10 @@ def _managed_exit_runtime(tmp_path, monkeypatch, *, enabled: bool):
         def fetch_order_book(self, **_): self.calls.append("book"); return {"bids": [{"price": "0.70"}], "asks": [{"price": "0.71"}]}
         def cancel_owned_order(self, **_): self.calls.append("cancel"); return {}
     class SpyController:
-        def __init__(self): self.calls = 0
-        def execute(self, **_): self.calls += 1; return ExitRequoteResult("sell_resting", "fake replacement", "old-sell", "new-sell")
+        def __init__(self): self.calls = 0; self.plans = []
+        def execute(self, **kwargs):
+            self.calls += 1; self.plans.append(kwargs["plan"])
+            return ExitRequoteResult("sell_resting", "fake replacement", "old-sell", "new-sell")
     gateway, controller = LossGateway(), SpyController()
     runtime = OutcomeLiveExecutionRuntime(
         account=FilledAccount(balances=[{"coin": "+11530", "total": "13", "entryNtl": "10.4"}], orders=[{"coin": "#11530", "side": "A", "oid": "old-sell", "sz": "13"}]),
@@ -217,3 +220,63 @@ def test_e4_new_sell_is_written_as_durable_owned_lifecycle(monkeypatch, tmp_path
     assert runtime.tick_market(market=market(), entry_side_index=None).state == "sell_placed"
     restored = runtime.exit_lifecycle_store.recover(wallet="w", outcome_id=1153, coin="#11530")
     assert restored is not None and restored.order_id == "1"
+
+
+def test_e4_does_not_block_first_protective_sell_for_newly_filled_inventory(monkeypatch, tmp_path):
+    """E4/E5 can manage only an existing sell, never prevent creating one."""
+    monkeypatch.setenv("OUTCOME_AUTOMATED_EXECUTION_ENABLED", "1")
+    monkeypatch.setenv("OUTCOME_SDK_EXECUTION_ENABLED", "1")
+    monkeypatch.setenv("OUTCOME_EXIT_REQUOTE_ENABLED", "1")
+    journal = TradeJournalDB(tmp_path / "first-sell.db")
+    journal.log_strategy_event("run", "OUTCOME_P3_CALIBRATION_ENTRY_PLACED", {
+        "outcome_id": 1153, "coin": "#11530", "target_return_pct": "0.05",
+        "loss_reprice_pct": "0.05", "maker_close_fee_rate": "0.0004", "order_id": "buy-1",
+    })
+    class FilledAccount(Account):
+        def get_user_fills_sync(self, _):
+            return [{"coin": "#11530", "side": "B", "px": "0.80", "sz": "13", "time": 1}]
+    class TrackingGateway(Gateway):
+        def __init__(self): self.calls = []
+        def place_alo(self, **kwargs): self.calls.append(kwargs); return {"orderId": "first-sell"}
+    gateway = TrackingGateway()
+    runtime = OutcomeLiveExecutionRuntime(
+        account=FilledAccount(balances=[{"coin": "+11530", "total": "13", "entryNtl": "10.4"}]),
+        wallet="w", gateway=gateway, ledger=OutcomeExecutionLedger(journal, "run"),
+    )
+    result = runtime.tick_market(market=market(), entry_side_index=None)
+    assert result.state == "sell_placed"
+    assert gateway.calls[0]["is_buy"] is False
+    assert runtime.exit_lifecycle_store.recover(wallet="w", outcome_id=1153, coin="#11530").order_id == "first-sell"
+
+
+def test_e5_canary_is_one_time_upward_replacement_only_after_explicit_second_gate(monkeypatch, tmp_path):
+    runtime, controller, gateway, _ = _managed_exit_runtime(tmp_path, monkeypatch, enabled=True)
+    # Without the E5 gate, a matching target simply remains resting.
+    gateway.fetch_order_book = lambda **_: {"bids": [{"price": "0.84"}], "asks": [{"price": "0.85"}]}
+    assert runtime.tick_market(market=market(), entry_side_index=None).state == "sell_resting"
+    assert controller.calls == 0
+    monkeypatch.setenv("OUTCOME_EXIT_REQUOTE_CANARY_ENABLED", "1")
+    monkeypatch.setenv("OUTCOME_EXIT_REQUOTE_CANARY_MIN_AGE_SEC", "1")
+    runtime._e5_canary_eligible_order_ids.add("old-sell")
+    original_time = time.time
+    monkeypatch.setattr("bot.outcome_live_execution_runtime.time.time", lambda: original_time() + 2)
+    result = runtime.tick_market(market=market(), entry_side_index=None)
+    assert result.order_id == "new-sell" and controller.calls == 1
+    plan = controller.plans[0]
+    assert plan.reason == "e5_one_tick_upward_canary"
+    assert plan.target_price == Decimal("0.85001")
+    # The order id is removed from the in-memory eligibility set even if the
+    # controller later reports a problem; a run never retries the canary.
+    assert "old-sell" not in runtime._e5_canary_eligible_order_ids
+
+
+def test_runtime_closes_stale_lifecycle_after_exchange_fill_reconciliation(monkeypatch, tmp_path):
+    monkeypatch.setenv("OUTCOME_AUTOMATED_EXECUTION_ENABLED", "1")
+    monkeypatch.setenv("OUTCOME_SDK_EXECUTION_ENABLED", "1")
+    journal = TradeJournalDB(tmp_path / "closed.db")
+    ledger = OutcomeExecutionLedger(journal, "run")
+    store = OutcomeExitLifecycleStore(journal, "run")
+    store.record(OutcomeExitLifecycle("w", 1153, "#11530", "filled-sell", Decimal("13"), Decimal("0.85"), 0, "SELL_RESTING"), reason="fixture")
+    runtime = OutcomeLiveExecutionRuntime(account=Account(), wallet="w", gateway=Gateway(), ledger=ledger, exit_lifecycle_store=store)
+    runtime.tick_market(market=market(), entry_side_index=None)
+    assert store.recover(wallet="w", outcome_id=1153, coin="#11530") is None
