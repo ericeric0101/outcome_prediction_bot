@@ -185,11 +185,14 @@ class OutcomeLiveExecutionRuntime:
         except (ArithmeticError, sqlite3.Error):
             return None
 
-    def _strategy_exit_tier(self, *, market: OutcomeMarketSpec, coin: str) -> tuple[Decimal, Decimal] | None:
-        """Return (minimum net return, loss threshold) for a persisted S0 entry.
+    def _strategy_exit_tier(self, *, market: OutcomeMarketSpec, coin: str) -> tuple[Decimal, Decimal | None] | None:
+        """Return the elapsed-time S0 target and any permitted loss-band floor.
 
-        The loss threshold is fixed at zero: a weak market may only reprice to
-        fee-inclusive break-even, never to a negative-return stop.
+        The strategy starts with a strict +5% fee-after target.  It may narrow
+        to +3% after the first configured age and +2% after the second.  Only
+        at that final tier may a weak book use the fee-inclusive break-even
+        floor.  This prevents a one-tick adverse quote from replacing the
+        initial take-profit order with a near-cost sell.
         """
         if self.ledger is None:
             return None
@@ -219,8 +222,8 @@ class OutcomeLiveExecutionRuntime:
             if age >= floor_after:
                 return floor, Decimal("0")
             if age >= narrow_after:
-                return narrow, Decimal("0")
-            return target, Decimal("0")
+                return narrow, None
+            return target, None
         except (KeyError, TypeError, ValueError, ArithmeticError, sqlite3.Error, json.JSONDecodeError):
             return None
 
@@ -299,13 +302,22 @@ class OutcomeLiveExecutionRuntime:
         if policy is None or fee is None:
             return None
         side_index = 0 if coin == market.yes_coin else 1
+        strategy_tier = self._strategy_exit_tier(market=market, coin=coin)
+        # A newly-filled S0 order has no lifecycle yet, so this is the one
+        # place that creates its first protective sell.  Do not pass the
+        # break-even loss band before the final time tier: the first order
+        # must be the configured +5% target, and the 1h tier remains +3%.
+        minimum_return_pct, loss_reprice_pct = strategy_tier or (
+            policy.target_return_pct,
+            policy.loss_reprice_pct if self.exit_requote_enabled() else None,
+        )
         result = self.machine.tick(
             market=market, side_index=side_index, entry_permitted=False,
-            minimum_return_pct=policy.target_return_pct, maker_close_fee_rate=fee,
+            minimum_return_pct=minimum_return_pct, maker_close_fee_rate=fee,
             # The former one-shot loss cancellation is itself a dynamic
             # cancel/replace behavior.  E4 keeps it dormant until the new
             # confirmation/rebook controller is explicitly enabled.
-            loss_reprice_pct=policy.loss_reprice_pct if self.exit_requote_enabled() else None,
+            loss_reprice_pct=loss_reprice_pct,
         )
         return self._record(market, side_index, result)
 

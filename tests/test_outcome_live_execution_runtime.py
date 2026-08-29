@@ -186,9 +186,38 @@ def test_s0_exit_tiers_are_anchored_to_entry_not_replacement(monkeypatch, tmp_pa
     import bot.outcome_live_execution_runtime as runtime_module
     base = runtime_module.time.time()
     monkeypatch.setattr(runtime_module.time, "time", lambda: base + 11)
-    assert runtime._strategy_exit_tier(market=market(), coin="#11530") == (Decimal("0.03"), Decimal("0"))
+    assert runtime._strategy_exit_tier(market=market(), coin="#11530") == (Decimal("0.03"), None)
     monkeypatch.setattr(runtime_module.time, "time", lambda: base + 21)
     assert runtime._strategy_exit_tier(market=market(), coin="#11530") == (Decimal("0.02"), Decimal("0"))
+
+
+def test_s0_initial_protective_sell_keeps_five_percent_target_with_e4_enabled(monkeypatch, tmp_path):
+    monkeypatch.setenv("OUTCOME_AUTOMATED_EXECUTION_ENABLED", "1")
+    monkeypatch.setenv("OUTCOME_SDK_EXECUTION_ENABLED", "1")
+    monkeypatch.setenv("OUTCOME_EXIT_REQUOTE_ENABLED", "1")
+    journal = TradeJournalDB(tmp_path / "s0_initial_exit.db")
+    journal.log_strategy_event("run", "OUTCOME_LIVE_STRATEGY_ENTRY_PLACED", {
+        "outcome_id": 1153, "coin": "#11530", "target_return_pct": "0.05", "loss_reprice_pct": "0",
+        "maker_close_fee_rate": "0.0004", "narrow_after_sec": 3600, "narrow_return_pct": "0.03",
+        "floor_after_sec": 7200, "floor_return_pct": "0.02",
+    })
+    class FilledAccount(Account):
+        def get_user_fills_sync(self, _):
+            return [{"coin": "#11530", "side": "B", "px": "0.74868", "sz": "14", "time": 1}]
+    class TrackingGateway(Gateway):
+        def __init__(self): self.calls = []
+        def fetch_order_book(self, **_): return {"bids": [{"price": "0.72"}], "asks": [{"price": "0.73"}]}
+        def place_alo(self, **kwargs): self.calls.append(kwargs); return {"orderId": "sell-1"}
+    gateway = TrackingGateway()
+    runtime = OutcomeLiveExecutionRuntime(
+        account=FilledAccount(balances=[{"coin": "+11530", "total": "14", "entryNtl": "10.48152"}]),
+        wallet="w", gateway=gateway, stream_health=healthy_stream(),
+        ledger=OutcomeExecutionLedger(journal, "run"),
+    )
+    finding = type("Finding", (), {"coin": "#11530"})()
+    result = runtime._advance_persisted_p3_exit(market=market(), finding=finding)
+    assert result is not None and result.state == "sell_placed"
+    assert gateway.calls[0]["price"] == Decimal("0.74868") * Decimal("1.05") / Decimal("0.9996")
 
 
 def test_generic_recovery_restores_persisted_p3_exit_policy(monkeypatch, tmp_path):
