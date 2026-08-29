@@ -517,6 +517,14 @@ class OutcomeLiveExecutionRuntime:
             price = Decimal(str(book["bids"][0]["price"]))
         except (IndexError, KeyError, TypeError, ValueError):
             return LiveExecutionResult("blocked", "live strategy entry book unavailable")
+        # The opening 50/50 region is an uncertainty regime, not a bargain
+        # by itself.  S0 is a momentum/confirmation experiment and therefore
+        # never tries to call a reversal from the centre of the binary range.
+        if price < config.min_entry_price:
+            return LiveExecutionResult(
+                "flat",
+                f"live strategy no-trade band: selected bid {price} < {config.min_entry_price}",
+            )
         if take_profit_price(entry_price=price, target_return_pct=config.target_return_pct,
                              maker_close_fee_rate=maker_close_fee) is None:
             return LiveExecutionResult("flat", "live strategy fee-after +5% target exceeds Outcome price ceiling")

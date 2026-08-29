@@ -28,6 +28,7 @@ class OutcomeLiveStrategyConfig:
     oi_return_min_bps: Decimal = Decimal("1")
     oi_lookback_sec: int = 300
     oi_max_age_sec: int = 90
+    min_entry_price: Decimal = Decimal("0.55")
 
     @classmethod
     def from_env(cls) -> "OutcomeLiveStrategyConfig":
@@ -43,6 +44,7 @@ class OutcomeLiveStrategyConfig:
             oi_return_min_bps=Decimal(os.environ.get("OUTCOME_LIVE_STRATEGY_OI_RETURN_MIN_BPS", "1")),
             oi_lookback_sec=int(os.environ.get("OUTCOME_LIVE_STRATEGY_OI_LOOKBACK_SEC", "300")),
             oi_max_age_sec=int(os.environ.get("OUTCOME_LIVE_STRATEGY_OI_MAX_AGE_SEC", "90")),
+            min_entry_price=Decimal(os.environ.get("OUTCOME_LIVE_STRATEGY_MIN_ENTRY_PRICE", "0.55")),
         )
         if not 1 <= value.max_daily_entries <= 10:
             raise ValueError("OUTCOME_LIVE_STRATEGY_MAX_DAILY_ENTRIES must be in [1, 10]")
@@ -54,6 +56,8 @@ class OutcomeLiveStrategyConfig:
             raise ValueError("live strategy OI windows must be positive")
         if min(value.spot_strike_min_bps, value.mark_return_min_bps, value.oi_return_min_bps) < 0:
             raise ValueError("live strategy thresholds must be non-negative")
+        if not Decimal("0") < value.min_entry_price < Decimal("1"):
+            raise ValueError("OUTCOME_LIVE_STRATEGY_MIN_ENTRY_PRICE must be in (0, 1)")
         return value
 
 

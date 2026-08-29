@@ -155,6 +155,26 @@ def test_s0_live_strategy_logs_explicit_oi_policy_entry(monkeypatch, tmp_path):
     assert '"sampling_policy": "oi_spot_mark_confirmation"' in payload
 
 
+def test_s0_live_strategy_blocks_selected_bid_in_50_to_55_no_trade_band(monkeypatch, tmp_path):
+    monkeypatch.setenv("OUTCOME_AUTOMATED_EXECUTION_ENABLED", "1")
+    monkeypatch.setenv("OUTCOME_SDK_EXECUTION_ENABLED", "1")
+    monkeypatch.setenv("OUTCOME_LIVE_STRATEGY_ENABLED", "1")
+    journal = TradeJournalDB(tmp_path / "band.db")
+    class CenterGateway(Gateway):
+        def __init__(self): self.calls = []
+        def fetch_order_book(self, **_): return {"bids": [{"price": "0.50"}], "asks": [{"price": "0.501"}]}
+        def place_alo(self, **kwargs): self.calls.append(kwargs); return {"orderId": "must-not-place"}
+    gateway = CenterGateway()
+    runtime = OutcomeLiveExecutionRuntime(
+        account=CalibrationAccount(), wallet="w", gateway=gateway, stream_health=healthy_stream(),
+        ledger=OutcomeExecutionLedger(journal, "run"),
+    )
+    result = runtime.tick_live_strategy(market=market(), entry_side_index=0, entry_reason="confirmed", entry_evidence={})
+    assert result.state == "flat"
+    assert "no-trade band" in result.detail
+    assert gateway.calls == []
+
+
 def test_s0_exit_tiers_are_anchored_to_entry_not_replacement(monkeypatch, tmp_path):
     journal = TradeJournalDB(tmp_path / "tiers.db")
     journal.log_strategy_event("run", "OUTCOME_LIVE_STRATEGY_ENTRY_PLACED", {
