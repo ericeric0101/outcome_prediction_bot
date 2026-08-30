@@ -36,10 +36,13 @@ def test_live_research_capture_writes_p2_p3_heartbeat_and_gap(tmp_path):
     with sqlite3.connect(journal.db_path) as conn:
         events = [row[0] for row in conn.execute("SELECT event_type FROM strategy_events")]
         fill_count = conn.execute("SELECT COUNT(*) FROM order_events WHERE event_type='ORDER_FILLED'").fetchone()[0]
+        payload = json.loads(conn.execute("SELECT payload_json FROM strategy_events WHERE event_type='OUTCOME_P2_PARITY_SNAPSHOT' LIMIT 1").fetchone()[0])
     assert events.count("OUTCOME_P2_PARITY_SNAPSHOT") == 2
     assert "OUTCOME_RESEARCH_CAPTURE_HEARTBEAT" in events
     assert "OUTCOME_RESEARCH_CAPTURE_GAP_ALERT" in events
     assert fill_count == 1
+    assert payload["expiry"] == "20260830-0000"
+    assert "time_left_sec" in payload and payload["strike"] == "70000"
 
 
 def test_duplicate_fill_repair_keeps_first_row_and_logs_audit(tmp_path):

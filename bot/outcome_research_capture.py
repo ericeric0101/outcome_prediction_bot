@@ -87,6 +87,12 @@ class OutcomeResearchCapture:
         self.journal.log_strategy_event(self.run_id, "OUTCOME_P2_PARITY_SNAPSHOT", {
             "venue": "hyperliquid_outcome", "period": market.period, "p2_schema_version": P2_SCHEMA_VERSION,
             "snapshot_timestamp_ms": capture_complete_at_ms, "outcome_id": market.outcome_id,
+            # These are decision-time facts, not retrospective metadata.  X4
+            # needs them to test whether the same feature behaves differently
+            # early versus late in a daily contract.
+            "expiry": market.expiry_str,
+            "time_left_sec": market.time_to_expiry_sec(current_timestamp=capture_complete_at_ms // 1000),
+            "strike": str(market.strike),
             "yes_coin": market.yes_coin, "no_coin": market.no_coin, "yes_l2": dict(yes_book), "no_l2": dict(no_book),
             "capture_quality": quality, "fee_evidence": fee_evidence, **parity.as_dict(),
         })

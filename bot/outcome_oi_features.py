@@ -17,7 +17,7 @@ from typing import Any, Mapping
 from bot.outcome_p2_quality import is_eligible_p2_snapshot
 from monitoring.trade_journal_db import TradeJournalDB
 
-FEATURE_SCHEMA_VERSION = 1
+FEATURE_SCHEMA_VERSION = 2
 LABEL_HORIZONS_SEC = (60, 300, 600, 1800, 3600)
 LABEL_TOLERANCE_MS = 120_000
 
@@ -216,6 +216,11 @@ class OutcomeOiFeaturePipeline:
             yes_bid, yes_ask, yes_bid_size, yes_ask_size = _bbo(snapshot["yes_l2"])
             no_bid, no_ask, no_bid_size, no_ask_size = _bbo(snapshot["no_l2"])
             features.update({
+                # X4 can only use this decision-time value.  Old snapshots
+                # without it remain valid X3 data but are excluded from the
+                # time-to-expiry walk-forward comparison.
+                "time_left_sec": _number(snapshot.get("time_left_sec")),
+                "strike": _number(snapshot.get("strike")),
                 "yes_bid": yes_bid, "yes_ask": yes_ask, "yes_spread": yes_ask - yes_bid if yes_bid is not None and yes_ask is not None else None,
                 "yes_bid_size": yes_bid_size, "yes_ask_size": yes_ask_size,
                 "no_bid": no_bid, "no_ask": no_ask, "no_spread": no_ask - no_bid if no_bid is not None and no_ask is not None else None,
