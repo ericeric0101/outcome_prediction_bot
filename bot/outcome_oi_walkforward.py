@@ -23,6 +23,13 @@ MIN_MARKET_INSTANCES = 5
 MIN_TRAIN_ROWS = 100
 MIN_TEST_ROWS = 20
 MIN_OOS_ROWS = 200
+# This is explicitly provisional: 30m blocks and small counts let a running
+# daily market produce diagnostics in hours, not days.  X4 final keeps the
+# much stronger independent-market requirements above.
+INTRADAY_BLOCK_SEC = 1800
+INTRADAY_MIN_TRAIN_ROWS = 18
+INTRADAY_MIN_TEST_ROWS = 3
+INTRADAY_MIN_OOS_ROWS = 18
 
 BASELINE_FEATURES = (
     "yes_mid", "yes_spread", "yes_depth_imbalance", "yes_probability_distance", "time_left_fraction",
@@ -74,6 +81,33 @@ class X4WalkForwardReport:
     incremental_evidence: bool
     ready_for_x5: bool
     blockers: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class X4IntradayHorizonReport:
+    label_horizon_sec: int
+    block_sec: int
+    sampled_rows: int
+    chronological_blocks: int
+    folds: tuple[X4Fold, ...]
+    oos_rows: int
+    baseline_rmse: float | None
+    oi_extended_rmse: float | None
+    rmse_improvement: float | None
+    baseline_mae: float | None
+    oi_extended_mae: float | None
+    mae_improvement: float | None
+    provisional_incremental_signal: bool
+    blockers: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class X4IntradayReport:
+    """Fast, explicitly non-independent evidence while a 1d market runs."""
+    feature_schema_version: int
+    provisional_only: bool
+    horizons: tuple[X4IntradayHorizonReport, ...]
+    ready_for_x5: bool
 
 
 def _finite(value: Any) -> float | None:
@@ -131,8 +165,8 @@ def _errors(predictions: Iterable[float], rows: Iterable[_Row]) -> tuple[float, 
     )
 
 
-def _row(features: dict[str, Any], labels: dict[str, Any], outcome_id: int, timestamp_ms: int) -> _Row | None:
-    label = labels.get(f"future_{LABEL_HORIZON_SEC}s", {})
+def _row(features: dict[str, Any], labels: dict[str, Any], outcome_id: int, timestamp_ms: int, *, label_horizon_sec: int) -> _Row | None:
+    label = labels.get(f"future_{label_horizon_sec}s", {})
     target = _finite(label.get("yes_long_markout_ps")) if label.get("available") is True else None
     yes_bid, yes_ask = _finite(features.get("yes_bid")), _finite(features.get("yes_ask"))
     bid_size, ask_size = _finite(features.get("yes_bid_size")), _finite(features.get("yes_ask_size"))
@@ -157,7 +191,7 @@ def _row(features: dict[str, Any], labels: dict[str, Any], outcome_id: int, time
     return _Row(outcome_id, timestamp_ms, baseline, baseline + oi, target)
 
 
-def _load_rows(db_path: str | Path) -> list[_Row]:
+def _load_rows(db_path: str | Path, *, label_horizon_sec: int = LABEL_HORIZON_SEC) -> list[_Row]:
     path = Path(db_path)
     if not path.exists():
         return []
@@ -178,7 +212,7 @@ def _load_rows(db_path: str | Path) -> list[_Row]:
         except (TypeError, json.JSONDecodeError):
             continue
         if isinstance(features, dict) and isinstance(labels, dict):
-            parsed = _row(features, labels, int(outcome_id), int(timestamp_ms))
+            parsed = _row(features, labels, int(outcome_id), int(timestamp_ms), label_horizon_sec=label_horizon_sec)
             if parsed is not None:
                 output.append(parsed)
     return output
@@ -237,5 +271,81 @@ def x4_walk_forward_report(db_path: str | Path) -> X4WalkForwardReport:
     return X4WalkForwardReport(FEATURE_SCHEMA_VERSION, LABEL_HORIZON_SEC, PURGE_SEC, len(rows), len(ordered_instances), tuple(folds), len(targets), baseline_rmse, extended_rmse, rmse_improvement, baseline_mae, extended_mae, mae_improvement, incremental, False, tuple(blockers))
 
 
+def _non_overlapping_rows(rows: list[_Row], horizon_sec: int) -> list[_Row]:
+    """One decision per horizon per market; prevents snapshot overlap inflation."""
+    selected: list[_Row] = []
+    last_by_market: dict[int, int] = {}
+    for row in rows:
+        last = last_by_market.get(row.market_instance)
+        if last is None or row.timestamp_ms - last >= horizon_sec * 1000:
+            selected.append(row)
+            last_by_market[row.market_instance] = row.timestamp_ms
+    return selected
+
+
+def _intraday_horizon_report(db_path: str | Path, horizon_sec: int) -> X4IntradayHorizonReport:
+    sampled = _non_overlapping_rows(_load_rows(db_path, label_horizon_sec=horizon_sec), horizon_sec)
+    first_by_market: dict[int, int] = {}
+    for row in sampled:
+        first_by_market.setdefault(row.market_instance, row.timestamp_ms)
+    block_ms = INTRADAY_BLOCK_SEC * 1000
+    grouped: dict[tuple[int, int], list[_Row]] = {}
+    for row in sampled:
+        key = (row.market_instance, (row.timestamp_ms - first_by_market[row.market_instance]) // block_ms)
+        grouped.setdefault(key, []).append(row)
+    ordered = sorted(grouped, key=lambda key: min(row.timestamp_ms for row in grouped[key]))
+    folds: list[X4Fold] = []
+    base_predictions: list[float] = []
+    extended_predictions: list[float] = []
+    targets: list[_Row] = []
+    for position in range(1, len(ordered)):
+        test_key = ordered[position]
+        test = grouped[test_key]
+        test_start = min(row.timestamp_ms for row in test)
+        raw_train = [row for key in ordered[:position] for row in grouped[key]]
+        # Embargo exactly one label horizon before the test block.  Together
+        # with non-overlapping sampling this prevents a label spanning the
+        # train/test boundary from being counted twice.
+        train = [row for row in raw_train if row.timestamp_ms <= test_start - horizon_sec * 1000]
+        if len(train) < INTRADAY_MIN_TRAIN_ROWS or len(test) < INTRADAY_MIN_TEST_ROWS:
+            continue
+        base = _ridge_predict(train, test, extended=False)
+        extended = _ridge_predict(train, test, extended=True)
+        base_rmse, base_mae = _errors(base, test)
+        ext_rmse, ext_mae = _errors(extended, test)
+        folds.append(X4Fold(test_key[0], len({row.market_instance for row in train}), len(train), len(raw_train) - len(train), len(test), base_rmse, ext_rmse, base_mae, ext_mae))
+        base_predictions.extend(base)
+        extended_predictions.extend(extended)
+        targets.extend(test)
+    blockers: list[str] = []
+    if len(ordered) < 2:
+        blockers.append("insufficient_intraday_time_blocks")
+    if not folds:
+        blockers.append("insufficient_purged_intraday_rows")
+    if len(targets) < INTRADAY_MIN_OOS_ROWS:
+        blockers.append("insufficient_intraday_oos_rows")
+    baseline_rmse = baseline_mae = extended_rmse = extended_mae = None
+    if targets:
+        baseline_rmse, baseline_mae = _errors(base_predictions, targets)
+        extended_rmse, extended_mae = _errors(extended_predictions, targets)
+    rmse_gain = baseline_rmse - extended_rmse if baseline_rmse is not None and extended_rmse is not None else None
+    mae_gain = baseline_mae - extended_mae if baseline_mae is not None and extended_mae is not None else None
+    provisional = bool(not blockers and rmse_gain is not None and mae_gain is not None and rmse_gain > 0 and mae_gain > 0)
+    if not provisional:
+        blockers.append("oi_incremental_intraday_improvement_not_established")
+    return X4IntradayHorizonReport(horizon_sec, INTRADAY_BLOCK_SEC, len(sampled), len(ordered), tuple(folds), len(targets), baseline_rmse, extended_rmse, rmse_gain, baseline_mae, extended_mae, mae_gain, provisional, tuple(blockers))
+
+
+def x4_intraday_report(db_path: str | Path, *, horizons: tuple[int, ...] = (300, 900)) -> X4IntradayReport:
+    """Return fast 5m/15m diagnostics, never a live-policy approval."""
+    if any(horizon not in (60, 300, 600, 900, 1800, 3600) for horizon in horizons):
+        raise ValueError("intraday horizon must be one of the X3 executable label horizons")
+    return X4IntradayReport(FEATURE_SCHEMA_VERSION, True, tuple(_intraday_horizon_report(db_path, horizon) for horizon in horizons), False)
+
+
 def as_dict(db_path: str | Path) -> dict[str, Any]:
     return asdict(x4_walk_forward_report(db_path))
+
+
+def intraday_as_dict(db_path: str | Path) -> dict[str, Any]:
+    return asdict(x4_intraday_report(db_path))

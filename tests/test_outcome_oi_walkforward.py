@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from bot.outcome_oi_features import FEATURE_SCHEMA_VERSION
-from bot.outcome_oi_walkforward import x4_walk_forward_report
+from bot.outcome_oi_walkforward import x4_intraday_report, x4_walk_forward_report
 from monitoring.trade_journal_db import TradeJournalDB
 
 
@@ -23,7 +23,10 @@ def _write(journal: TradeJournalDB, *, event_id: int, market: int, timestamp: in
         outcome_id=market, period="1d", snapshot_timestamp_ms=timestamp, oi_observation_id=event_id,
         oi_exchange_timestamp_ms=timestamp - 1, oi_local_received_at_ms=timestamp - 1, oi_age_ms=1,
         oi_join_direction="as_of_local_received_at", oi_backfilled=False, features=_features(signal=signal),
-        labels={"future_300s": {"available": True, "yes_long_markout_ps": signal / 10_000.0}},
+        labels={
+            "future_300s": {"available": True, "yes_long_markout_ps": signal / 10_000.0},
+            "future_900s": {"available": True, "yes_long_markout_ps": signal / 10_000.0},
+        },
         market_context={"market_instance": str(market)},
     )
 
@@ -65,3 +68,21 @@ def test_x4_excludes_rows_without_decision_time_expiry_or_full_oi_horizons(tmp_p
     report = x4_walk_forward_report(journal.db_path)
     assert report.eligible_rows == 0
     assert "insufficient_independent_daily_market_instances" in report.blockers
+
+
+def test_x4a_intraday_uses_non_overlapping_5m_and_15m_labels_but_never_authorizes_live(tmp_path):
+    journal = TradeJournalDB(tmp_path / "journal.db")
+    event_id = 1
+    # One active daily contract is enough for provisional rolling research;
+    # 5-minute / 15-minute samples are deliberately not called independent
+    # daily instances.
+    for index in range(300):
+        _write(journal, event_id=event_id, market=100, timestamp=2_000_000_000_000 + index * 5_000,
+               signal=float((index % 15) - 7))
+        event_id += 1
+    report = x4_intraday_report(journal.db_path)
+    five_minute, fifteen_minute = report.horizons
+    assert report.provisional_only and report.ready_for_x5 is False
+    assert five_minute.sampled_rows == 5
+    assert fifteen_minute.sampled_rows == 2
+    assert "insufficient_intraday_oos_rows" in five_minute.blockers

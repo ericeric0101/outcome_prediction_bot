@@ -18,7 +18,9 @@ from bot.outcome_p2_quality import is_eligible_p2_snapshot
 from monitoring.trade_journal_db import TradeJournalDB
 
 FEATURE_SCHEMA_VERSION = 2
-LABEL_HORIZONS_SEC = (60, 300, 600, 1800, 3600)
+# 15m is intentionally explicit: it is the fast provisional X4a horizon for
+# the 1d contract, not a claim that an Outcome 15m market exists.
+LABEL_HORIZONS_SEC = (60, 300, 600, 900, 1800, 3600)
 LABEL_TOLERANCE_MS = 120_000
 
 
