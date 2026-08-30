@@ -15,7 +15,6 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from loguru import logger
-import redis
 
 from alert_watcher import AlertWatcher
 from dashboard_state import DashboardState
@@ -129,41 +128,10 @@ def run_hyperliquid_preflight_checks(simulation: bool) -> bool:
     except Exception as e:
         logger.warning(f"Live Outcome API check note: {e}")
 
-    redis_client = init_redis()
-    if redis_client:
-        logger.info("Preflight Redis check: OK")
-    else:
-        logger.warning("Preflight Redis check: skipped/unavailable")
-
     mode_text = "SIMULATION" if simulation else "LIVE TRADING"
     logger.info(f"Hyperliquid preflight mode target: {mode_text}")
     logger.info("HYPERLIQUID PREFLIGHT CHECK PASSED")
     return True
-
-
-def init_redis():
-    """Optional Redis initialization."""
-    try:
-        redis_host = os.getenv("REDIS_HOST", "localhost")
-        redis_password = os.getenv("REDIS_PASSWORD")
-        redis_username = os.getenv("REDIS_USERNAME")
-        redis_client = redis.Redis(
-            host=redis_host,
-            port=int(os.getenv("REDIS_PORT", 6379)),
-            db=int(os.getenv("REDIS_DB", 2)),
-            username=redis_username if redis_username else None,
-            password=redis_password if redis_password else None,
-            decode_responses=True,
-            socket_connect_timeout=5,
-            socket_keepalive=True,
-        )
-        redis_client.ping()
-        logger.info("Redis connection established")
-        return redis_client
-    except Exception as e:
-        logger.warning(f"Redis connection failed: {e}")
-        logger.warning("Simulation mode will be static (from .env)")
-        return None
 
 
 def _strategy_requested_rollover(node: Any) -> bool:
