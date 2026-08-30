@@ -181,7 +181,7 @@ def _strategy_requested_rollover(node: Any) -> bool:
 
 def acquire_live_process_lock() -> ProcessLock | None:
     """Prevent two live launchers on the same host from sharing one wallet."""
-    lock_path = os.getenv("LIVE_PROCESS_LOCK_PATH", "/tmp/hyperliquid-btc-live.lock")
+    lock_path = os.getenv("LIVE_PROCESS_LOCK_PATH", "/tmp/hyperliquid-outcome-strategy-live.lock")
     lock = ProcessLock(lock_path)
     if lock.acquire():
         return lock
@@ -201,6 +201,17 @@ def run_integrated_hyperliquid_bot(
     Run Hyperliquid Outcome (HIP-4) Prediction Market Trading Node.
     """
     logger.info("Starting integrated Hyperliquid Outcome prediction market trading bot.")
+
+    # ``bot.launcher --live`` already requires a typed confirmation and holds
+    # the one-wallet process lock.  It is therefore the sole production
+    # execution authorization: do not make the operator repeat four fragile
+    # environment flags for the same decision.  Shadow/preflight invocation
+    # never reaches this live branch.
+    if not simulation:
+        os.environ["OUTCOME_AUTOMATED_EXECUTION_ENABLED"] = "1"
+        os.environ["OUTCOME_SDK_EXECUTION_ENABLED"] = "1"
+        os.environ["OUTCOME_LIVE_STRATEGY_ENABLED"] = "1"
+        os.environ["OUTCOME_EXIT_REQUOTE_ENABLED"] = "1"
 
     auth = resolve_hyperliquid_auth()
     if not auth:

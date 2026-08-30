@@ -22,7 +22,10 @@ class OutcomeExitQuotePlannerConfig:
     tick_size: Decimal = Decimal("0.00001")
     min_price_delta_ticks: int = 2
     min_requote_interval_sec: float = 60.0
-    max_replacements: int = 3
+    # Production E6 re-prices only when a durable lifecycle policy changes;
+    # there is no arbitrary per-process replacement quota.  Rate limiting,
+    # ownership confirmation and ALO non-crossing checks remain mandatory.
+    max_replacements: int | None = None
     max_book_age_sec: float = 15.0
 
 
@@ -77,7 +80,7 @@ class OutcomeExitQuotePlanner:
             return ExitQuotePlan(ExitQuoteAction.BLOCK, "invalid_book")
         if item.book_age_sec is None or item.book_age_sec > cfg.max_book_age_sec:
             return ExitQuotePlan(ExitQuoteAction.BLOCK, "stale_book")
-        if item.replacement_count >= cfg.max_replacements:
+        if cfg.max_replacements is not None and item.replacement_count >= cfg.max_replacements:
             return ExitQuotePlan(ExitQuoteAction.BLOCK, "replacement_attempt_cap")
         if item.last_requote_ts is not None and item.now_ts - item.last_requote_ts < cfg.min_requote_interval_sec:
             return ExitQuotePlan(ExitQuoteAction.KEEP, "requote_interval_not_elapsed")

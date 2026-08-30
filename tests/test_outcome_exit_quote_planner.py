@@ -48,6 +48,11 @@ def test_planner_enforces_interval_and_attempt_cap():
     assert planner.plan(_input(replacement_count=1, existing_price=Decimal("0.90"))).reason == "replacement_attempt_cap"
 
 
+def test_default_planner_has_no_arbitrary_replacement_quota():
+    plan = OutcomeExitQuotePlanner().plan(_input(replacement_count=999, existing_price=Decimal("0.90")))
+    assert plan.action is ExitQuoteAction.CANCEL_REPLACE
+
+
 def test_planner_never_proposes_a_crossing_sell():
     plan = OutcomeExitQuotePlanner(OutcomeExitQuotePlannerConfig(tick_size=Decimal("0.01"))).plan(
         _input(best_bid=Decimal("0.999"), best_ask=Decimal("0.9995"), existing_price=Decimal("0.90"))

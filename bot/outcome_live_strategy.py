@@ -17,7 +17,6 @@ from typing import Any
 
 @dataclass(frozen=True)
 class OutcomeLiveStrategyConfig:
-    max_daily_entries: int = 1
     target_return_pct: Decimal = Decimal("0.05")
     narrow_after_sec: int = 3600
     narrow_return_pct: Decimal = Decimal("0.03")
@@ -33,7 +32,6 @@ class OutcomeLiveStrategyConfig:
     @classmethod
     def from_env(cls) -> "OutcomeLiveStrategyConfig":
         value = cls(
-            max_daily_entries=int(os.environ.get("OUTCOME_LIVE_STRATEGY_MAX_DAILY_ENTRIES", "1")),
             target_return_pct=Decimal(os.environ.get("OUTCOME_LIVE_STRATEGY_TARGET_RETURN_PCT", "0.05")),
             narrow_after_sec=int(os.environ.get("OUTCOME_LIVE_STRATEGY_NARROW_AFTER_SEC", "3600")),
             narrow_return_pct=Decimal(os.environ.get("OUTCOME_LIVE_STRATEGY_NARROW_RETURN_PCT", "0.03")),
@@ -46,8 +44,6 @@ class OutcomeLiveStrategyConfig:
             oi_max_age_sec=int(os.environ.get("OUTCOME_LIVE_STRATEGY_OI_MAX_AGE_SEC", "90")),
             min_entry_price=Decimal(os.environ.get("OUTCOME_LIVE_STRATEGY_MIN_ENTRY_PRICE", "0.55")),
         )
-        if not 1 <= value.max_daily_entries <= 10:
-            raise ValueError("OUTCOME_LIVE_STRATEGY_MAX_DAILY_ENTRIES must be in [1, 10]")
         if not (Decimal("0") <= value.floor_return_pct <= value.narrow_return_pct <= value.target_return_pct < Decimal("1")):
             raise ValueError("live strategy return tiers must satisfy 0 <= floor <= narrow <= target < 1")
         if value.narrow_after_sec <= 0 or value.floor_after_sec < value.narrow_after_sec:

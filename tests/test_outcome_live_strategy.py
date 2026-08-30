@@ -29,3 +29,8 @@ def test_gate_fails_closed_for_stale_or_conflicting_oi(tmp_path):
     gate = OutcomeOiEntryGate(db.db_path, OutcomeLiveStrategyConfig(oi_max_age_sec=90))
     assert gate.evaluate(spot_price=Decimal("101"), strike_price=Decimal("100"), now_ms=1_330_000).side_index is None
     assert gate.evaluate(spot_price=Decimal("101"), strike_price=Decimal("100"), now_ms=1_500_000).reason == "oi_observation_stale"
+
+
+def test_live_strategy_config_has_no_daily_entry_count_parameter(monkeypatch):
+    monkeypatch.setenv("OUTCOME_LIVE_STRATEGY_MAX_DAILY_ENTRIES", "0")
+    assert not hasattr(OutcomeLiveStrategyConfig.from_env(), "max_daily_entries")

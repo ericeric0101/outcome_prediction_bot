@@ -50,10 +50,7 @@ class OutcomeLiveExecutionRuntime:
         self.ledger = ledger
         self.research_gate = research_gate or OutcomeResearchGate()
         if exit_planner is None:
-            max_replacements = int(os.environ.get("OUTCOME_EXIT_REQUOTE_MAX_REPLACEMENTS", "2"))
-            if max_replacements < 0 or max_replacements > 10:
-                raise ValueError("OUTCOME_EXIT_REQUOTE_MAX_REPLACEMENTS must be in [0, 10]")
-            exit_planner = OutcomeExitQuotePlanner(OutcomeExitQuotePlannerConfig(max_replacements=max_replacements))
+            exit_planner = OutcomeExitQuotePlanner(OutcomeExitQuotePlannerConfig())
         self.exit_planner = exit_planner
         self.exit_lifecycle_store = exit_lifecycle_store or (OutcomeExitLifecycleStore(ledger.journal, ledger.run_id) if ledger else None)
         self.exit_requote_controller = exit_requote_controller or (
@@ -120,15 +117,6 @@ class OutcomeLiveExecutionRuntime:
         with sqlite3.connect(self.ledger.journal.db_path) as conn:
             row = conn.execute(
                 "SELECT COUNT(*) FROM strategy_events WHERE event_type='OUTCOME_P3_CALIBRATION_ENTRY_PLACED' AND date(ts)=date('now')"
-            ).fetchone()
-        return int(row[0] or 0)
-
-    def _daily_live_strategy_entries(self) -> int:
-        if not self.ledger:
-            return 0
-        with sqlite3.connect(self.ledger.journal.db_path) as conn:
-            row = conn.execute(
-                "SELECT COUNT(*) FROM strategy_events WHERE event_type='OUTCOME_LIVE_STRATEGY_ENTRY_PLACED' AND date(ts)=date('now')"
             ).fetchone()
         return int(row[0] or 0)
 
@@ -520,8 +508,6 @@ class OutcomeLiveExecutionRuntime:
             return LiveExecutionResult("blocked", "live strategy has existing Outcome inventory or order")
         if entry_side_index not in (0, 1):
             return LiveExecutionResult("flat", f"live strategy no entry: {entry_reason}")
-        if self._daily_live_strategy_entries() >= config.max_daily_entries:
-            return LiveExecutionResult("flat", f"live strategy daily entry cap reached ({config.max_daily_entries})")
         fees = self.recovery.account.get_user_fees_sync(self.recovery.wallet)
         maker_close_fee = Decimal(str(fees["userSpotAddRate"]))
         book = self.machine.gateway.fetch_order_book(market=market, side_index=entry_side_index)
