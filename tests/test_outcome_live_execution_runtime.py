@@ -303,7 +303,9 @@ def test_e4_flag_off_never_calls_cancel_replace_controller(monkeypatch, tmp_path
     result = runtime.tick_market(market=market(), entry_side_index=None)
     assert controller.calls == 0
     assert "inventory is protected" in result.detail
-    assert gateway.calls == ["book"]
+    # S2-0 captures the holding path from a fresh BBO before the existing
+    # protective sell is advanced, then the normal state machine reads again.
+    assert gateway.calls == ["book", "book"]
 
 
 def test_e4_flag_on_requires_managed_lifecycle_then_calls_controller(monkeypatch, tmp_path):

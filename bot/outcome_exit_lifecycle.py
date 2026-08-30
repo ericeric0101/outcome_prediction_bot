@@ -62,7 +62,10 @@ class OutcomeExitLifecycleStore:
             if not row:
                 return None
             payload = json.loads(row[2])
-            if not isinstance(payload, dict) or payload.get("state") not in {"SELL_RESTING", "CANCEL_SUBMITTED", "RECONCILE_REQUIRED"}:
+            if not isinstance(payload, dict) or payload.get("state") not in {
+                "SELL_RESTING", "LOSS_BAND_RESTING", "LOSS_BAND_UNFILLED",
+                "REVERSAL_CONFIRMED", "CANCEL_SUBMITTED", "RECONCILE_REQUIRED",
+            }:
                 return None
             return OutcomeExitLifecycle(
                 wallet=str(payload["wallet"]), outcome_id=int(payload["outcome_id"]), coin=str(payload["coin"]),
@@ -84,7 +87,11 @@ class OutcomeExitLifecycleStore:
         # inventory and absence of the owned order.  Either fact alone can be
         # a partial-fill/cancel race and must remain reconciliation-only.
         if inventory <= 0 and not matching:
-            self.record(lifecycle, reason="inventory_flat_and_owned_sell_absent", extra={"state": "CLOSED"})
+            closed = OutcomeExitLifecycle(
+                lifecycle.wallet, lifecycle.outcome_id, lifecycle.coin, lifecycle.order_id,
+                lifecycle.inventory, lifecycle.target_price, lifecycle.replacement_count, "CLOSED",
+            )
+            self.record(closed, reason="inventory_flat_and_owned_sell_absent", extra={"prior_state": lifecycle.state})
             return None
         if len(matching) != 1 or inventory <= 0 or Decimal(str(matching[0].get("sz", "0"))) < inventory:
             self.record(lifecycle, reason="account_truth_does_not_match_owned_sell", extra={"state": "RECONCILE_REQUIRED"})

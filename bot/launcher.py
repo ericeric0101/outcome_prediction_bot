@@ -397,6 +397,10 @@ def run_integrated_hyperliquid_bot(
                                 market=market, entry_side_index=decision.side_index,
                                 entry_reason=decision.reason, entry_evidence=decision.evidence,
                                 retiring_markets=retiring_markets,
+                                market_context={
+                                    **decision.evidence, "spot_price": str(spot_px),
+                                    "strike_price": str(strike_px),
+                                },
                             )
                         elif live_execution.calibration_enabled():
                             runtime_result = live_execution.tick_p3_calibration(market=market)

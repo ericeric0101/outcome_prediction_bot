@@ -29,6 +29,9 @@ from bot.outcome_exit_target_policy import OutcomeExitTargetPolicy
 from bot.outcome_exit_lifecycle import OutcomeExitLifecycle, OutcomeExitLifecycleStore
 from bot.outcome_exit_quote_planner import ExitQuoteAction, ExitQuoteInput, ExitQuotePlan, OutcomeExitQuotePlanner, OutcomeExitQuotePlannerConfig
 from bot.outcome_exit_requote_controller import OutcomeExitRequoteController
+from bot.outcome_holding_path import OutcomeHoldingPathObservation, OutcomeHoldingPathRecorder
+from bot.outcome_reversal import OutcomeReversalClassifier, OutcomeReversalInput
+from bot.outcome_loss_reentry import OutcomeLossReentryGate
 
 
 @dataclass(frozen=True)
@@ -58,6 +61,11 @@ class OutcomeLiveExecutionRuntime:
             OutcomeExitRequoteController(account=account, gateway=self.machine.gateway, store=self.exit_lifecycle_store, wallet=wallet)
             if self.exit_lifecycle_store else None
         )
+        self.holding_path_recorder = OutcomeHoldingPathRecorder(ledger.journal, ledger.run_id) if ledger else None
+        self.reversal_classifier = OutcomeReversalClassifier()
+        self.loss_reentry_gate = OutcomeLossReentryGate(ledger.journal, ledger.run_id) if ledger else None
+        self._holding_context: dict[int, dict[str, object]] = {}
+        self._opposite_observation_counts: dict[tuple[int, str], int] = {}
         # E5 is deliberately process-local.  A restart must never resume a
         # canary against an old position without a new explicit operator run.
         self._e5_canary_eligible_order_ids: set[str] = set()
@@ -281,6 +289,10 @@ class OutcomeLiveExecutionRuntime:
             last_requote_ts=lifecycle.updated_at_ts, replacement_count=lifecycle.replacement_count,
         ))
         if plan.action.value == "KEEP":
+            if plan.exit_mode == "loss_band" and lifecycle.state == "LOSS_BAND_RESTING":
+                self.exit_lifecycle_store.record(
+                    lifecycle, reason="loss_band_unfilled_passive_quote", extra={"state": "LOSS_BAND_UNFILLED"},
+                )
             return LiveExecutionResult("sell_resting", f"exit reprice keep: {plan.reason}", lifecycle.order_id)
         if plan.action.value == "BLOCK":
             return LiveExecutionResult("blocked", f"exit reprice blocked: {plan.reason}", lifecycle.order_id)
@@ -356,14 +368,96 @@ class OutcomeLiveExecutionRuntime:
                     # Retiring markets are reconciled to block overlap; their
                     # exit lifecycle is never mutated through the new market.
                     continue
+                previous = self.exit_lifecycle_store.recover(
+                    wallet=self.recovery.wallet, outcome_id=market.outcome_id,
+                    coin=str(getattr(finding, "coin", "")),
+                )
                 self.exit_lifecycle_store.reconcile_owned_sell(
                     wallet=self.recovery.wallet, outcome_id=market.outcome_id,
                     coin=str(getattr(finding, "coin", "")),
                     inventory=Decimal(str(getattr(finding, "inventory", "0"))), open_orders=open_orders,
                 )
+                inventory = Decimal(str(getattr(finding, "inventory", "0")))
+                if (inventory <= 0 and previous is not None
+                        and not any(str(row.get("oid")) == previous.order_id for row in open_orders)
+                        and previous.state in {"LOSS_BAND_RESTING", "LOSS_BAND_UNFILLED", "REVERSAL_CONFIRMED"}
+                        and self.loss_reentry_gate is not None):
+                    self.loss_reentry_gate.record_confirmed_loss_exit(
+                        outcome_id=market.outcome_id, period=market.period,
+                        coin=previous.coin, order_id=previous.order_id,
+                    )
         except Exception:
             # The normal recovery report remains the execution gate.  Do not
             # infer a close from a failed read.
+            return
+
+    def _capture_holding_path(self, *, market: OutcomeMarketSpec, finding: object) -> None:
+        """Persist as-of open-inventory facts; never changes an order decision."""
+        if self.holding_path_recorder is None or self.ledger is None:
+            return
+        coin = str(getattr(finding, "coin", ""))
+        inventory = Decimal(str(getattr(finding, "inventory", "0")))
+        vwap = self.machine._fill_vwap_for_inventory(coin=coin, inventory=inventory)
+        fee = self._persisted_p3_maker_fee(market=market, coin=coin)
+        if inventory <= 0 or vwap is None or fee is None:
+            return
+        side_index = 0 if coin == market.yes_coin else 1
+        try:
+            book = self.machine.gateway.fetch_order_book(market=market, side_index=side_index)
+            bid = Decimal(str(book["bids"][0]["price"])); ask = Decimal(str(book["asks"][0]["price"]))
+            if not Decimal("0") < bid < ask < Decimal("1"):
+                return
+            age = 0.0
+            evidence: dict[str, object] = dict(self._holding_context.get(market.outcome_id, {}))
+            with sqlite3.connect(self.ledger.journal.db_path) as conn:
+                row = conn.execute(
+                    """SELECT ts, payload_json FROM strategy_events
+                       WHERE event_type='OUTCOME_LIVE_STRATEGY_ENTRY_PLACED'
+                         AND CAST(json_extract(payload_json, '$.outcome_id') AS INTEGER)=?
+                         AND json_extract(payload_json, '$.coin')=? ORDER BY id DESC LIMIT 1""",
+                    (market.outcome_id, coin),
+                ).fetchone()
+            if row:
+                age = max(0.0, time.time() - datetime.fromisoformat(str(row[0])).timestamp())
+                payload = json.loads(row[1])
+                if not evidence:
+                    evidence = payload.get("entry_evidence") if isinstance(payload.get("entry_evidence"), dict) else {}
+            self.holding_path_recorder.record(OutcomeHoldingPathObservation(
+                market.outcome_id, market.period, coin, inventory, vwap, bid, ask, fee, age,
+                market.time_to_expiry_sec(), "fresh_rest_book", evidence,
+            ))
+            def _decimal(name: str) -> Decimal | None:
+                try:
+                    value = evidence.get(name)
+                    return Decimal(str(value)) if value is not None else None
+                except (ValueError, ArithmeticError):
+                    return None
+            spot_bps, mark_bps, oi_bps = _decimal("spot_strike_bps"), _decimal("mark_return_bps"), _decimal("oi_return_bps")
+            opposite = False
+            if spot_bps is not None and mark_bps is not None and oi_bps is not None:
+                direction = Decimal("1") if side_index == 0 else Decimal("-1")
+                opposite = direction * spot_bps < 0 and direction * mark_bps < 0 and oi_bps > 0
+            key = (market.outcome_id, coin)
+            self._opposite_observation_counts[key] = self._opposite_observation_counts.get(key, 0) + 1 if opposite else 0
+            decision = self.reversal_classifier.classify(OutcomeReversalInput(
+                side_index, vwap, bid, ask, spot_bps, mark_bps, oi_bps, True,
+                self._opposite_observation_counts[key],
+            ))
+            self.ledger.journal.log_strategy_event(self.ledger.run_id, "OUTCOME_REVERSAL_SHADOW_DECISION", {
+                "venue": "hyperliquid_outcome", "outcome_id": market.outcome_id, "period": market.period,
+                "coin": coin, "state": decision.state, "reason": decision.reason,
+                "execution_submitted": False,
+            })
+            if decision.state.value == "REVERSAL_CONFIRMED" and self.exit_lifecycle_store is not None:
+                lifecycle = self.exit_lifecycle_store.recover(
+                    wallet=self.recovery.wallet, outcome_id=market.outcome_id, coin=coin,
+                )
+                if lifecycle is not None:
+                    self.exit_lifecycle_store.record(
+                        lifecycle, reason="reversal_classifier_shadow_confirmed",
+                        extra={"state": "REVERSAL_CONFIRMED"},
+                    )
+        except (sqlite3.Error, ValueError, TypeError, KeyError, IndexError, json.JSONDecodeError):
             return
 
     def tick_market(self, *, market: OutcomeMarketSpec, entry_side_index: int | None) -> LiveExecutionResult:
@@ -374,6 +468,7 @@ class OutcomeLiveExecutionRuntime:
         self._reconcile_exit_lifecycles(market=market, report=report)
         active = [finding for finding in report.findings if finding.state != "flat"]
         if len(active) == 1:
+            self._capture_holding_path(market=market, finding=active[0])
             requote = self._maybe_requote_p3_exit(market=market, finding=active[0])
             if requote is not None:
                 return requote
@@ -420,6 +515,7 @@ class OutcomeLiveExecutionRuntime:
         config = OutcomeP3CalibrationConfig.from_env()
         active = [finding for finding in report.findings if finding.state != "flat"]
         if len(active) == 1:
+            self._capture_holding_path(market=market, finding=active[0])
             requote = self._maybe_requote_p3_exit(market=market, finding=active[0])
             if requote is not None:
                 return requote
@@ -486,7 +582,8 @@ class OutcomeLiveExecutionRuntime:
 
     def tick_live_strategy(self, *, market: OutcomeMarketSpec, entry_side_index: int | None,
                            entry_reason: str, entry_evidence: dict[str, object],
-                           retiring_markets: tuple[OutcomeMarketSpec, ...] = ()) -> LiveExecutionResult:
+                           retiring_markets: tuple[OutcomeMarketSpec, ...] = (),
+                           market_context: dict[str, object] | None = None) -> LiveExecutionResult:
         """Run one explicitly gated S0 live strategy lifecycle.
 
         The caller supplies a pure, already fail-closed OI/spot decision.  The
@@ -497,6 +594,7 @@ class OutcomeLiveExecutionRuntime:
             return LiveExecutionResult("disabled", "live strategy requires automated, SDK, and OUTCOME_LIVE_STRATEGY_ENABLED gates")
         if self.ledger is None:
             return LiveExecutionResult("blocked", "live strategy requires an execution ledger")
+        self._holding_context[market.outcome_id] = dict(market_context or entry_evidence)
         health_error = self._stream_ready(market)
         if health_error:
             return health_error
@@ -515,6 +613,7 @@ class OutcomeLiveExecutionRuntime:
             )
         active = [finding for finding in report.findings if finding.market_id == market.outcome_id and finding.state != "flat"]
         if len(active) == 1:
+            self._capture_holding_path(market=market, finding=active[0])
             requote = self._maybe_requote_p3_exit(market=market, finding=active[0])
             if requote is not None:
                 return requote
@@ -527,6 +626,10 @@ class OutcomeLiveExecutionRuntime:
             return LiveExecutionResult("blocked", "live strategy has existing Outcome inventory or order")
         if entry_side_index not in (0, 1):
             return LiveExecutionResult("flat", f"live strategy no entry: {entry_reason}")
+        if self.loss_reentry_gate is not None:
+            reentry = self.loss_reentry_gate.evaluate(outcome_id=market.outcome_id)
+            if not reentry.allowed:
+                return LiveExecutionResult("flat", f"live strategy no entry: {reentry.reason}")
         fees = self.recovery.account.get_user_fees_sync(self.recovery.wallet)
         maker_close_fee = Decimal(str(fees["userSpotAddRate"]))
         book = self.machine.gateway.fetch_order_book(market=market, side_index=entry_side_index)

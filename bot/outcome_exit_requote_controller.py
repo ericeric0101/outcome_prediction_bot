@@ -100,8 +100,9 @@ class OutcomeExitRequoteController:
             if not new_id:
                 self.store.record(lifecycle, reason="replacement_missing_order_id", extra={"state": "RECONCILE_REQUIRED"})
                 return ExitRequoteResult("reconcile_required", "replacement_unconfirmed", lifecycle.order_id)
+            state = "LOSS_BAND_RESTING" if plan.exit_mode == "loss_band" else "SELL_RESTING"
             new_lifecycle = OutcomeExitLifecycle(self.wallet, market.outcome_id, lifecycle.coin, new_id,
-                                                  inventory_after_cancel, price, lifecycle.replacement_count + 1, "SELL_RESTING")
+                                                  inventory_after_cancel, price, lifecycle.replacement_count + 1, state)
             self.store.record(new_lifecycle, reason=plan.reason, extra={"old_order_id": lifecycle.order_id,
                               "best_bid": str(bid), "best_ask": str(ask), "exit_mode": plan.exit_mode or "unknown"})
             return ExitRequoteResult("sell_resting", "cancel_confirmed_rebooked_alo_replacement", lifecycle.order_id, new_id)
