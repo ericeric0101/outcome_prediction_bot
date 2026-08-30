@@ -357,11 +357,13 @@ def select_active_or_next_btc_market(
 def evaluate_outcome_market_phase(
     market: Optional[OutcomeMarketSpec],
     current_timestamp: Optional[int] = None,
-    reduce_only_seconds: float = 300.0,
+    reduce_only_seconds: float | None = None,
     settling_grace_seconds: float = 60.0,
 ) -> MarketPhase:
     """
-    State machine for Outcome 15m market:
+    State machine for Outcome markets.  Daily markets enter reduce-only one
+    hour before expiry; short markets retain the five-minute tail.  This is a
+    venue-lifecycle safety control, not a strategy parameter.
     - WAITING: current_time < market.start_timestamp
     - ACTIVE: market.start_timestamp <= current_time < (expiry - reduce_only_seconds)
     - REDUCE_ONLY: (expiry - reduce_only_seconds) <= current_time < expiry
@@ -370,6 +372,9 @@ def evaluate_outcome_market_phase(
     """
     if market is None:
         return MarketPhase.WAITING
+
+    if reduce_only_seconds is None:
+        reduce_only_seconds = 3600.0 if market.period in {"1d", "24h", "daily"} else 300.0
 
     now = current_timestamp if current_timestamp is not None else int(time.time())
     time_left = market.time_to_expiry_sec(now)

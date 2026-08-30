@@ -23,6 +23,7 @@ from bot.adapters.outcome_auth import OutcomeAuth
 from bot.adapters.outcome_client import OutcomeClient
 from bot.lifecycle.outcome_lifecycle import (
     OutcomeMarketSpec,
+    discover_btc_markets_by_preference,
     discover_btc_15m_markets,
     parse_period_preferences,
     select_configured_btc_market,
@@ -41,6 +42,7 @@ from bot.outcome_ws_recorder import OutcomeWebSocketRecorder
 from bot.outcome_execution_ledger import OutcomeExecutionLedger
 from bot.outcome_operations_monitor import OutcomeOperationsMonitor
 from bot.outcome_research_capture import OutcomeResearchCapture
+from bot.outcome_rollover import OutcomeRolloverCoordinator
 from monitoring.trade_journal_db import TradeJournalDB
 from bot.enums import MarketPhase
 from bot.app_config import AppConfig
@@ -280,6 +282,8 @@ def run_integrated_hyperliquid_bot(
     inventory_shares: float = 0.0
     inventory_entry_px: float = 0.0
     settled_markets: Set[int] = set()
+    settlement_last_attempt_at: dict[int, float] = {}
+    rollover = OutcomeRolloverCoordinator()
 
     refresh_interval = 1.5 if not test_mode else 1.0
     last_log_time = 0.0
@@ -293,6 +297,9 @@ def run_integrated_hyperliquid_bot(
             try:
                 meta = client.get_outcome_meta_sync(ttl_sec=20.0)
                 market, status, selected_period, fallback_used = select_configured_btc_market(
+                    meta, period_preferences=market_preferences, allow_fallback=market_allow_fallback,
+                )
+                configured_markets, _, _ = discover_btc_markets_by_preference(
                     meta, period_preferences=market_preferences, allow_fallback=market_allow_fallback,
                 )
                 if fallback_used:
@@ -310,6 +317,7 @@ def run_integrated_hyperliquid_bot(
                 continue
 
             current_market = market
+            retiring_markets = rollover.observe(selected=market, discovered=configured_markets)
 
             # 2. Update pricing feeds
             book_yes: dict[str, Any] | None = None
@@ -420,6 +428,7 @@ def run_integrated_hyperliquid_bot(
                             runtime_result = live_execution.tick_live_strategy(
                                 market=market, entry_side_index=decision.side_index,
                                 entry_reason=decision.reason, entry_evidence=decision.evidence,
+                                retiring_markets=retiring_markets,
                             )
                         elif live_execution.calibration_enabled():
                             runtime_result = live_execution.tick_p3_calibration(market=market)
@@ -470,33 +479,66 @@ def run_integrated_hyperliquid_bot(
                             logger.info(f"[SIMULATION FILL] Filled {min_shares} {active_side} @ ${target_bid:.4f}")
 
             elif phase == MarketPhase.REDUCE_ONLY:
-                if active_order_id:
-                    if simulation:
+                if simulation:
+                    if active_order_id:
                         if terminal_dash:
                             terminal_dash.record_order_canceled(client_order_id=active_order_id)
                         active_order_id = None
                         logger.info("[SIMULATION] Cancelled active entry order in REDUCE_ONLY phase.")
-                    else:
-                        try:
-                            result = live_execution.cancel_resting_buys(market=market)
-                            logger.info(f"[LIVE OUTCOME REDUCE_ONLY] state={result.state} detail={result.detail}")
-                            if terminal_dash:
-                                terminal_dash.record_order_canceled(client_order_id=str(active_order_id))
-                            active_order_id = None
-                        except Exception as e:
-                            logger.error(f"Error cancelling open order: {e}")
+                else:
+                    try:
+                        # Account truth, not the process-local order id, owns
+                        # the daily one-hour reduce-only cancellation.
+                        result = live_execution.cancel_resting_buys(
+                            market=market, tracked_markets=retiring_markets,
+                        )
+                        logger.info(f"[LIVE OUTCOME REDUCE_ONLY] state={result.state} detail={result.detail}")
+                        active_order_id = None
+                    except Exception as e:
+                        logger.error(f"Error cancelling open order: {e}")
 
-            elif phase == MarketPhase.SETTLING:
-                if market.outcome_id not in settled_markets:
+            # A process may have been down during the one-hour tail.  Once a
+            # new daily instance is selected, cancel any inherited *old* buy
+            # orders as well.  Never touch old protective sells or inventory.
+            if not simulation:
+                for retiring_market in retiring_markets:
+                    try:
+                        result = live_execution.cancel_resting_buys(
+                            market=retiring_market,
+                            tracked_markets=(market, *retiring_markets),
+                        )
+                        if result.state == "cancelled":
+                            logger.info(
+                                f"[OUTCOME ROLLOVER] cancelled retiring-market entry buys "
+                                f"market=#{retiring_market.outcome_id} order={result.order_id}"
+                            )
+                    except Exception as e:
+                        logger.warning(
+                            f"[OUTCOME ROLLOVER] retiring market #{retiring_market.outcome_id} "
+                            f"buy-cancel reconciliation failed: {e}"
+                        )
+
+            # Settlement outlives active-market selection.  Keep requesting
+            # official evidence for retiring instances until confirmed; BTC
+            # price and UI state are never used as a settlement proxy.
+            settlement_candidates = list(retiring_markets)
+            if phase == MarketPhase.SETTLING:
+                settlement_candidates.append(market)
+            for settlement_market in settlement_candidates:
+                if settlement_market.outcome_id not in settled_markets:
+                    now_monotonic = time.monotonic()
+                    if now_monotonic - settlement_last_attempt_at.get(settlement_market.outcome_id, 0.0) < 30.0:
+                        continue
+                    settlement_last_attempt_at[settlement_market.outcome_id] = now_monotonic
                     if not simulation:
                         try:
-                            settlement = settlement_adapter.fetch(market)
+                            settlement = settlement_adapter.fetch(settlement_market)
                             if not settlement.settled:
-                                logger.info(f"[OUTCOME SETTLEMENT] #{market.outcome_id} not yet confirmed by official SDK; holding state.")
+                                logger.info(f"[OUTCOME SETTLEMENT] #{settlement_market.outcome_id} not yet confirmed by official SDK; holding state.")
                             else:
-                                settled_markets.add(market.outcome_id)
+                                settled_markets.add(settlement_market.outcome_id)
                                 logger.info(
-                                    f"[OUTCOME SETTLEMENT] #{market.outcome_id} confirmed by official SDK "
+                                    f"[OUTCOME SETTLEMENT] #{settlement_market.outcome_id} confirmed by official SDK "
                                     f"fraction={settlement.settle_fraction} details={settlement.details}"
                                 )
                                 # A standalone binary side has no generic SDK
@@ -504,25 +546,11 @@ def run_integrated_hyperliquid_bot(
                         except Exception as e:
                             logger.warning(f"[OUTCOME SETTLEMENT] official confirmation unavailable: {e}")
                     else:
-                        settled_markets.add(market.outcome_id)
-                        won = (spot_px >= strike_px and inventory_side == "UP") or (spot_px < strike_px and inventory_side == "DOWN")
-                        payout_per_share = 1.0 if won else 0.0
-                        realized_pnl = (payout_per_share - inventory_entry_px) * inventory_shares if inventory_shares > 0 else 0.0
-
+                        settled_markets.add(settlement_market.outcome_id)
                         logger.info(
-                            f"[SETTLEMENT] Outcome #{market.outcome_id} Settled! "
-                            f"Strike=${strike_px:,.2f} Final Spot=${spot_px:,.2f} "
-                            f"Result={'WIN' if won else 'LOSS'} Realized PnL: ${realized_pnl:+.4f} USDC"
+                            f"[OUTCOME SETTLEMENT] simulation marked #{settlement_market.outcome_id} "
+                            "terminal without inferring payout from BTC price"
                         )
-
-                        if terminal_dash:
-                            terminal_dash.record_cycle(slug=f"Outcome #{market.outcome_id}", pnl_usdc=realized_pnl)
-                            terminal_dash.increment_redeem()
-
-                        inventory_shares = 0.0
-                        inventory_side = None
-                        inventory_entry_px = 0.0
-                        active_order_id = None
 
             # 5. Update dashboard state
             with dashboard_state._lock:

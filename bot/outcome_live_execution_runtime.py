@@ -352,6 +352,10 @@ class OutcomeLiveExecutionRuntime:
         try:
             open_orders = self.recovery.account.get_open_orders_sync(self.recovery.wallet)
             for finding in getattr(report, "findings", ()):
+                if int(getattr(finding, "market_id", -1)) != market.outcome_id:
+                    # Retiring markets are reconciled to block overlap; their
+                    # exit lifecycle is never mutated through the new market.
+                    continue
                 self.exit_lifecycle_store.reconcile_owned_sell(
                     wallet=self.recovery.wallet, outcome_id=market.outcome_id,
                     coin=str(getattr(finding, "coin", "")),
@@ -481,7 +485,8 @@ class OutcomeLiveExecutionRuntime:
         return self._record(market, side_index, result)
 
     def tick_live_strategy(self, *, market: OutcomeMarketSpec, entry_side_index: int | None,
-                           entry_reason: str, entry_evidence: dict[str, object]) -> LiveExecutionResult:
+                           entry_reason: str, entry_evidence: dict[str, object],
+                           retiring_markets: tuple[OutcomeMarketSpec, ...] = ()) -> LiveExecutionResult:
         """Run one explicitly gated S0 live strategy lifecycle.
 
         The caller supplies a pure, already fail-closed OI/spot decision.  The
@@ -496,9 +501,19 @@ class OutcomeLiveExecutionRuntime:
         if health_error:
             return health_error
         config = OutcomeLiveStrategyConfig.from_env()
-        report = self.recovery.reconcile([market])
+        tracked_markets = (market, *retiring_markets)
+        report = self.recovery.reconcile(tracked_markets)
         self._reconcile_exit_lifecycles(market=market, report=report)
-        active = [finding for finding in report.findings if finding.state != "flat"]
+        retired_active = [
+            finding for finding in report.findings
+            if finding.market_id != market.outcome_id and finding.state != "flat"
+        ]
+        if retired_active:
+            return LiveExecutionResult(
+                "blocked",
+                "market rollover pending: retiring Outcome has live inventory or order; new entry refused",
+            )
+        active = [finding for finding in report.findings if finding.market_id == market.outcome_id and finding.state != "flat"]
         if len(active) == 1:
             requote = self._maybe_requote_p3_exit(market=market, finding=active[0])
             if requote is not None:
@@ -560,16 +575,21 @@ class OutcomeLiveExecutionRuntime:
             })
         return self._record(market, entry_side_index, result)
 
-    def cancel_resting_buys(self, *, market: OutcomeMarketSpec) -> LiveExecutionResult:
+    def cancel_resting_buys(
+        self,
+        *,
+        market: OutcomeMarketSpec,
+        tracked_markets: tuple[OutcomeMarketSpec, ...] = (),
+    ) -> LiveExecutionResult:
         """Reduce-only transition: cancel owned entries, never sell/take."""
         if not self.enabled():
             return LiveExecutionResult("disabled", "automated execution is disabled")
-        report = self.recovery.reconcile([market])
+        report = self.recovery.reconcile((market, *tracked_markets))
         if not report.safe_for_new_entry:
             return LiveExecutionResult("blocked", f"account recovery blocked cancellation: {report.reason}")
         cancelled: list[str] = []
         for side_index, coin in enumerate((market.yes_coin, market.no_coin)):
-            finding = next(item for item in report.findings if item.coin == coin)
+            finding = next(item for item in report.findings if item.market_id == market.outcome_id and item.coin == coin)
             for order_id in finding.buy_order_ids:
                 self.machine.gateway.cancel_owned_order(market=market, side_index=side_index, order_id=order_id)
                 cancelled.append(order_id)

@@ -605,6 +605,19 @@ child_order_notional <= min(
 
 ---
 
+### 每日市場 rollover 與一小時 reduce-only 保護（完成 2026-08-30）
+
+**問題與結論。** 先前 launcher 能從 `outcomeMeta` 選到新 1d market、重建 WebSocket recorder，但未把「選到新市場」與「舊市場仍待結算／仍有帳戶曝險」當作同一個可審計流程。因此正常每日台北時間約 14:00 的切換雖不會刻意重疊下單，卻可能把舊 `#coin` 視為 unmanaged exposure 而 fail-closed，且只追蹤當前選中市場的 settlement。這不是可宣稱已完成的 24 小時 rollover。
+
+現在 `bot/outcome_rollover.py` 與 `bot/launcher.py` 建立下列正式不變量：
+
+1. **Daily tail。** `period in {1d, 24h, daily}` 於到期前 **3,600 秒（一小時）**進入 `REDUCE_ONLY`；15m 等短市場保留五分鐘。tail 中以帳戶實際 `frontendOpenOrders` 為準，取消本市場所有 bot-owned resting BUY，不依賴 process-local `active_order_id`，不取消 SELL、不送 taker。
+2. **舊市場持續追蹤。** 新 market 被選中時，前一 market 與 `outcomeMeta` 仍可見的最近到期同週期 market 都進入 retiring set；重新啟動後也能從仍存在的 metadata 恢復最近退休 market。retiring set 最長保留六小時；metadata 不可得時 account recovery 仍將未知 `#coin` fail-closed，絕不猜測歸屬。
+3. **不重疊開倉。** live strategy 每個 tick 對 `current + retiring` 同步 balances/open orders。只要 retiring market 仍有 BUY、SELL 或 inventory，會回報 `market rollover pending`，拒絕新市場 entry；舊市場 flat 時不構成阻擋。
+4. **結算不隨選擇消失。** launcher 對 retiring market 持續透過 official SDK `fetchSettledOutcome` 查驗，30 秒節流；BTC 價格、前端概率或本地推論均不得代替 settlement/payout evidence。即使 official settlement 已確認，舊 coin 的餘額／掛單仍會由 recovery 繼續約束新 entry。
+
+**驗證（2026-08-30）。** 新增 `tests/test_outcome_rollover.py`，並擴充 official runtime test：日市場一小時 tail、15m 五分鐘 tail、正常切換、process restart 從 metadata 恢復 retiring market、retiring BUY 阻擋新 market entry。定向測試與 lifecycle/runtime 測試 **29 passed**，另以 `py_compile` 驗證 launcher／rollover／runtime import。這是 fixture 級 rollover 驗證，仍須在下一次台北 14:00 觀察正式 journal 的 `cancel → old settlement query → new entry unblock` 三段證據；在此之前不得把它標示為已完成的真實 24h runtime 測試。
+
 ## 肆、 執行與止損階梯架構 (`OutcomeExecutionAdapter`)
 
 ```mermaid

@@ -175,6 +175,24 @@ def test_s0_live_strategy_blocks_selected_bid_in_50_to_55_no_trade_band(monkeypa
     assert gateway.calls == []
 
 
+def test_s0_live_strategy_blocks_new_market_while_known_retiring_market_has_resting_order(monkeypatch, tmp_path):
+    monkeypatch.setenv("OUTCOME_AUTOMATED_EXECUTION_ENABLED", "1")
+    monkeypatch.setenv("OUTCOME_SDK_EXECUTION_ENABLED", "1")
+    monkeypatch.setenv("OUTCOME_LIVE_STRATEGY_ENABLED", "1")
+    retiring = OutcomeMarketSpec(1152, "@1152", "#11520", "#11521", 1, 2, "priceBinary", "BTC", "", 0, 1, Decimal("1"), "1d", "")
+    runtime = OutcomeLiveExecutionRuntime(
+        account=CalibrationAccount(orders=[{"coin": "#11520", "side": "B", "oid": 7, "sz": "13"}]),
+        wallet="w", gateway=Gateway(), stream_health=healthy_stream(),
+        ledger=OutcomeExecutionLedger(TradeJournalDB(tmp_path / "rollover.db"), "run"),
+    )
+    result = runtime.tick_live_strategy(
+        market=market(), entry_side_index=0, entry_reason="confirmed", entry_evidence={},
+        retiring_markets=(retiring,),
+    )
+    assert result.state == "blocked"
+    assert "rollover pending" in result.detail
+
+
 def test_s0_exit_tiers_are_anchored_to_entry_not_replacement(monkeypatch, tmp_path):
     journal = TradeJournalDB(tmp_path / "tiers.db")
     journal.log_strategy_event("run", "OUTCOME_LIVE_STRATEGY_ENTRY_PLACED", {
