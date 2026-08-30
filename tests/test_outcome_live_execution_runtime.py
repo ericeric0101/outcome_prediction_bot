@@ -188,7 +188,7 @@ def test_s0_exit_tiers_are_anchored_to_entry_not_replacement(monkeypatch, tmp_pa
     monkeypatch.setattr(runtime_module.time, "time", lambda: base + 11)
     assert runtime._strategy_exit_tier(market=market(), coin="#11530") == (Decimal("0.03"), None)
     monkeypatch.setattr(runtime_module.time, "time", lambda: base + 21)
-    assert runtime._strategy_exit_tier(market=market(), coin="#11530") == (Decimal("0.02"), Decimal("0"))
+    assert runtime._strategy_exit_tier(market=market(), coin="#11530") == (Decimal("0.02"), Decimal("0.05"))
 
 
 def test_s0_initial_protective_sell_keeps_five_percent_target_with_e4_enabled(monkeypatch, tmp_path):

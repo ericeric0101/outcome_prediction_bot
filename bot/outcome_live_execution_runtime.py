@@ -25,6 +25,7 @@ from bot.outcome_execution_ledger import OutcomeExecutionLedger
 from bot.outcome_research_gate import OutcomeResearchGate
 from bot.outcome_p3_calibration import OutcomeP3CalibrationConfig, choose_consensus_calibration_side, take_profit_price
 from bot.outcome_live_strategy import OutcomeLiveStrategyConfig
+from bot.outcome_exit_target_policy import OutcomeExitTargetPolicy
 from bot.outcome_exit_lifecycle import OutcomeExitLifecycle, OutcomeExitLifecycleStore
 from bot.outcome_exit_quote_planner import ExitQuoteAction, ExitQuoteInput, ExitQuotePlan, OutcomeExitQuotePlanner, OutcomeExitQuotePlannerConfig
 from bot.outcome_exit_requote_controller import OutcomeExitRequoteController
@@ -208,7 +209,10 @@ class OutcomeLiveExecutionRuntime:
             # postpone the +3%/+2% time tiers.
             age = max(0.0, time.time() - datetime.fromisoformat(str(row[0])).timestamp())
             if age >= floor_after:
-                return floor, Decimal("0")
+                # The loss band is only eligible after the two-hour floor
+                # tier.  It is a fee-inclusive -5% passive quote, never an
+                # immediate stop or a taker instruction.
+                return floor, Decimal("0.05")
             if age >= narrow_after:
                 return narrow, None
             return target, None
@@ -523,9 +527,12 @@ class OutcomeLiveExecutionRuntime:
                 "flat",
                 f"live strategy no-trade band: selected bid {price} < {config.min_entry_price}",
             )
-        if take_profit_price(entry_price=price, target_return_pct=config.target_return_pct,
+        target_decision = OutcomeExitTargetPolicy(self.ledger.journal.db_path).decide(
+            outcome_id=market.outcome_id, side_index=entry_side_index,
+        )
+        if take_profit_price(entry_price=price, target_return_pct=target_decision.target_return_pct,
                              maker_close_fee_rate=maker_close_fee) is None:
-            return LiveExecutionResult("flat", "live strategy fee-after +5% target exceeds Outcome price ceiling")
+            return LiveExecutionResult("flat", "live strategy dynamic fee-after target exceeds Outcome price ceiling")
         shares = whole_share_size(price)
         risk = self.risk_gate.evaluate(
             balances=self.recovery.account.get_spot_clearinghouse_state_sync(self.recovery.wallet).get("balances", []),
@@ -538,10 +545,13 @@ class OutcomeLiveExecutionRuntime:
             self.ledger.journal.log_strategy_event(self.ledger.run_id, "OUTCOME_LIVE_STRATEGY_ENTRY_PLACED", {
                 "venue": "hyperliquid_outcome", "outcome_id": market.outcome_id, "period": market.period,
                 "side_index": entry_side_index, "coin": self.machine.gateway.outcome_coin(market, entry_side_index),
-                "price": str(price), "shares": shares, "target_return_pct": str(config.target_return_pct),
-                # Zero means a weak book can only lower an exit to the
-                # fee-inclusive break-even floor, never a loss stop.
-                "loss_reprice_pct": "0", "maker_close_fee_rate": str(maker_close_fee),
+                "price": str(price), "shares": shares, "target_return_pct": str(target_decision.target_return_pct),
+                "target_policy_source": target_decision.source,
+                "target_estimated_move_pct": str(target_decision.estimated_move_pct) if target_decision.estimated_move_pct is not None else None,
+                "target_volatility_sample_count": target_decision.sample_count,
+                # Prior to the two-hour floor tier no loss band is eligible.
+                # Thereafter this is a fee-inclusive -5% passive quote only.
+                "loss_reprice_pct": "0.05", "maker_close_fee_rate": str(maker_close_fee),
                 "narrow_after_sec": config.narrow_after_sec, "narrow_return_pct": str(config.narrow_return_pct),
                 "floor_after_sec": config.floor_after_sec, "floor_return_pct": str(config.floor_return_pct),
                 "order_id": result.order_id, "entry_reason": entry_reason,
