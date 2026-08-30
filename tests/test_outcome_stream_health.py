@@ -8,7 +8,7 @@ def market(): return OutcomeMarketSpec(1153, "@1153", "#11530", "#11531", 1, 2, 
 
 
 def test_stream_health_requires_connection_rest_resync_and_both_books():
-    health = OutcomeStreamHealth(max_book_age_sec=3)
+    health = OutcomeStreamHealth()
     assert health.check(market(), now=10).reason == "ws_disconnected"
     health.on_lifecycle("connected")
     assert health.check(market(), now=10).reason == "ws_rest_resync_required"
@@ -16,8 +16,10 @@ def test_stream_health_requires_connection_rest_resync_and_both_books():
     health.on_l2_book("#11530", 10)
     assert health.check(market(), now=10).reason == "ws_book_missing"
     health.on_l2_book("#11531", 10)
-    assert health.check(market(), now=12).ready
-    assert health.check(market(), now=14).reason == "ws_book_stale"
+    # Outcome quiet-book updates are normally spaced about 5--6 seconds; the
+    # default must not classify that normal cadence as a disconnect.
+    assert health.check(market(), now=14).ready
+    assert health.check(market(), now=26).reason == "ws_book_stale"
 
 
 def test_stream_health_fails_closed_after_disconnect_or_market_rollover():

@@ -14,7 +14,12 @@ class OutcomeStreamHealthStatus:
 
 
 class OutcomeStreamHealth:
-    def __init__(self, *, max_book_age_sec: float = 3.0) -> None:
+    # Outcome's public L2 stream commonly publishes a paired update roughly
+    # every 5--6 seconds in quiet books.  Three seconds therefore rejected a
+    # healthy subscribed stream between normal venue updates.  Fifteen seconds
+    # permits two missed normal intervals while still failing closed promptly
+    # on a stopped feed.
+    def __init__(self, *, max_book_age_sec: float = 15.0) -> None:
         self.max_book_age_sec = max_book_age_sec
         self.market_id: int | None = None
         self.coins: tuple[str, str] = ("", "")
