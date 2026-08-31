@@ -29,3 +29,9 @@ def test_sidecar_client_does_not_allow_execution_without_the_sidecar_gate():
             payload={"marketId": "1153", "outcome": "#11530", "orderId": "1"},
             allow_execution=True,
         )
+
+
+def test_sidecar_client_emergency_ioc_still_requires_execution_opt_in():
+    client = OutcomeSdkSidecarClient("missing-sidecar")
+    with pytest.raises(OutcomeSdkSidecarError, match="explicit allow_execution"):
+        client.request("place_emergency_ioc_exit")  # type: ignore[arg-type]

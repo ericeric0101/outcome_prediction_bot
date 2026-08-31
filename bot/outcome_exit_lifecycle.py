@@ -65,6 +65,7 @@ class OutcomeExitLifecycleStore:
             if not isinstance(payload, dict) or payload.get("state") not in {
                 "SELL_RESTING", "LOSS_BAND_RESTING", "LOSS_BAND_UNFILLED",
                 "REVERSAL_CONFIRMED", "CANCEL_SUBMITTED", "RECONCILE_REQUIRED",
+                "EMERGENCY_CANCEL_SUBMITTED", "EMERGENCY_EXIT_SUBMITTED",
             }:
                 return None
             return OutcomeExitLifecycle(
@@ -76,6 +77,47 @@ class OutcomeExitLifecycleStore:
             )
         except (KeyError, TypeError, ValueError, sqlite3.Error, json.JSONDecodeError):
             return None
+
+    def loss_band_first_seen_ts(self, *, wallet: str, outcome_id: int, coin: str) -> float | None:
+        """Return durable first passive-loss evidence, never a guessed timer."""
+        try:
+            with sqlite3.connect(self.journal.db_path) as conn:
+                row = conn.execute(
+                    """
+                    SELECT ts FROM strategy_events
+                    WHERE event_type=?
+                      AND json_extract(payload_json, '$.venue')='hyperliquid_outcome'
+                      AND json_extract(payload_json, '$.wallet')=?
+                      AND CAST(json_extract(payload_json, '$.outcome_id') AS INTEGER)=?
+                      AND json_extract(payload_json, '$.coin')=?
+                      AND json_extract(payload_json, '$.state') IN ('LOSS_BAND_RESTING', 'LOSS_BAND_UNFILLED')
+                    ORDER BY id ASC LIMIT 1
+                    """, (self.EVENT, wallet, outcome_id, coin),
+                ).fetchone()
+            return datetime.fromisoformat(str(row[0])).timestamp() if row else None
+        except (TypeError, ValueError, sqlite3.Error):
+            return None
+
+    def emergency_attempted(self, *, wallet: str, outcome_id: int, coin: str) -> bool:
+        """One emergency IOC per Outcome position lifecycle, including restart."""
+        try:
+            with sqlite3.connect(self.journal.db_path) as conn:
+                row = conn.execute(
+                    """
+                    SELECT 1 FROM strategy_events
+                    WHERE event_type=?
+                      AND json_extract(payload_json, '$.venue')='hyperliquid_outcome'
+                      AND json_extract(payload_json, '$.wallet')=?
+                      AND CAST(json_extract(payload_json, '$.outcome_id') AS INTEGER)=?
+                      AND json_extract(payload_json, '$.coin')=?
+                      AND json_extract(payload_json, '$.state')='EMERGENCY_EXIT_SUBMITTED'
+                    LIMIT 1
+                    """, (self.EVENT, wallet, outcome_id, coin),
+                ).fetchone()
+            return row is not None
+        except sqlite3.Error:
+            # A journal failure must not reopen the one-shot execution budget.
+            return True
 
     def reconcile_owned_sell(self, *, wallet: str, outcome_id: int, coin: str, inventory: Decimal,
                               open_orders: list[dict[str, Any]]) -> OutcomeExitLifecycle | None:

@@ -32,6 +32,14 @@ from bot.outcome_exit_requote_controller import OutcomeExitRequoteController
 from bot.outcome_holding_path import OutcomeHoldingPathObservation, OutcomeHoldingPathRecorder
 from bot.outcome_reversal import OutcomeReversalClassifier, OutcomeReversalInput
 from bot.outcome_loss_reentry import OutcomeLossReentryGate
+from bot.outcome_emergency_exit import (
+    EmergencyExitAction,
+    OutcomeEmergencyExitController,
+    OutcomeEmergencyExitInput,
+    OutcomeEmergencyExitPolicy,
+    book_age_sec as emergency_book_age_sec,
+    parse_bid_levels,
+)
 
 
 @dataclass(frozen=True)
@@ -64,8 +72,19 @@ class OutcomeLiveExecutionRuntime:
         self.holding_path_recorder = OutcomeHoldingPathRecorder(ledger.journal, ledger.run_id) if ledger else None
         self.reversal_classifier = OutcomeReversalClassifier()
         self.loss_reentry_gate = OutcomeLossReentryGate(ledger.journal, ledger.run_id) if ledger else None
+        self.emergency_exit_policy = OutcomeEmergencyExitPolicy()
+        self.emergency_exit_controller = (
+            OutcomeEmergencyExitController(
+                account=account, gateway=self.machine.gateway, store=self.exit_lifecycle_store,
+                wallet=wallet, policy=self.emergency_exit_policy,
+            ) if self.exit_lifecycle_store else None
+        )
         self._holding_context: dict[int, dict[str, object]] = {}
         self._opposite_observation_counts: dict[tuple[int, str], int] = {}
+        # Emergency S3 requires three independently spaced confirmed samples.
+        # This state is intentionally reset on restart, which is conservative:
+        # a new process must observe the persistent reversal again.
+        self._emergency_reversal_windows: dict[tuple[int, str], tuple[float, float, int]] = {}
         # E5 is deliberately process-local.  A restart must never resume a
         # canary against an old position without a new explicit operator run.
         self._e5_canary_eligible_order_ids: set[str] = set()
@@ -380,7 +399,10 @@ class OutcomeLiveExecutionRuntime:
                 inventory = Decimal(str(getattr(finding, "inventory", "0")))
                 if (inventory <= 0 and previous is not None
                         and not any(str(row.get("oid")) == previous.order_id for row in open_orders)
-                        and previous.state in {"LOSS_BAND_RESTING", "LOSS_BAND_UNFILLED", "REVERSAL_CONFIRMED"}
+                        and previous.state in {
+                            "LOSS_BAND_RESTING", "LOSS_BAND_UNFILLED", "REVERSAL_CONFIRMED",
+                            "EMERGENCY_EXIT_SUBMITTED",
+                        }
                         and self.loss_reentry_gate is not None):
                     self.loss_reentry_gate.record_confirmed_loss_exit(
                         outcome_id=market.outcome_id, period=market.period,
@@ -439,13 +461,29 @@ class OutcomeLiveExecutionRuntime:
                 opposite = direction * spot_bps < 0 and direction * mark_bps < 0 and oi_bps > 0
             key = (market.outcome_id, coin)
             self._opposite_observation_counts[key] = self._opposite_observation_counts.get(key, 0) + 1 if opposite else 0
+            try:
+                oi_age_ms = int(evidence.get("oi_age_ms"))
+            except (TypeError, ValueError):
+                oi_age_ms = -1
+            context_fresh = 0 <= oi_age_ms <= 90_000
             decision = self.reversal_classifier.classify(OutcomeReversalInput(
-                side_index, vwap, bid, ask, spot_bps, mark_bps, oi_bps, True,
+                side_index, vwap, bid, ask, spot_bps, mark_bps, oi_bps, context_fresh,
                 self._opposite_observation_counts[key],
             ))
+            now = time.time()
+            if decision.state.value == "REVERSAL_CONFIRMED":
+                first_ts, last_independent_ts, count = self._emergency_reversal_windows.get(key, (now, 0.0, 0))
+                if last_independent_ts <= 0 or now - last_independent_ts >= 60.0:
+                    count += 1
+                    last_independent_ts = now
+                self._emergency_reversal_windows[key] = (first_ts, last_independent_ts, count)
+            else:
+                self._emergency_reversal_windows.pop(key, None)
             self.ledger.journal.log_strategy_event(self.ledger.run_id, "OUTCOME_REVERSAL_SHADOW_DECISION", {
                 "venue": "hyperliquid_outcome", "outcome_id": market.outcome_id, "period": market.period,
                 "coin": coin, "state": decision.state, "reason": decision.reason,
+                "oi_context_fresh": context_fresh,
+                "emergency_independent_observations": self._emergency_reversal_windows.get(key, (0.0, 0.0, 0))[2],
                 "execution_submitted": False,
             })
             if decision.state.value == "REVERSAL_CONFIRMED" and self.exit_lifecycle_store is not None:
@@ -459,6 +497,97 @@ class OutcomeLiveExecutionRuntime:
                     )
         except (sqlite3.Error, ValueError, TypeError, KeyError, IndexError, json.JSONDecodeError):
             return
+
+    def _live_entry_age_sec(self, *, market: OutcomeMarketSpec, coin: str) -> float | None:
+        if self.ledger is None:
+            return None
+        try:
+            with sqlite3.connect(self.ledger.journal.db_path) as conn:
+                row = conn.execute(
+                    """SELECT ts FROM strategy_events
+                       WHERE event_type='OUTCOME_LIVE_STRATEGY_ENTRY_PLACED'
+                         AND CAST(json_extract(payload_json, '$.outcome_id') AS INTEGER)=?
+                         AND json_extract(payload_json, '$.coin')=?
+                       ORDER BY id DESC LIMIT 1""",
+                    (market.outcome_id, coin),
+                ).fetchone()
+            return max(0.0, time.time() - datetime.fromisoformat(str(row[0])).timestamp()) if row else None
+        except (TypeError, ValueError, sqlite3.Error):
+            return None
+
+    def _maybe_emergency_exit(self, *, market: OutcomeMarketSpec, finding: object) -> LiveExecutionResult | None:
+        """Run S3 only after all passive/reversal/depth gates independently pass.
+
+        A failed candidate deliberately leaves the current ALO lifecycle to the
+        normal requote path; it never converts a stale/illiquid book into a
+        market order.
+        """
+        if self.ledger is None or self.exit_lifecycle_store is None or self.emergency_exit_controller is None:
+            return None
+        if not tuple(getattr(finding, "sell_order_ids", ())):
+            return None
+        coin = str(getattr(finding, "coin", ""))
+        inventory = Decimal(str(getattr(finding, "inventory", "0")))
+        lifecycle = self.exit_lifecycle_store.recover(
+            wallet=self.recovery.wallet, outcome_id=market.outcome_id, coin=coin,
+        )
+        if lifecycle is None or lifecycle.state == "EMERGENCY_EXIT_SUBMITTED":
+            return None
+        side_index = 0 if coin == market.yes_coin else 1
+        fill_vwap = self.machine._fill_vwap_for_inventory(coin=coin, inventory=inventory)
+        entry_age = self._live_entry_age_sec(market=market, coin=coin)
+        loss_since = self.exit_lifecycle_store.loss_band_first_seen_ts(
+            wallet=self.recovery.wallet, outcome_id=market.outcome_id, coin=coin,
+        )
+        window = self._emergency_reversal_windows.get((market.outcome_id, coin), (0.0, 0.0, 0))
+        try:
+            fees = self.recovery.account.get_user_fees_sync(self.recovery.wallet)
+            taker_fee = Decimal(str(fees["userSpotCrossRate"]))
+            book = self.machine.gateway.fetch_order_book(market=market, side_index=side_index)
+            bids = parse_bid_levels(book)
+            age = emergency_book_age_sec(book, now_ms=int(time.time() * 1000))
+        except (KeyError, TypeError, ValueError, ArithmeticError):
+            bids, age, taker_fee = None, None, None
+        item = OutcomeEmergencyExitInput(
+            inventory=inventory, fill_vwap=fill_vwap, taker_close_fee_rate=taker_fee,
+            bids=bids or (), book_age_sec=age, holding_age_sec=entry_age if entry_age is not None else -1.0,
+            loss_band_unfilled_sec=(time.time() - loss_since) if loss_since is not None else None,
+            reversal_independent_observations=window[2], reversal_duration_sec=(time.time() - window[0]) if window[0] > 0 else 0.0,
+            already_attempted=self.exit_lifecycle_store.emergency_attempted(
+                wallet=self.recovery.wallet, outcome_id=market.outcome_id, coin=coin,
+            ),
+        )
+        plan = self.emergency_exit_policy.plan(item)
+        self.ledger.journal.log_strategy_event(self.ledger.run_id, "OUTCOME_EMERGENCY_EXIT_DECISION", {
+            "venue": "hyperliquid_outcome", "outcome_id": market.outcome_id, "period": market.period,
+            "coin": coin, "lifecycle_order_id": lifecycle.order_id, "action": plan.action,
+            "reason": plan.reason, "inventory": str(inventory),
+            "holding_age_sec": item.holding_age_sec, "loss_band_unfilled_sec": item.loss_band_unfilled_sec,
+            "independent_reversal_observations": item.reversal_independent_observations,
+            "reversal_duration_sec": item.reversal_duration_sec, "book_age_sec": item.book_age_sec,
+            "limit_price": str(plan.limit_price) if plan.limit_price is not None else None,
+            "executable_vwap": str(plan.executable_vwap) if plan.executable_vwap is not None else None,
+            "net_return_pct": str(plan.net_return_pct) if plan.net_return_pct is not None else None,
+            "execution_submitted": False,
+        })
+        if plan.action is not EmergencyExitAction.EXECUTE:
+            return None
+        result = self.emergency_exit_controller.execute(
+            market=market, side_index=side_index, lifecycle=lifecycle, item=item, plan=plan,
+        )
+        if result.state == "emergency_exit_submitted":
+            self.ledger.journal.log_order_event(
+                self.ledger.run_id, "ORDER_SUBMIT", venue_order_id=result.emergency_order_id,
+                side="SELL", status="IOC_SUBMITTED", instrument_id=coin, reason=result.detail,
+                payload={
+                    "venue": "hyperliquid_outcome", "outcome_id": market.outcome_id, "coin": coin,
+                    "execution_type": "s3_price_protected_fak_ioc", "old_order_id": result.old_order_id,
+                    "limit_price": str(plan.limit_price), "planned_net_return_pct": str(plan.net_return_pct),
+                },
+            )
+            fills = self.recovery.account.get_user_fills_sync(self.recovery.wallet)
+            self.ledger.sync_fills(fills=fills, market_key=f"outcome:{market.outcome_id}", period=market.period)
+        return LiveExecutionResult(result.state, result.detail, result.emergency_order_id or result.old_order_id)
 
     def tick_market(self, *, market: OutcomeMarketSpec, entry_side_index: int | None) -> LiveExecutionResult:
         """Advance existing exposure first; only a flat market accepts a signal."""
@@ -595,12 +724,22 @@ class OutcomeLiveExecutionRuntime:
         if self.ledger is None:
             return LiveExecutionResult("blocked", "live strategy requires an execution ledger")
         self._holding_context[market.outcome_id] = dict(market_context or entry_evidence)
-        health_error = self._stream_ready(market)
-        if health_error:
-            return health_error
         config = OutcomeLiveStrategyConfig.from_env()
         tracked_markets = (market, *retiring_markets)
         report = self.recovery.reconcile(tracked_markets)
+        # An IOC may fill between the previous tick and this account snapshot.
+        # Import official fills before evaluating its durable loss/re-entry
+        # consequence; otherwise an emergency close could be misclassified as
+        # merely a missing order.
+        try:
+            self.ledger.sync_fills(
+                fills=self.recovery.account.get_user_fills_sync(self.recovery.wallet),
+                market_key=f"outcome:{market.outcome_id}", period=market.period,
+            )
+        except Exception:
+            # Account recovery remains the hard safety source; missing fill
+            # history means no inferred loss/re-entry transition.
+            pass
         self._reconcile_exit_lifecycles(market=market, report=report)
         retired_active = [
             finding for finding in report.findings
@@ -614,6 +753,16 @@ class OutcomeLiveExecutionRuntime:
         active = [finding for finding in report.findings if finding.market_id == market.outcome_id and finding.state != "flat"]
         if len(active) == 1:
             self._capture_holding_path(market=market, finding=active[0])
+            # S3 deliberately uses a freshly fetched REST L2 depth walk, not
+            # the WebSocket cache.  It may therefore assess an already-held
+            # position even when the stream only blocks *new* entries.
+            emergency = self._maybe_emergency_exit(market=market, finding=active[0])
+            if emergency is not None:
+                return emergency
+        health_error = self._stream_ready(market)
+        if health_error:
+            return health_error
+        if len(active) == 1:
             requote = self._maybe_requote_p3_exit(market=market, finding=active[0])
             if requote is not None:
                 return requote

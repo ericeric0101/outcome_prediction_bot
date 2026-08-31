@@ -339,7 +339,23 @@ SELL_RESTING
 | **S2-3 — durable post-loss re-entry gate（完成；保守同市場封鎖）** | 只有 managed loss/reversal lifecycle 已由 account truth 確認 inventory=0、owned sell 不在 open orders，且同一 `venue_order_id` 具有 official `userFills`-derived `ORDER_FILLED` 時，才寫 `OUTCOME_LOSS_EXIT_CONFIRMED`。該 event 不是由 UI、PnL、掛出 loss quote 或不同 sell order 推論。第一版不臆造 cooldown 秒數：同一 Outcome market 一旦有 confirmed loss exit，S0 直接拒絕任何新 entry 至 market rollover。 | 此為安全的先行 gate；recovery-time/OOS 資料足夠後，才可另行修訂為校準後的 cooldown + classifier 條件，而非解除保護。 |
 | **S2-4 — limited live canary** | 只在 S2-0 至 S2-3 各自通過後，以既有 $11、單一 inventory/order、完整 journal、kill switch、同一 daily market做一個 bounded canary。 | 先驗證 lifecycle correctness，不因少量成功提高 size；若有 unmanaged order、stale data、未對帳 fill 或 official settlement 缺口，立即停止新 entry。 |
 
-**S2 後的決策規則。** 真正需要「無論跌至 -20% 都保證退出」時，技術上必須另行核准 taker/marketable emergency exit；那是與目前 ALO-only 原則不同的風險交易，不能由 S2 或「reversal」名稱自動授權。若維持 ALO-only，S2 的可交付物是更早辨識、被動減損、避免重複進場與可量化尾端風險，而不是保證成交。
+**S2 後的決策規則。** S2 本身仍只負責早期辨識、被動減損、避免重複進場與量化尾端風險；它不是 guaranteed stop。操作者已於 2026-08-31 另行核准下列 S3 受限 emergency IOC path。它是不同於 ALO-only 的高風險權限，絕不可由 S2 classifier、一般 `reversal` 名稱或提高資金自行推導。
+
+### S3 — price-protected emergency IOC exit（實作完成；尚無主網實際成交證據）
+
+**授權目的與邊界。** S3 是 daily BTC position 的尾端風險保險，不是一般止損、更不是裸市價單。它只處理本 runtime 已管理、已持倉、已有 owned passive sell 的單一 Outcome side；不開新倉、不買入、不接受小數 shares、不掃過價格下限、不因 UI PnL 或單一 BTC tick 觸發。出場透過官方 TypeScript HIP-4 SDK 的 `limit` + `FAK`（Hyperliquid IOC 語意）送出；Python sidecar 僅暴露 `place_emergency_ioc_exit` 這個固定 SELL 路徑，**不**暴露通用 market-order command。
+
+| S3 gate／動作 | 固定正式 policy（不新增 `.env`／shell 參數） | Fail-closed 行為 |
+|---|---|---|
+| 持有與被動等待 | confirmed fill 起算至少 **2 小時**；durable `LOSS_BAND_RESTING`／`LOSS_BAND_UNFILLED` 首次 evidence 後至少 **20 分鐘**仍未成交。 | 維持既有 ALO；不取消、不 IOC。 |
+| 持續反轉 | S2 spot/mark/OI opposite evidence 必須當下 OI age ≤90 秒、book 合法，且有 **3 個至少相隔 60 秒**的 `REVERSAL_CONFIRMED` sample（首末至少 120 秒）。process restart 會重新累積，較保守。 | 缺資料、stale context、短暫抖動或 sample 不足皆不觸發。 |
+| 損失與深度 | 以 **taker `userSpotCrossRate`**、完整 raw REST L2 bids 逐檔 depth-walk 計算，不用 mid。費後 full-inventory executable loss 必須已達 **-8%** trigger；且所有庫存都能在費後 **不差於 -12%** 的 price cap 成交。limit floor = `ceil_to_tick(fill_VWAP × 0.88 / (1 - taker_fee))`。 | 任一股數深度不足、book timestamp 超過 15 秒、價格在 cap 以下或 fee/VWAP 不可驗證，都不送單。 |
+| 原子流程 | 驗證 lifecycle ownership + 帳戶 inventory → cancel old ALO → 官方 open-order readback 確認取消 → inventory readback 必須完全不變 → 重抓 REST L2 並重新 depth-walk → 才送 full-size FAK/IOC limit SELL。 | old sell 未消失、cancel/fill race、partial inventory、fresh L2 改變或 SDK reject 一律 `RECONCILE_REQUIRED`；下一 tick 回復 verified passive-exit 流程，絕不送無上限 market order。 |
+| 次數／後果 | 每個同一 market/coin lifecycle 最多 **一次** emergency attempt；提交成功不等於成交。只有 official `userFills` 寫入 `ORDER_FILLED`、account truth 顯示 flat 且 order 不在 open orders，才視為 real close 並套用 S2-3「同 market 至 rollover 禁止 re-entry」。 | 無 fill、partial fill 或 journal 不可讀時不得假設已止損，不重送 IOC；保留/重建 ALO 並要求 reconciliation。 |
+
+**不可同時保證的事。** 「一定退出」與「最大虧損絕不超過 -12%」在薄書／跳空時無法同時成立。S3 的優先序是**先守價格上限**：若市場已只剩 -20% 以下的買方，IOC 不會送出，資金仍可能保留到被動成交、反彈或官方結算。這是刻意選擇，不得在告警時偷偷改成 unrestricted market sell。相反地，若完整庫存可在 cap 以上成交，FAK 會立即成交可成交部分並取消其餘，故實際 `userFills`、fee 與剩餘 inventory 必須再對帳。
+
+**程式與驗證（2026-08-31）。** `bot/outcome_emergency_exit.py` 為純 policy、strict L2 parser/depth walker 與 cancel-confirm-fresh-book controller；`bot/outcome_execution_gateway.py` 只傳 `marketId/outcome/limit price/integer inventory` 給 official SDK sidecar；`bot/outcome_live_execution_runtime.py` 在 existing inventory 的 normal re-quote 之前執行 S3，且 S3 允許在 WS 僅阻擋**新 entry**時以 fresh REST L2 評估既有持倉。每次 decision 寫入 `OUTCOME_EMERGENCY_EXIT_DECISION`，提交寫 `OUTCOME_EXIT_LIFECYCLE(state=EMERGENCY_EXIT_SUBMITTED)` 和 `ORDER_SUBMIT(execution_type=s3_price_protected_fak_ioc)`；actual close 仍只採 official fill。unit/controller/runtime fixtures 驗證滿足全 gate 才送 IOC、取消未確認/partial race/深度不足/stale book 絕不送 IOC，定向測試 **49 passed**、完整 regression **463 passed**；official sidecar `npm run build` 通過。這是 code/fixture verification，不是主網成交證據；在首筆 S3 real fill 前不得宣稱 -12% 被市場驗證或放大 size。
 
 **1d horizon clarification (2026-08-30):** The current S0 `mark_return` and `OI_return` use a 5-minute lookback. That is intentionally an **entry-timing / short-term momentum confirmation**, not a forecast that the 1d contract will resolve UP or DOWN. It is therefore expected that spot can be hundreds of dollars above strike while S0 refuses a new YES entry: a flat or falling most-recent five-minute Binance mark, or insufficient OI increase, fails the timing gate. The mismatch is real and must not be hidden by relaxing the threshold ad hoc. For 1d directional alpha, X4 must evaluate multi-horizon, strictly as-of features (at least 5m, 15m, 1h and daily-instance/time-left context) against a market-only baseline using purged walk-forward validation. Until that evidence exists, 5m remains a deliberately conservative confirmation filter; it must neither be described as a daily predictor nor be used alone to choose side.
 
@@ -648,6 +664,8 @@ flowchart TD
     CANCEL --> SYNC["重讀 fills / inventory / open orders / fresh L2"]
     SYNC -->|一致且仍為 passive| REPLACE["提交 replacement ALO SELL"]
     SYNC -->|不一致或 crossing| RECON["RECONCILE_REQUIRED；不送 replacement"]
+    FILL -->|S3 gates 全部成立| IOC["price-protected FAK/IOC SELL（最多一次）"]
+    IOC --> VERIFY["official fills + account truth 對帳"]
     FILL -->|持倉至到期| SETTLE["等待官方結算 evidence"]
     SETTLE -->|official resolution confirms winner| WIN["確認 payout 後才錄入 MARKET_SETTLEMENT"]
     SETTLE -->|evidence unavailable| BLOCK["維持 blocked；不得自行推論"]
@@ -658,10 +676,10 @@ flowchart TD
    - 報價重掛機制（Requote Hysteresis）：若價格變動小於門檻跳數，維持原單佇列優先權（Queue Priority）。
 2. **獲利止盈 (Take-Profit)**：
    - 以 official `userFills` FIFO 重建仍持有庫存的 confirmed fill VWAP，計算 fee-adjusted target；不得把聚合帳戶成本或固定 `0.97` 假裝成每筆真實 take-profit。
-3. **失效／風險降低 (Maker-Only Risk Reduction)**：
+3. **失效／風險降低 (ALO-first；S3 例外)**：
    - 現行 Outcome 正式 runtime 只允許 ALO/post-only。達到 loss、time、markout 或流動性條件時，只能依 E0–E4 cancel/replace state machine 重新掛被動 SELL；它不是 guaranteed stop-loss。
    - 每次 replacement 必須先確認舊單已取消、重新同步 partial fills／inventory／open orders，並在 fresh L2 上驗證 `sell price > best_bid`。任何 cancel/fill race、stale book 或 crossing 均 fail-closed。
-   - **IOC／FAK／marketable SELL 目前禁止。** 若未來要加入 taker emergency exit，必須另立 authority revision、獨立操作者 gate、可接受滑價的 depth-walk、P3 真實 evidence 與完整測試；不得由「緊急」或「放大到 100 USDC」自行推導授權。
+   - **S3 唯一例外（2026-08-31 已授權／實作）：** 僅可對已驗證持倉送 full-size、price-protected `FAK`／IOC SELL；必須先通過 2h holding、20m passive loss-band 未成交、3 個獨立 persistent reversal、fresh REST full-depth、fee-inclusive -8% trigger 與 -12% cap。它不是 unrestricted market order，也不支援 buy／重試／擴大 size。任何其他 IOC／FAK／marketable SELL 仍禁止。
 
 ---
 

@@ -388,3 +388,41 @@ def test_runtime_closes_stale_lifecycle_after_exchange_fill_reconciliation(monke
     runtime = OutcomeLiveExecutionRuntime(account=Account(), wallet="w", gateway=Gateway(), ledger=ledger, exit_lifecycle_store=store)
     runtime.tick_market(market=market(), entry_side_index=None)
     assert store.recover(wallet="w", outcome_id=1153, coin="#11530") is None
+
+
+def test_s3_emergency_exit_requires_durable_loss_band_then_uses_price_protected_ioc(monkeypatch, tmp_path):
+    """The runtime never reaches the IOC boundary without every S3 evidence gate."""
+    journal = TradeJournalDB(tmp_path / "s3.db")
+    ledger = OutcomeExecutionLedger(journal, "run")
+    journal.log_strategy_event("run", "OUTCOME_LIVE_STRATEGY_ENTRY_PLACED", {
+        "outcome_id": 1153, "coin": "#11530", "target_return_pct": "0.05", "loss_reprice_pct": "0.05",
+        "maker_close_fee_rate": "0.0004", "narrow_after_sec": 3600, "narrow_return_pct": "0.03",
+        "floor_after_sec": 7200, "floor_return_pct": "0.02", "entry_evidence": {"oi_age_ms": 1},
+    })
+    class FilledAccount(CalibrationAccount):
+        def __init__(self): super().__init__(balances=[{"coin": "+11530", "total": "13", "entryNtl": "10.4"}], orders=[{"coin": "#11530", "side": "A", "oid": "old-sell", "sz": "13"}])
+        def get_user_fills_sync(self, _): return [{"coin": "#11530", "side": "B", "px": "0.80", "sz": "13", "time": 1}]
+    class EmergencyGateway(Gateway):
+        def __init__(self, account): self.account, self.calls = account, []
+        def fetch_order_book(self, **_):
+            return {"timestamp": int(base * 1000), "bids": [{"price": "0.730", "size": "20"}], "asks": [{"price": "0.731", "size": "20"}]}
+        def cancel_owned_order(self, **kwargs):
+            self.calls.append(("cancel", kwargs)); self.account.orders = []; return {}
+        def place_price_protected_ioc_exit(self, **kwargs): self.calls.append(("ioc", kwargs)); return {"orderId": "ioc-1", "status": "filled"}
+    base = time.time() + 7201
+    account = FilledAccount()
+    gateway = EmergencyGateway(account)
+    store = OutcomeExitLifecycleStore(journal, "run")
+    lifecycle = OutcomeExitLifecycle("w", 1153, "#11530", "old-sell", Decimal("13"), Decimal("0.76"), 0, "LOSS_BAND_UNFILLED")
+    store.record(lifecycle, reason="fixture")
+    runtime = OutcomeLiveExecutionRuntime(account=account, wallet="w", gateway=gateway, ledger=ledger, exit_lifecycle_store=store)
+    runtime._emergency_reversal_windows[(1153, "#11530")] = (base - 121, base - 1, 3)
+    monkeypatch.setattr("bot.outcome_live_execution_runtime.time.time", lambda: base)
+    monkeypatch.setattr("bot.outcome_emergency_exit.time.time", lambda: base)
+
+    finding = type("Finding", (), {"coin": "#11530", "inventory": Decimal("13"), "sell_order_ids": ("old-sell",)})()
+    result = runtime._maybe_emergency_exit(market=market(), finding=finding)
+
+    assert result is not None and result.state == "emergency_exit_submitted"
+    assert [name for name, _ in gateway.calls] == ["cancel", "ioc"]
+    assert gateway.calls[-1][1]["limit_price"] == Decimal("0.70450")

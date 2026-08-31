@@ -92,6 +92,35 @@ class OutcomeExecutionGateway:
             payload={"marketId": str(market.outcome_id), "outcome": self.outcome_coin(market, side_index)},
         )
 
+    def place_price_protected_ioc_exit(
+        self, *, market: OutcomeMarketSpec, side_index: int, limit_price: Decimal,
+        requested_shares: Decimal,
+    ) -> dict[str, Any]:
+        """Submit one reduce-only, price-capped FAK/IOC exit via the official SDK.
+
+        This is intentionally narrow: it can only sell a wallet-reconciled
+        integral inventory at a caller-provided limit.  It never accepts a
+        buy, a raw market order, a fractional amount, or an opening-order
+        minimum-notional path.
+        """
+        shares = whole_share_size(limit_price, requested_shares, enforce_minimum=False)
+        if shares <= 0:
+            raise ValueError("Outcome emergency IOC exit requires positive whole inventory")
+        result = self.sidecar.request(
+            "place_emergency_ioc_exit",
+            payload={
+                "marketId": str(market.outcome_id),
+                "outcome": self.outcome_coin(market, side_index),
+                "price": str(limit_price),
+                "amount": str(shares),
+                "skipMinNotionalCheck": True,
+            },
+            allow_execution=True,
+        )
+        if not result.get("orderId"):
+            raise RuntimeError(f"Outcome price-protected IOC exit was not accepted: {result}")
+        return {**result, "shares": shares, "coin": self.outcome_coin(market, side_index)}
+
     def cancel_owned_order(self, *, market: OutcomeMarketSpec, side_index: int, order_id: str) -> dict[str, Any]:
         return self.sidecar.request(
             "cancel_order",

@@ -69,3 +69,29 @@ def test_gateway_rejects_subminimum_sell_without_reduce_only_attestation():
 def test_gateway_rejects_fractional_reduce_only_inventory():
     with pytest.raises(ValueError, match="integer number of shares"):
         whole_share_size(Decimal("0.78"), Decimal("3.1"), enforce_minimum=False)
+
+
+def test_gateway_emergency_exit_is_sell_only_price_protected_ioc_contract():
+    calls = []
+
+    class Sidecar:
+        def request(self, command, **kwargs):
+            calls.append((command, kwargs))
+            return {"status": "filled", "orderId": "44"}
+
+    result = OutcomeExecutionGateway(Sidecar()).place_price_protected_ioc_exit(
+        market=_market(), side_index=0, limit_price=Decimal("0.704"), requested_shares=Decimal("13"),
+    )
+
+    assert result["shares"] == 13
+    assert calls == [("place_emergency_ioc_exit", {"payload": {
+        "marketId": "1153", "outcome": "#11530", "price": "0.704", "amount": "13",
+        "skipMinNotionalCheck": True,
+    }, "allow_execution": True})]
+
+
+def test_gateway_emergency_exit_rejects_fractional_inventory():
+    with pytest.raises(ValueError, match="integer number of shares"):
+        OutcomeExecutionGateway(object()).place_price_protected_ioc_exit(  # type: ignore[arg-type]
+            market=_market(), side_index=0, limit_price=Decimal("0.704"), requested_shares=Decimal("13.1"),
+        )

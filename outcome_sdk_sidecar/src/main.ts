@@ -4,7 +4,7 @@ import type { DefaultBinaryMarket } from "@outcome.xyz/hip4";
 import { privateKeyToAccount } from "viem/accounts";
 import { createInterface } from "node:readline";
 
-type Command = "health" | "fetch_markets" | "fetch_order_book" | "fetch_settled_outcome" | "fetch_account_snapshot" | "place_limit_order" | "cancel_order" | "merge_outcome";
+type Command = "health" | "fetch_markets" | "fetch_order_book" | "fetch_settled_outcome" | "fetch_account_snapshot" | "place_limit_order" | "place_emergency_ioc_exit" | "cancel_order" | "merge_outcome";
 type Request = { id: string; command: Command; testnet?: boolean; payload?: Record<string, unknown> };
 type Response = { id: string; ok: boolean; result?: unknown; error?: { code: string; message: string } };
 type LimitOrderPayload = { marketId: string; outcome: string; side: "buy" | "sell"; price: string; amount: string; timeInForce?: "GTC" | "GTD" | "FOK" | "FAK" | "ALO"; skipMinNotionalCheck?: boolean };
@@ -86,8 +86,8 @@ async function requireAloIsMaker(hip4: ReturnType<typeof createHIP4Adapter>, pay
 
 async function handle(request: Request): Promise<Response> {
   if (request.command === "health") return { id: request.id, ok: true, result: { protocol: "outcome-sdk-sidecar/v1", execution: "disabled_by_default" } };
-  if (!(["fetch_markets", "fetch_order_book", "fetch_settled_outcome", "fetch_account_snapshot", "place_limit_order", "cancel_order", "merge_outcome"] as string[]).includes(request.command)) return { id: request.id, ok: false, error: { code: "UNKNOWN_COMMAND", message: request.command } };
-  if ((request.command === "place_limit_order" || request.command === "cancel_order" || request.command === "merge_outcome") && !executionEnabled()) return { id: request.id, ok: false, error: { code: "EXECUTION_DISABLED", message: "Set OUTCOME_SDK_EXECUTION_ENABLED=1 after explicit operator approval." } };
+  if (!(["fetch_markets", "fetch_order_book", "fetch_settled_outcome", "fetch_account_snapshot", "place_limit_order", "place_emergency_ioc_exit", "cancel_order", "merge_outcome"] as string[]).includes(request.command)) return { id: request.id, ok: false, error: { code: "UNKNOWN_COMMAND", message: request.command } };
+  if ((request.command === "place_limit_order" || request.command === "place_emergency_ioc_exit" || request.command === "cancel_order" || request.command === "merge_outcome") && !executionEnabled()) return { id: request.id, ok: false, error: { code: "EXECUTION_DISABLED", message: "Set OUTCOME_SDK_EXECUTION_ENABLED=1 after explicit operator approval." } };
   const hip4 = createHIP4Adapter({ testnet: request.testnet ?? false });
   await hip4.initialize();
   if (request.command === "fetch_markets") {
@@ -121,6 +121,16 @@ async function handle(request: Request): Promise<Response> {
     await requireAloIsMaker(hip4, payload, sideIndex);
     const result = await hip4.trading.placeOrder({ ...payload, type: "limit" });
     return result.success ? { id: request.id, ok: true, result } : { id: request.id, ok: false, result, error: { code: "ORDER_REJECTED", message: result.error ?? "Outcome rejected order" } };
+  }
+  if (request.command === "place_emergency_ioc_exit") {
+    // This deliberately does *not* expose a general market-order surface.
+    // The Python policy has already depth-walked the whole inventory and
+    // supplied its loss-cap price.  FAK maps to Hyperliquid's IOC semantics:
+    // fill only at-or-better than this limit, then cancel any remainder.
+    const payload = parseLimitPayload({ ...request.payload, side: "sell", timeInForce: "FAK", skipMinNotionalCheck: true });
+    await requireMarketSide(hip4, payload.marketId, payload.outcome);
+    const result = await hip4.trading.placeOrder({ ...payload, type: "limit" });
+    return result.success ? { id: request.id, ok: true, result } : { id: request.id, ok: false, result, error: { code: "EMERGENCY_IOC_REJECTED", message: result.error ?? "Outcome rejected emergency IOC exit" } };
   }
   if (request.command === "merge_outcome") {
     if (process.env.OUTCOME_SETTLEMENT_ACTION_ENABLED !== "1") return { id: request.id, ok: false, error: { code: "SETTLEMENT_ACTION_DISABLED", message: "Set OUTCOME_SETTLEMENT_ACTION_ENABLED=1 after explicit operator approval." } };
