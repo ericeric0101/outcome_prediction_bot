@@ -950,6 +950,65 @@ class TradeJournalDB:
             logger.debug(f"TradeJournalDB log_outcome_fill_once failed: {e}")
             return False
 
+    def verified_outcome_fill_vwap_for_inventory(
+        self, *, coin: str, inventory: Decimal,
+    ) -> Optional[Decimal]:
+        """Rebuild remaining FIFO lots from locally verified HIP-4 fills.
+
+        This is deliberately a *fallback* to the exchange's ``userFills``
+        response.  It is usable only when the durable journal reconstructs the
+        exact currently reconciled inventory, so a partial local history can
+        never turn into an invented entry price.
+        """
+        if inventory <= 0:
+            return None
+        try:
+            with self._connect() as conn:
+                rows = conn.execute(
+                    """
+                    SELECT side, price, qty
+                    FROM order_events
+                    WHERE event_type='ORDER_FILLED'
+                      AND instrument_id=?
+                      AND json_extract(payload_json, '$.venue')='hyperliquid_outcome'
+                      AND json_extract(payload_json, '$.actual_fill')=1
+                    ORDER BY CAST(json_extract(payload_json, '$.timestamp_ms') AS INTEGER), id
+                    """,
+                    (str(coin),),
+                ).fetchall()
+        except (sqlite3.Error, ValueError):
+            return None
+
+        lots: list[list[Decimal]] = []
+        try:
+            for side, price_raw, qty_raw in rows:
+                quantity, price = Decimal(str(qty_raw)), Decimal(str(price_raw))
+                if quantity <= 0 or not Decimal("0") < price < Decimal("1"):
+                    return None
+                normalized_side = str(side or "").upper()
+                if normalized_side == "BUY":
+                    lots.append([quantity, price])
+                elif normalized_side == "SELL":
+                    remaining = quantity
+                    while remaining > 0 and lots:
+                        lot = lots[0]
+                        consumed = min(remaining, lot[0])
+                        lot[0] -= consumed
+                        remaining -= consumed
+                        if lot[0] == 0:
+                            lots.pop(0)
+                    if remaining > 0:
+                        return None
+                else:
+                    return None
+        except (ArithmeticError, ValueError):
+            return None
+
+        reconstructed = sum((lot[0] for lot in lots), Decimal("0"))
+        if reconstructed != inventory:
+            return None
+        return sum((lot[0] * lot[1] for lot in lots), Decimal("0")) / inventory
+
     def repair_duplicate_outcome_fills(self, *, run_id: str, dry_run: bool = True) -> Dict[str, int]:
         """Remove only proven duplicate HIP-4 fill rows, preserving the first fact.
 

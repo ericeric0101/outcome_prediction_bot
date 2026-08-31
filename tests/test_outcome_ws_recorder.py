@@ -1,6 +1,8 @@
 import json
 import sqlite3
+from decimal import Decimal
 
+from bot.pricing.outcome_pricing import OutcomePricingState
 from bot.outcome_ws_recorder import OutcomeWebSocketRecorder
 from monitoring.trade_journal_db import TradeJournalDB
 
@@ -46,3 +48,15 @@ def test_ws_recorder_unregisters_callbacks_when_stopped():
     recorder._register_callbacks()
     recorder._unregister_callbacks()
     assert all(not callbacks for callbacks in client.callbacks.values())
+
+
+def test_l2_callback_keeps_terminal_pricing_cache_fresh(tmp_path):
+    pricing = OutcomePricingState(stale_timeout_sec=5)
+    recorder = OutcomeWebSocketRecorder(
+        CallbackClient(), TradeJournalDB(tmp_path / "stream.db"), "stream-run", pricing_state=pricing,
+    )
+    recorder._on_l2({"channel": "l2Book", "data": {
+        "coin": "#11450", "time": 456,
+        "levels": [[{"px": "0.60", "sz": "10"}], [{"px": "0.61", "sz": "11"}]],
+    }})
+    assert pricing.get_best_bid_ask("#11450") == (Decimal("0.60"), Decimal("0.61"))

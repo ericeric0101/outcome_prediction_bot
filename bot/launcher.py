@@ -313,7 +313,10 @@ def run_integrated_hyperliquid_bot(
                     if live_ws_recorder is None or live_ws_recorder._market_id != market.outcome_id:
                         if live_ws_recorder is not None:
                             live_ws_recorder.stop()
-                        live_ws_recorder = OutcomeWebSocketRecorder(client, live_journal, f"outcome-live-ws-{uuid.uuid4().hex[:10]}")
+                        live_ws_recorder = OutcomeWebSocketRecorder(
+                            client, live_journal, f"outcome-live-ws-{uuid.uuid4().hex[:10]}",
+                            pricing_state=pricing,
+                        )
                     live_ws_recorder.start(outcome_id=market.outcome_id, yes_coin=market.yes_coin, no_coin=market.no_coin)
                     if live_ws_recorder.resync_required.is_set():
                         # The REST reads above are the mandatory post-connect

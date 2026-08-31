@@ -8,10 +8,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Any, Literal, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 from bot.lifecycle.outcome_lifecycle import OutcomeMarketSpec
 from bot.outcome_execution_gateway import OutcomeExecutionGateway
+
+if TYPE_CHECKING:
+    from monitoring.trade_journal_db import TradeJournalDB
 
 
 class AccountReader(Protocol):
@@ -31,10 +34,12 @@ class MakerTickResult:
 class OutcomeMakerStateMachine:
     """Venue state machine; strategy decides only whether entry is permitted."""
 
-    def __init__(self, *, account: AccountReader, gateway: OutcomeExecutionGateway, wallet: str) -> None:
+    def __init__(self, *, account: AccountReader, gateway: OutcomeExecutionGateway, wallet: str,
+                 journal: "TradeJournalDB | None" = None) -> None:
         self.account = account
         self.gateway = gateway
         self.wallet = wallet
+        self.journal = journal
 
     @staticmethod
     def _coin_position(state: dict[str, Any], coin: str) -> tuple[Decimal, Decimal]:
@@ -92,13 +97,13 @@ class OutcomeMakerStateMachine:
         unverifiable price.
         """
         get_fills = getattr(self.account, "get_user_fills_sync", None)
-        if not callable(get_fills) or inventory <= 0:
+        if inventory <= 0:
             return None
         lots: list[list[Decimal]] = []
         try:
-            fills = sorted(get_fills(self.wallet), key=lambda fill: int(fill.get("time", 0)))
+            fills = sorted(get_fills(self.wallet), key=lambda fill: int(fill.get("time", 0))) if callable(get_fills) else []
         except (TypeError, ValueError):
-            return None
+            fills = []
         for raw in fills:
             if str(raw.get("coin")) != coin:
                 continue
@@ -122,11 +127,17 @@ class OutcomeMakerStateMachine:
                     if lot[0] == 0:
                         lots.pop(0)
                 if remaining > 0:
-                    return None
+                    lots = []
+                    break
         reconstructed_quantity = sum((lot[0] for lot in lots), Decimal("0"))
-        if reconstructed_quantity != inventory:
-            return None
-        return sum((lot[0] * lot[1] for lot in lots), Decimal("0")) / inventory
+        if reconstructed_quantity == inventory:
+            return sum((lot[0] * lot[1] for lot in lots), Decimal("0")) / inventory
+        # ``userFills`` can be temporarily incomplete after a restart or API
+        # window change.  A durable locally verified stream may repair that
+        # only when it exactly reconciles the current exchange inventory.
+        if self.journal is not None:
+            return self.journal.verified_outcome_fill_vwap_for_inventory(coin=coin, inventory=inventory)
+        return None
 
     def tick(
         self, *, market: OutcomeMarketSpec, side_index: int, entry_permitted: bool,

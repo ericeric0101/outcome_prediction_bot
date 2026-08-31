@@ -14,8 +14,13 @@ from bot.outcome_stream_health import OutcomeStreamHealth
 class OutcomeWebSocketRecorder:
     """Persist raw market stream messages; no trading client method is called."""
 
-    def __init__(self, client: Any, journal: TradeJournalDB, run_id: str) -> None:
+    def __init__(self, client: Any, journal: TradeJournalDB, run_id: str, *, pricing_state: Any | None = None) -> None:
         self.client, self.journal, self.run_id = client, journal, run_id
+        # The recorder is the single subscription owner for the live launcher.
+        # Feeding its *received* L2 snapshots into the display cache prevents a
+        # slow research write from making terminal BBOs look empty.  Execution
+        # still independently fetches a fresh REST book before any order.
+        self.pricing_state = pricing_state
         self._market_id: Optional[int] = None
         self._coins: tuple[str, str] = ("", "")
         self._thread: Optional[threading.Thread] = None
@@ -60,10 +65,17 @@ class OutcomeWebSocketRecorder:
             self.resync_required.set()
 
     def _on_l2(self, payload: Mapping[str, Any]) -> None:
-        self._record("OUTCOME_WS_L2_BOOK", payload)
         data = payload.get("data")
         if isinstance(data, Mapping) and isinstance(data.get("coin"), str):
+            if self.pricing_state is not None:
+                try:
+                    self.pricing_state.update_l2_book(str(data["coin"]), dict(data))
+                except Exception:
+                    # Recording and stream health must remain available even if
+                    # a malformed display update is rejected.
+                    pass
             self.health.on_l2_book(data["coin"])
+        self._record("OUTCOME_WS_L2_BOOK", payload)
 
     def _on_mids(self, payload: Mapping[str, Any]) -> None:
         self._record("OUTCOME_WS_ALL_MIDS", payload)

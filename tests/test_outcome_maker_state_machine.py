@@ -2,6 +2,7 @@ from decimal import Decimal
 
 from bot.lifecycle.outcome_lifecycle import OutcomeMarketSpec
 from bot.outcome_maker_state_machine import OutcomeMakerStateMachine
+from monitoring.trade_journal_db import TradeJournalDB
 
 
 def market():
@@ -79,6 +80,26 @@ def test_calibration_refuses_unverifiable_account_entry_notional():
     assert result.state == "blocked"
     assert "cannot verify fill VWAP" in result.detail
     assert not gateway.calls
+
+
+def test_calibration_uses_exact_durable_fill_fallback_when_userfills_is_incomplete(tmp_path):
+    journal = TradeJournalDB(tmp_path / "journal.db")
+    journal.log_outcome_fill_once(
+        "run", trade_id="verified-entry", side="BUY", price=0.80, qty=13,
+        status="FILLED", instrument_id="#11530", commission_usdc=0,
+        payload={"venue": "hyperliquid_outcome", "actual_fill": True, "timestamp_ms": 1},
+    )
+    gateway = Gateway()
+    account = Account("0")
+    account.get_spot_clearinghouse_state_sync = lambda _: {"balances": [{"coin": "+11530", "total": "13", "entryNtl": "10"}]}
+    # Simulate a transient userFills window that no longer contains the buy.
+    account.get_user_fills_sync = lambda _: []
+    result = OutcomeMakerStateMachine(account=account, gateway=gateway, wallet="w", journal=journal).tick(
+        market=market(), side_index=0, entry_permitted=False,
+        minimum_return_pct=Decimal("0.05"), maker_close_fee_rate=Decimal("0.0004"),
+    )
+    assert result.state == "sell_placed"
+    assert result.audit is not None and Decimal(result.audit["fill_entry_vwap"]) == Decimal("0.80")
 
 
 def test_calibration_loss_band_cancels_old_profit_sell_without_taking():

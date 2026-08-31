@@ -52,7 +52,10 @@ class LiveExecutionResult:
 class OutcomeLiveExecutionRuntime:
     def __init__(self, *, account: OutcomeClient, wallet: str, gateway: OutcomeExecutionGateway | None = None, risk_gate: OutcomePreTradeRiskGate | None = None, stream_health: OutcomeStreamHealth | None = None, ledger: OutcomeExecutionLedger | None = None, research_gate: OutcomeResearchGate | None = None, exit_planner: OutcomeExitQuotePlanner | None = None, exit_lifecycle_store: OutcomeExitLifecycleStore | None = None, exit_requote_controller: OutcomeExitRequoteController | None = None) -> None:
         self.recovery = OutcomeAccountRecovery(account=account, wallet=wallet)
-        self.machine = OutcomeMakerStateMachine(account=account, gateway=gateway or OutcomeExecutionGateway(), wallet=wallet)
+        self.machine = OutcomeMakerStateMachine(
+            account=account, gateway=gateway or OutcomeExecutionGateway(), wallet=wallet,
+            journal=ledger.journal if ledger else None,
+        )
         self.risk_gate = risk_gate or OutcomePreTradeRiskGate(OutcomeRiskLimits(
             max_entry_notional_usdc=Decimal(os.environ.get("OUTCOME_MAX_ENTRY_NOTIONAL_USDC", "11")),
             max_total_outcome_exposure_usdc=Decimal(os.environ.get("OUTCOME_MAX_OUTCOME_EXPOSURE_USDC", "11")),

@@ -1,5 +1,7 @@
 import json
 import sqlite3
+import threading
+import time
 from decimal import Decimal
 
 from bot.lifecycle.outcome_lifecycle import OutcomeMarketSpec
@@ -27,7 +29,7 @@ class Client:
 def test_live_research_capture_writes_p2_p3_heartbeat_and_gap(tmp_path):
     journal = TradeJournalDB(tmp_path / "journal.db")
     capture = OutcomeResearchCapture(client=Client(), wallet_address="0x" + "a" * 40, journal=journal,
-        interval_sec=1, heartbeat_sec=1, gap_alert_sec=3)
+        interval_sec=1, heartbeat_sec=1, gap_alert_sec=3, account_sync_async=False)
     assert capture.capture_if_due(market=market(), yes_book=book(2_000), no_book=book(2_000, "0.39", "0.40"),
         yes_local_received_at_ms=2_000, no_local_received_at_ms=2_000, capture_complete_at_ms=2_000).captured
     later = capture.capture_if_due(market=market(), yes_book=book(6_000), no_book=book(6_000, "0.39", "0.40"),
@@ -43,6 +45,35 @@ def test_live_research_capture_writes_p2_p3_heartbeat_and_gap(tmp_path):
     assert fill_count == 1
     assert payload["expiry"] == "20260830-0000"
     assert "time_left_sec" in payload and payload["strike"] == "70000"
+
+
+def test_capture_persists_book_without_waiting_for_slow_account_reads(tmp_path):
+    entered, release = threading.Event(), threading.Event()
+
+    class SlowClient(Client):
+        def get_user_fills_sync(self, _wallet):
+            entered.set()
+            assert release.wait(timeout=2)
+            return super().get_user_fills_sync(_wallet)
+
+    journal = TradeJournalDB(tmp_path / "journal.db")
+    capture = OutcomeResearchCapture(
+        client=SlowClient(), wallet_address="0x" + "a" * 40, journal=journal,
+        interval_sec=1, heartbeat_sec=1, gap_alert_sec=3,
+    )
+    started = time.monotonic()
+    result = capture.capture_if_due(
+        market=market(), yes_book=book(2_000), no_book=book(2_000, "0.39", "0.40"),
+        yes_local_received_at_ms=2_000, no_local_received_at_ms=2_000, capture_complete_at_ms=2_000,
+    )
+    assert result.captured and time.monotonic() - started < 0.3
+    assert entered.wait(timeout=1)
+    with sqlite3.connect(journal.db_path) as conn:
+        snapshot = json.loads(conn.execute(
+            "SELECT payload_json FROM strategy_events WHERE event_type='OUTCOME_P2_PARITY_SNAPSHOT'"
+        ).fetchone()[0])
+    assert snapshot["fee_evidence"]["status"] == "pending_first_observation"
+    release.set()
 
 
 def test_duplicate_fill_repair_keeps_first_row_and_logs_audit(tmp_path):

@@ -426,3 +426,45 @@ def test_s3_emergency_exit_requires_durable_loss_band_then_uses_price_protected_
     assert result is not None and result.state == "emergency_exit_submitted"
     assert [name for name, _ in gateway.calls] == ["cancel", "ioc"]
     assert gateway.calls[-1][1]["limit_price"] == Decimal("0.70450")
+
+
+def test_s3_uses_exact_durable_fill_fallback_when_exchange_history_is_temporarily_empty(monkeypatch, tmp_path):
+    journal = TradeJournalDB(tmp_path / "s3_durable_fallback.db")
+    ledger = OutcomeExecutionLedger(journal, "run")
+    journal.log_strategy_event("run", "OUTCOME_LIVE_STRATEGY_ENTRY_PLACED", {
+        "outcome_id": 1153, "coin": "#11530", "entry_evidence": {"oi_age_ms": 1},
+    })
+    journal.log_outcome_fill_once(
+        "run", trade_id="durable-entry", side="BUY", price=0.80, qty=13,
+        status="FILLED", instrument_id="#11530", commission_usdc=0,
+        payload={"venue": "hyperliquid_outcome", "actual_fill": True, "timestamp_ms": 1},
+    )
+
+    class EmptyHistoryAccount(CalibrationAccount):
+        def __init__(self):
+            super().__init__(balances=[{"coin": "+11530", "total": "13", "entryNtl": "10.4"}], orders=[{"coin": "#11530", "side": "A", "oid": "old-sell", "sz": "13"}])
+        def get_user_fills_sync(self, _): return []
+
+    base = time.time() + 7201
+
+    class EmergencyGateway(Gateway):
+        def __init__(self, account): self.account, self.calls = account, []
+        def fetch_order_book(self, **_):
+            return {"timestamp": int(base * 1000), "bids": [{"price": "0.730", "size": "20"}], "asks": [{"price": "0.731", "size": "20"}]}
+        def cancel_owned_order(self, **kwargs): self.calls.append(("cancel", kwargs)); self.account.orders = []; return {}
+        def place_price_protected_ioc_exit(self, **kwargs): self.calls.append(("ioc", kwargs)); return {"orderId": "ioc-durable", "status": "filled"}
+
+    account = EmptyHistoryAccount()
+    gateway = EmergencyGateway(account)
+    store = OutcomeExitLifecycleStore(journal, "run")
+    store.record(OutcomeExitLifecycle("w", 1153, "#11530", "old-sell", Decimal("13"), Decimal("0.76"), 0, "LOSS_BAND_UNFILLED"), reason="fixture")
+    runtime = OutcomeLiveExecutionRuntime(account=account, wallet="w", gateway=gateway, ledger=ledger, exit_lifecycle_store=store)
+    runtime._emergency_reversal_windows[(1153, "#11530")] = (base - 121, base - 1, 3)
+    monkeypatch.setattr("bot.outcome_live_execution_runtime.time.time", lambda: base)
+    monkeypatch.setattr("bot.outcome_emergency_exit.time.time", lambda: base)
+    finding = type("Finding", (), {"coin": "#11530", "inventory": Decimal("13"), "sell_order_ids": ("old-sell",)})()
+
+    result = runtime._maybe_emergency_exit(market=market(), finding=finding)
+
+    assert result is not None and result.state == "emergency_exit_submitted"
+    assert [name for name, _ in gateway.calls] == ["cancel", "ioc"]
