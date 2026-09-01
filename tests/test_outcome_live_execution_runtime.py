@@ -152,7 +152,23 @@ def test_s0_live_strategy_logs_explicit_oi_policy_entry(monkeypatch, tmp_path):
     import sqlite3
     with sqlite3.connect(journal.db_path) as conn:
         payload = conn.execute("SELECT payload_json FROM strategy_events WHERE event_type='OUTCOME_LIVE_STRATEGY_ENTRY_PLACED'").fetchone()[0]
+        order_payload = conn.execute(
+            "SELECT payload_json FROM order_events WHERE event_type='ORDER_SUBMIT' AND venue_order_id='strategy-buy'"
+        ).fetchone()[0]
     assert '"sampling_policy": "oi_spot_mark_confirmation"' in payload
+    assert '"order_submit_audit_persisted": true' in payload
+    assert '"target_policy_source"' in order_payload
+    assert '"target_price_preview_from_decision_bid"' in order_payload
+    # The ORDER_SUBMIT audit is the crash-window recovery evidence: deleting
+    # the following strategy event must not erase the accepted order's target
+    # provenance or make its eventual protective exit unauditable.
+    with sqlite3.connect(journal.db_path) as conn:
+        conn.execute("DELETE FROM strategy_events WHERE event_type='OUTCOME_LIVE_STRATEGY_ENTRY_PLACED'")
+        conn.commit()
+    recovered = runtime._persisted_entry_policy_evidence(market=market(), coin="#11531")
+    assert recovered is not None
+    assert recovered[1]["target_policy_source"] == "fallback_no_accepted_l2"
+    assert runtime._persisted_p3_exit_policy(market=market(), coin="#11531").target_return_pct == Decimal("0.03")
 
 
 def test_s0_live_strategy_blocks_selected_bid_in_50_to_55_no_trade_band(monkeypatch, tmp_path):

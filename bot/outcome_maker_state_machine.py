@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import TYPE_CHECKING, Any, Literal, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Mapping, Protocol
 
 from bot.lifecycle.outcome_lifecycle import OutcomeMarketSpec
 from bot.outcome_execution_gateway import OutcomeExecutionGateway
@@ -143,6 +143,7 @@ class OutcomeMakerStateMachine:
         self, *, market: OutcomeMarketSpec, side_index: int, entry_permitted: bool,
         minimum_return_pct: Decimal | None = None, maker_close_fee_rate: Decimal | None = None,
         loss_reprice_pct: Decimal | None = None,
+        entry_audit: Mapping[str, str | int | None] | None = None,
     ) -> MakerTickResult:
         coin = self.gateway.outcome_coin(market, side_index)
         inventory, entry_notional = self._coin_position(self.account.get_spot_clearinghouse_state_sync(self.wallet), coin)
@@ -243,4 +244,12 @@ class OutcomeMakerStateMachine:
         book = self.gateway.fetch_order_book(market=market, side_index=side_index)
         bid = self._best(book["bids"], "bid")
         result = self.gateway.place_alo(market=market, side_index=side_index, is_buy=True, price=bid)
-        return MakerTickResult("buy_placed", "placed first-level ALO buy", str(result["orderId"]))
+        # The ledger records this ``audit`` payload on the same durable
+        # ORDER_SUBMIT row as the exchange order id.  In particular, a live
+        # strategy's chosen exit target must not exist only in a later,
+        # best-effort strategy event: a process crash after order acceptance
+        # would otherwise make the order impossible to audit accurately.
+        return MakerTickResult(
+            "buy_placed", "placed first-level ALO buy", str(result["orderId"]),
+            audit=dict(entry_audit or {}),
+        )

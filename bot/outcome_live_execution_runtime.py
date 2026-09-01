@@ -151,12 +151,14 @@ class OutcomeLiveExecutionRuntime:
             ).fetchone()
         return int(row[0] or 0)
 
-    def _persisted_p3_exit_policy(self, *, market: OutcomeMarketSpec, coin: str) -> OutcomeP3CalibrationConfig | None:
-        """Recover the policy that created a still-managed P3 inventory.
+    def _persisted_entry_policy_evidence(self, *, market: OutcomeMarketSpec, coin: str) -> tuple[str, dict[str, object]] | None:
+        """Load a verified entry policy, preferring strategy evidence.
 
-        Entry and exit must not depend on which dispatcher happens to run on
-        the next tick.  The entry event is durable evidence of the approved
-        policy; malformed or absent evidence is deliberately not guessed.
+        New S0 orders duplicate their policy decision on the matching
+        ``ORDER_SUBMIT`` audit row.  This provides a recovery path if the
+        process exits after the accepted order is journaled but before its
+        follow-up strategy event commits.  When both records exist, their
+        target and fee fields must agree; disagreement is fail-closed.
         """
         if self.ledger is None:
             return None
@@ -164,7 +166,7 @@ class OutcomeLiveExecutionRuntime:
             with sqlite3.connect(self.ledger.journal.db_path) as conn:
                 row = conn.execute(
                     """
-                    SELECT payload_json FROM strategy_events
+                    SELECT ts, payload_json FROM strategy_events
                     WHERE event_type IN ('OUTCOME_P3_CALIBRATION_ENTRY_PLACED', 'OUTCOME_LIVE_STRATEGY_ENTRY_PLACED')
                       AND CAST(json_extract(payload_json, '$.outcome_id') AS INTEGER)=?
                       AND json_extract(payload_json, '$.coin')=?
@@ -172,36 +174,79 @@ class OutcomeLiveExecutionRuntime:
                     """,
                     (market.outcome_id, coin),
                 ).fetchone()
-            if not row:
-                return None
-            payload = json.loads(row[0])
+                if row:
+                    timestamp, raw_payload = str(row[0]), row[1]
+                    payload = json.loads(raw_payload)
+                    if not isinstance(payload, dict):
+                        return None
+                    # Legacy/P3 entries may predate submit-audit evidence.
+                    # For new S0 entries, verify the matching order record
+                    # whenever it is present, without making old positions
+                    # impossible to reconcile after deployment.
+                    if str(payload.get("sampling_policy", "")) == "oi_spot_mark_confirmation":
+                        order_id = str(payload.get("order_id") or "")
+                        if order_id:
+                            audit_row = conn.execute(
+                                """
+                                SELECT payload_json FROM order_events
+                                WHERE event_type='ORDER_SUBMIT' AND side='BUY' AND venue_order_id=?
+                                ORDER BY id DESC LIMIT 1
+                                """, (order_id,),
+                            ).fetchone()
+                            if audit_row:
+                                order_payload = json.loads(audit_row[0] or "{}")
+                                audit = order_payload.get("audit") if isinstance(order_payload, dict) else None
+                                if isinstance(audit, dict) and audit.get("entry_policy_schema_version") == 1:
+                                    for field in ("target_return_pct", "maker_close_fee_rate"):
+                                        if str(audit.get(field)) != str(payload.get(field)):
+                                            return None
+                    return timestamp, payload
+
+                # No strategy event: recover only from the dedicated S0
+                # submit audit, scoped to the exact market/coin.  This is the
+                # crash-window fallback, not a license to adopt manual buys.
+                rows = conn.execute(
+                    """
+                    SELECT ts, payload_json FROM order_events
+                    WHERE event_type='ORDER_SUBMIT' AND side='BUY' AND instrument_id=?
+                      AND CAST(json_extract(payload_json, '$.outcome_id') AS INTEGER)=?
+                    ORDER BY id DESC LIMIT 20
+                    """, (coin, market.outcome_id),
+                ).fetchall()
+            for timestamp, raw_payload in rows:
+                order_payload = json.loads(raw_payload or "{}")
+                audit = order_payload.get("audit") if isinstance(order_payload, dict) else None
+                if isinstance(audit, dict) and audit.get("entry_policy_schema_version") == 1 and audit.get("entry_policy_kind") == "s0_oi_spot_mark_confirmation":
+                    return str(timestamp), audit
+            return None
+        except (KeyError, TypeError, ValueError, sqlite3.Error, json.JSONDecodeError):
+            return None
+
+    def _persisted_p3_exit_policy(self, *, market: OutcomeMarketSpec, coin: str) -> OutcomeP3CalibrationConfig | None:
+        """Recover the policy that created a still-managed P3/S0 inventory."""
+        evidence = self._persisted_entry_policy_evidence(market=market, coin=coin)
+        if evidence is None:
+            return None
+        _, payload = evidence
+        try:
             return OutcomeP3CalibrationConfig(
                 max_daily_entries=1,
                 target_return_pct=Decimal(str(payload["target_return_pct"])),
                 loss_reprice_pct=Decimal(str(payload["loss_reprice_pct"])),
             )
-        except (KeyError, TypeError, ValueError, sqlite3.Error):
+        except (KeyError, TypeError, ValueError):
             return None
 
     def _persisted_p3_maker_fee(self, *, market: OutcomeMarketSpec, coin: str) -> Decimal | None:
-        if self.ledger is None:
+        evidence = self._persisted_entry_policy_evidence(market=market, coin=coin)
+        if evidence is None:
             return None
         try:
-            with sqlite3.connect(self.ledger.journal.db_path) as conn:
-                row = conn.execute(
-                    """
-                    SELECT json_extract(payload_json, '$.maker_close_fee_rate')
-                    FROM strategy_events
-                    WHERE event_type IN ('OUTCOME_P3_CALIBRATION_ENTRY_PLACED', 'OUTCOME_LIVE_STRATEGY_ENTRY_PLACED')
-                      AND CAST(json_extract(payload_json, '$.outcome_id') AS INTEGER)=?
-                      AND json_extract(payload_json, '$.coin')=?
-                    ORDER BY id DESC LIMIT 1
-                    """,
-                    (market.outcome_id, coin),
-                ).fetchone()
-            fee = Decimal(str(row[0])) if row and row[0] is not None else None
+            _, payload = evidence
+            raw_fee = payload.get("maker_close_fee_rate")
+            fee = Decimal(str(raw_fee)) if raw_fee is not None else None
             return fee if fee is not None and Decimal("0") <= fee < Decimal("1") else None
-        except (ArithmeticError, sqlite3.Error):
+        except (ArithmeticError, ValueError):
             return None
 
     def _strategy_exit_tier(self, *, market: OutcomeMarketSpec, coin: str) -> tuple[Decimal, Decimal | None] | None:
@@ -213,22 +258,22 @@ class OutcomeLiveExecutionRuntime:
         floor.  This prevents a one-tick adverse quote from replacing the
         initial take-profit order with a near-cost sell.
         """
-        if self.ledger is None:
+        evidence = self._persisted_entry_policy_evidence(market=market, coin=coin)
+        if evidence is None:
             return None
         try:
-            with sqlite3.connect(self.ledger.journal.db_path) as conn:
-                row = conn.execute(
-                    """
-                    SELECT ts, payload_json FROM strategy_events
-                    WHERE event_type='OUTCOME_LIVE_STRATEGY_ENTRY_PLACED'
-                      AND CAST(json_extract(payload_json, '$.outcome_id') AS INTEGER)=?
-                      AND json_extract(payload_json, '$.coin')=?
-                    ORDER BY id DESC LIMIT 1
-                    """, (market.outcome_id, coin),
-                ).fetchone()
-            if not row:
+            timestamp, payload = evidence
+            # Pre-submit-audit S0 records used the strategy event type and
+            # tier fields but did not yet carry ``sampling_policy``.  The
+            # presence of the full tier contract identifies that legacy S0
+            # shape without mistaking a P3 calibration record for S0.
+            is_s0 = (
+                str(payload.get("entry_policy_kind", "")) == "s0_oi_spot_mark_confirmation"
+                or str(payload.get("sampling_policy", "")) == "oi_spot_mark_confirmation"
+                or all(key in payload for key in ("narrow_after_sec", "narrow_return_pct", "floor_after_sec", "floor_return_pct"))
+            )
+            if not is_s0:
                 return None
-            payload = json.loads(row[1])
             target = Decimal(str(payload["target_return_pct"]))
             narrow_after = float(payload["narrow_after_sec"])
             narrow = Decimal(str(payload["narrow_return_pct"]))
@@ -237,7 +282,7 @@ class OutcomeLiveExecutionRuntime:
             # Age is anchored to the original entry evidence, not the latest
             # replacement timestamp; otherwise each rebook would silently
             # postpone the +3%/+2% time tiers.
-            age = max(0.0, time.time() - datetime.fromisoformat(str(row[0])).timestamp())
+            age = max(0.0, time.time() - datetime.fromisoformat(timestamp).timestamp())
             if age >= floor_after:
                 # The loss band is only eligible after the two-hour floor
                 # tier.  It is a fee-inclusive -5% passive quote, never an
@@ -246,7 +291,7 @@ class OutcomeLiveExecutionRuntime:
             if age >= narrow_after:
                 return narrow, None
             return target, None
-        except (KeyError, TypeError, ValueError, ArithmeticError, sqlite3.Error, json.JSONDecodeError):
+        except (KeyError, TypeError, ValueError, ArithmeticError):
             return None
 
     def _maybe_requote_p3_exit(self, *, market: OutcomeMarketSpec, finding: object) -> LiveExecutionResult | None:
@@ -800,8 +845,11 @@ class OutcomeLiveExecutionRuntime:
         target_decision = OutcomeExitTargetPolicy(self.ledger.journal.db_path).decide(
             outcome_id=market.outcome_id, side_index=entry_side_index,
         )
-        if take_profit_price(entry_price=price, target_return_pct=target_decision.target_return_pct,
-                             maker_close_fee_rate=maker_close_fee) is None:
+        target_price_preview = take_profit_price(
+            entry_price=price, target_return_pct=target_decision.target_return_pct,
+            maker_close_fee_rate=maker_close_fee,
+        )
+        if target_price_preview is None:
             return LiveExecutionResult("flat", "live strategy dynamic fee-after target exceeds Outcome price ceiling")
         shares = whole_share_size(price)
         risk = self.risk_gate.evaluate(
@@ -810,7 +858,37 @@ class OutcomeLiveExecutionRuntime:
         )
         if not risk.allowed:
             return LiveExecutionResult("blocked", f"risk gate: {risk.reason}")
-        result = self.machine.tick(market=market, side_index=entry_side_index, entry_permitted=True)
+        # Persist the target decision on the ORDER_SUBMIT record itself.  The
+        # follow-up strategy event remains useful for research queries, but
+        # it is deliberately not the sole source of truth for an accepted
+        # live entry order.
+        entry_audit = {
+            "entry_policy_schema_version": 1,
+            "entry_policy_kind": "s0_oi_spot_mark_confirmation",
+            "target_return_pct": str(target_decision.target_return_pct),
+            "target_policy_source": target_decision.source,
+            "target_estimated_move_pct": (
+                str(target_decision.estimated_move_pct)
+                if target_decision.estimated_move_pct is not None else None
+            ),
+            "target_volatility_sample_count": target_decision.sample_count,
+            "maker_close_fee_rate": str(maker_close_fee),
+            "loss_reprice_pct": "0.05",
+            "narrow_after_sec": config.narrow_after_sec,
+            "narrow_return_pct": str(config.narrow_return_pct),
+            "floor_after_sec": config.floor_after_sec,
+            "floor_return_pct": str(config.floor_return_pct),
+            "entry_bid_at_decision": str(price),
+            # A fill may occur away from this bid.  The protective sell is
+            # recalculated from verified fill VWAP, so label this explicitly
+            # as a decision-time preview rather than an asserted exit price.
+            "target_price_preview_from_decision_bid": str(target_price_preview),
+            "target_decision_at_ms": int(time.time() * 1000),
+        }
+        result = self.machine.tick(
+            market=market, side_index=entry_side_index, entry_permitted=True,
+            entry_audit=entry_audit,
+        )
         if result.state == "buy_placed":
             self.ledger.journal.log_strategy_event(self.ledger.run_id, "OUTCOME_LIVE_STRATEGY_ENTRY_PLACED", {
                 "venue": "hyperliquid_outcome", "outcome_id": market.outcome_id, "period": market.period,
@@ -819,6 +897,8 @@ class OutcomeLiveExecutionRuntime:
                 "target_policy_source": target_decision.source,
                 "target_estimated_move_pct": str(target_decision.estimated_move_pct) if target_decision.estimated_move_pct is not None else None,
                 "target_volatility_sample_count": target_decision.sample_count,
+                "entry_policy_schema_version": 1,
+                "order_submit_audit_persisted": True,
                 # Prior to the two-hour floor tier no loss band is eligible.
                 # Thereafter this is a fee-inclusive -5% passive quote only.
                 "loss_reprice_pct": "0.05", "maker_close_fee_rate": str(maker_close_fee),
