@@ -16,6 +16,7 @@ from typing import Any, Mapping
 from bot.lifecycle.outcome_lifecycle import OutcomeMarketSpec
 from bot.outcome_event_bridge import OutcomeFillEvent
 from bot.outcome_p2_quality import P2_SCHEMA_VERSION, build_p2_capture_quality
+from bot.outcome_market_authority import publish_outcome_market_authority
 from bot.outcome_p3_pipeline import OutcomeP3Pipeline
 from bot.outcome_parity import OutcomeParityAnalyzer
 from monitoring.trade_journal_db import TradeJournalDB
@@ -157,6 +158,7 @@ class OutcomeResearchCapture:
 
     def capture_if_due(self, *, market: OutcomeMarketSpec, yes_book: Mapping[str, Any], no_book: Mapping[str, Any],
                        yes_local_received_at_ms: int, no_local_received_at_ms: int, capture_complete_at_ms: int) -> OutcomeResearchCaptureResult:
+        publish_outcome_market_authority(market)
         self._start_account_sync_if_due(market=market, now_ms=capture_complete_at_ms)
         if self._last_capture_ms and capture_complete_at_ms - self._last_capture_ms < self.interval_ms:
             return OutcomeResearchCaptureResult(False)

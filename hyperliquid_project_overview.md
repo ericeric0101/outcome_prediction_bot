@@ -65,6 +65,12 @@
 
 使用 `scripts/outcome_shadow.py`，而不是 `bot/launcher.py` 的 simulation loop。前者不 import execution adapter，且只會透過 `/info` 讀取 `outcomeMeta`、`allMids`、`l2Book`、`spotClearinghouseState`、`frontendOpenOrders`、`userFills`。每個 cycle 會將 `MarketSnapshot` / `PositionState` 餵入既有 `PositionManager` 和 `ExitPolicyEngine`，把結果記成 `OUTCOME_SHADOW_CYCLE`；不會產生模擬成交、簽名或 `/exchange` 請求。
 
+**Cross-repo market authority (2026-09-02):** 每個 research capture 都會以 atomic replace 發布
+`logs/outcome_market_authority.json`；檔案僅有目前 `market_id`、period、兩側 coin、strike、expiry、
+`updated_at_ms`。Polymarket 的被動 lead/lag observer 只讀取這個小型狀態檔來偵測 1d rollover，
+不會掃描 `outcome_shadow.db` 或把該 journal 當 authority。此檔不是交易訊號、也不改變 Outcome
+bot 的 market selection；它只是供另一個本機 process 取得已選市場的低延遲、可驗證描述。
+
 每筆 `OUTCOME_SHADOW_CYCLE` 同時保留研究與回測所需的資料：YES/NO `best_bid`、`best_ask`、spread、spot-vs-strike、`ForecastState` 的 sigma / 公平機率診斷、`SignalEngine` 的各層分數與權重、`proposed_side`、`entry_eligible`，以及對每側產生的 exit decision。`would_submit_entry=true` 僅代表既有訊號規則認為可進場；`execution_blocked=true` 是不可移除的 shadow 安全旗標，絕不代表已下單。
 
 ```bash
