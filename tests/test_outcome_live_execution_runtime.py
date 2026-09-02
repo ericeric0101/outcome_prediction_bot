@@ -8,6 +8,7 @@ from bot.outcome_execution_ledger import OutcomeExecutionLedger
 from bot.outcome_exit_lifecycle import OutcomeExitLifecycle, OutcomeExitLifecycleStore
 from bot.outcome_exit_quote_planner import OutcomeExitQuotePlanner, OutcomeExitQuotePlannerConfig
 from bot.outcome_exit_requote_controller import ExitRequoteResult
+from bot.outcome_entry_requote import OutcomeEntryQuotePlanner, OutcomeEntryQuotePlannerConfig
 from monitoring.trade_journal_db import TradeJournalDB
 
 
@@ -189,6 +190,40 @@ def test_s0_live_strategy_blocks_selected_bid_in_50_to_55_no_trade_band(monkeypa
     assert result.state == "flat"
     assert "no-trade band" in result.detail
     assert gateway.calls == []
+
+
+def test_s0_persists_gate_decision_and_cancels_only_owned_stale_entry_before_next_tick_rebook(monkeypatch, tmp_path):
+    monkeypatch.setenv("OUTCOME_AUTOMATED_EXECUTION_ENABLED", "1")
+    monkeypatch.setenv("OUTCOME_SDK_EXECUTION_ENABLED", "1")
+    monkeypatch.setenv("OUTCOME_LIVE_STRATEGY_ENABLED", "1")
+    journal = TradeJournalDB(tmp_path / "entry_requote.db")
+    journal.log_order_event("run", "ORDER_SUBMIT", venue_order_id="owned-buy", side="BUY", status="RESTING", instrument_id="#11531", payload={
+        "venue": "hyperliquid_outcome", "outcome_id": 1153, "coin": "#11531",
+        "audit": {"entry_policy_schema_version": 1, "entry_policy_kind": "s0_oi_spot_mark_confirmation", "entry_bid_at_decision": "0.77"},
+    })
+    class RequoteAccount(CalibrationAccount):
+        def __init__(self): super().__init__(orders=[{"coin": "#11531", "side": "B", "oid": "owned-buy", "limitPx": "0.77", "sz": "13"}])
+    class RequoteGateway(Gateway):
+        def __init__(self, account): self.account, self.calls = account, []
+        def fetch_order_book(self, **_): return {"bids": [{"price": "0.78"}], "asks": [{"price": "0.79"}]}
+        def cancel_owned_order(self, **kwargs): self.calls.append(kwargs); self.account.orders = []; return {}
+        def place_alo(self, **kwargs): self.calls.append(kwargs); return {"orderId": "must-not-rebook-same-tick"}
+    account = RequoteAccount(); gateway = RequoteGateway(account)
+    runtime = OutcomeLiveExecutionRuntime(
+        account=account, wallet="w", gateway=gateway, stream_health=healthy_stream(),
+        ledger=OutcomeExecutionLedger(journal, "run"),
+        entry_planner=OutcomeEntryQuotePlanner(OutcomeEntryQuotePlannerConfig(min_requote_interval_sec=0)),
+    )
+    result = runtime.tick_live_strategy(market=market(), entry_side_index=1, entry_reason="down_spot_mark_oi_confirmed", entry_evidence={"oi_age_ms": 5})
+    assert result.state == "cancelled"
+    assert [call for call in gateway.calls if "order_id" in call] == [{"market": market(), "side_index": 1, "order_id": "owned-buy"}]
+    assert not [call for call in gateway.calls if call.get("is_buy")]
+    import sqlite3
+    with sqlite3.connect(journal.db_path) as conn:
+        decision = conn.execute("SELECT payload_json FROM strategy_events WHERE event_type='OUTCOME_ENTRY_GATE_DECISION'").fetchone()[0]
+        cancellation = conn.execute("SELECT status FROM order_events WHERE event_type='ORDER_CANCEL'").fetchone()[0]
+    assert '"entry_reason": "down_spot_mark_oi_confirmed"' in decision
+    assert cancellation == "CANCELLED"
 
 
 def test_s0_live_strategy_blocks_new_market_while_known_retiring_market_has_resting_order(monkeypatch, tmp_path):
