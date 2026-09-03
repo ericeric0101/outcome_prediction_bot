@@ -153,6 +153,9 @@ def test_s0_live_strategy_logs_explicit_oi_policy_entry(monkeypatch, tmp_path):
     import sqlite3
     with sqlite3.connect(journal.db_path) as conn:
         payload = conn.execute("SELECT payload_json FROM strategy_events WHERE event_type='OUTCOME_LIVE_STRATEGY_ENTRY_PLACED'").fetchone()[0]
+        admission_payload = conn.execute(
+            "SELECT payload_json FROM strategy_events WHERE event_type='OUTCOME_ENTRY_ADMISSION_DECISION'"
+        ).fetchone()[0]
         order_payload = conn.execute(
             "SELECT payload_json FROM order_events WHERE event_type='ORDER_SUBMIT' AND venue_order_id='strategy-buy'"
         ).fetchone()[0]
@@ -160,6 +163,9 @@ def test_s0_live_strategy_logs_explicit_oi_policy_entry(monkeypatch, tmp_path):
     assert '"order_submit_audit_persisted": true' in payload
     assert '"target_policy_source"' in order_payload
     assert '"target_price_preview_from_decision_bid"' in order_payload
+    assert '"final_state": "buy_placed"' in admission_payload
+    assert '"execution_submitted": true' in admission_payload
+    assert '"selected_best_bid": "0.77"' in admission_payload
     # The ORDER_SUBMIT audit is the crash-window recovery evidence: deleting
     # the following strategy event must not erase the accepted order's target
     # provenance or make its eventual protective exit unauditable.
@@ -190,6 +196,13 @@ def test_s0_live_strategy_blocks_selected_bid_in_50_to_55_no_trade_band(monkeypa
     assert result.state == "flat"
     assert "no-trade band" in result.detail
     assert gateway.calls == []
+    import sqlite3
+    with sqlite3.connect(journal.db_path) as conn:
+        payload = conn.execute(
+            "SELECT payload_json FROM strategy_events WHERE event_type='OUTCOME_ENTRY_ADMISSION_DECISION'"
+        ).fetchone()[0]
+    assert '"entry_price_gate": "selected_bid_in_no_trade_band"' in payload
+    assert '"execution_submitted": false' in payload
 
 
 def test_s0_persists_gate_decision_and_cancels_only_owned_stale_entry_before_next_tick_rebook(monkeypatch, tmp_path):

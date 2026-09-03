@@ -71,6 +71,36 @@ class OutcomeOiEntryGate:
         self.db_path = str(db_path)
         self.config = config or OutcomeLiveStrategyConfig.from_env()
 
+    def _gate_variants(self, *, spot_strike_bps: Decimal, mark_return_bps: Decimal,
+                       oi_return_bps: Decimal) -> dict[str, dict[str, Any]]:
+        """Return pre-registered counterfactual entry gates without changing S0.
+
+        OI is an activity condition, not a directional sign: for DOWN the
+        directional input remains the negative spot/mark move while an OI
+        increase only confirms activity.  These rows are telemetry for later
+        ablation; ``evaluate`` continues to execute *only* ``spot_mark_oi``.
+        """
+        up_spot = spot_strike_bps >= self.config.spot_strike_min_bps
+        down_spot = spot_strike_bps <= -self.config.spot_strike_min_bps
+        up_mark = mark_return_bps >= self.config.mark_return_min_bps
+        down_mark = mark_return_bps <= -self.config.mark_return_min_bps
+        oi_active = oi_return_bps >= self.config.oi_return_min_bps
+
+        def choice(up: bool, down: bool) -> dict[str, Any]:
+            # The thresholds cannot make both sides true, but preserve an
+            # explicit fail-closed representation if future config changes.
+            side = 0 if up and not down else 1 if down and not up else None
+            return {"eligible": side is not None, "side_index": side}
+
+        return {
+            "spot_mark_oi": choice(up_spot and up_mark and oi_active, down_spot and down_mark and oi_active),
+            "spot_mark": choice(up_spot and up_mark, down_spot and down_mark),
+            "spot_mark_or_oi": choice(
+                up_spot and (up_mark or oi_active),
+                down_spot and (down_mark or oi_active),
+            ),
+        }
+
     def evaluate(self, *, spot_price: Decimal | None, strike_price: Decimal | None, now_ms: int | None = None) -> OutcomeOiEntryDecision:
         if spot_price is None or strike_price is None or spot_price <= 0 or strike_price <= 0:
             return OutcomeOiEntryDecision(None, "missing_spot_or_strike", {})
@@ -114,6 +144,14 @@ class OutcomeOiEntryGate:
             "oi_current_id": int(current[0]), "oi_prior_id": int(prior[0]), "oi_age_ms": age_ms,
             "spot_strike_bps": str(spot_strike_bps), "oi_return_bps": str(oi_return_bps),
             "mark_return_bps": str(mark_return_bps), "oi_lookback_sec": self.config.oi_lookback_sec,
+            # Persist all alternatives on the ordinary S0 decision event so
+            # an ablation report never needs to recompute a historical signal
+            # from changed thresholds or revised OI observations.
+            "gate_variants": self._gate_variants(
+                spot_strike_bps=spot_strike_bps,
+                mark_return_bps=mark_return_bps,
+                oi_return_bps=oi_return_bps,
+            ),
         }
         if (spot_strike_bps >= self.config.spot_strike_min_bps
                 and mark_return_bps >= self.config.mark_return_min_bps

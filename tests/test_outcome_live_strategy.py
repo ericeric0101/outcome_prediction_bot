@@ -20,6 +20,11 @@ def test_gate_requires_aligned_spot_mark_and_oi_for_up(tmp_path):
     decision = gate.evaluate(spot_price=Decimal("101"), strike_price=Decimal("100"), now_ms=1_330_000)
     assert decision.side_index == 0
     assert decision.reason == "up_spot_mark_oi_confirmed"
+    assert decision.evidence["gate_variants"] == {
+        "spot_mark_oi": {"eligible": True, "side_index": 0},
+        "spot_mark": {"eligible": True, "side_index": 0},
+        "spot_mark_or_oi": {"eligible": True, "side_index": 0},
+    }
 
 
 def test_gate_fails_closed_for_stale_or_conflicting_oi(tmp_path):
@@ -29,6 +34,19 @@ def test_gate_fails_closed_for_stale_or_conflicting_oi(tmp_path):
     gate = OutcomeOiEntryGate(db.db_path, OutcomeLiveStrategyConfig(oi_max_age_sec=90))
     assert gate.evaluate(spot_price=Decimal("101"), strike_price=Decimal("100"), now_ms=1_330_000).side_index is None
     assert gate.evaluate(spot_price=Decimal("101"), strike_price=Decimal("100"), now_ms=1_500_000).reason == "oi_observation_stale"
+
+
+def test_gate_persists_nonexecuting_ablation_variants_without_relaxing_s0(tmp_path):
+    db = TradeJournalDB(tmp_path / "strategy.db")
+    _oi(db, timestamp=1_000_000, oi="100", mark="100", tag="old")
+    # Spot and mark point UP, but OI falls: S0 stays blocked while the
+    # spot+mark counterfactual is visible for the later report.
+    _oi(db, timestamp=1_300_000, oi="99", mark="101", tag="new")
+    gate = OutcomeOiEntryGate(db.db_path, OutcomeLiveStrategyConfig(oi_max_age_sec=90))
+    decision = gate.evaluate(spot_price=Decimal("101"), strike_price=Decimal("100"), now_ms=1_330_000)
+    assert decision.side_index is None
+    assert decision.evidence["gate_variants"]["spot_mark"] == {"eligible": True, "side_index": 0}
+    assert decision.evidence["gate_variants"]["spot_mark_oi"] == {"eligible": False, "side_index": None}
 
 
 def test_live_strategy_config_has_no_daily_entry_count_parameter(monkeypatch):

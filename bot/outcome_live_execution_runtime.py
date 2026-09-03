@@ -347,6 +347,38 @@ class OutcomeLiveExecutionRuntime:
             "execution_submitted": False,
         })
 
+    def _record_entry_admission_decision(self, *, market: OutcomeMarketSpec,
+                                         entry_side_index: int | None, entry_reason: str,
+                                         entry_evidence: dict[str, object],
+                                         admission: dict[str, object],
+                                         result: LiveExecutionResult) -> None:
+        """Persist the final S0 admission result, after every venue-side gate.
+
+        ``OUTCOME_ENTRY_GATE_DECISION`` describes the upstream signal only.
+        This record answers the operationally distinct question: did that
+        signal reach a live ALO submit, and if not, precisely which later
+        guard stopped it?  It is journal-only and never changes an order.
+        """
+        if self.ledger is None:
+            return
+        stream: dict[str, object]
+        if self.stream_health is None:
+            stream = {"ready": False, "reason": "ws_health_not_configured"}
+        else:
+            status = self.stream_health.check(market)
+            stream = {"ready": status.ready, "reason": status.reason}
+        self.ledger.journal.log_strategy_event(self.ledger.run_id, "OUTCOME_ENTRY_ADMISSION_DECISION", {
+            "venue": "hyperliquid_outcome", "outcome_id": market.outcome_id,
+            "period": market.period, "read_only": True,
+            "raw_signal_side_index": entry_side_index, "raw_signal_reason": entry_reason,
+            "raw_signal_evidence": entry_evidence,
+            "admission_inputs": admission,
+            "stream_at_completion": stream,
+            "final_state": result.state, "final_reason": result.detail,
+            "execution_submitted": result.state == "buy_placed",
+            "order_id": result.order_id,
+        })
+
     def _maybe_requote_entry_buy(self, *, market: OutcomeMarketSpec, finding: object,
                                  entry_side_index: int | None, entry_reason: str,
                                  config: OutcomeLiveStrategyConfig) -> LiveExecutionResult | None:
@@ -871,6 +903,24 @@ class OutcomeLiveExecutionRuntime:
                            entry_reason: str, entry_evidence: dict[str, object],
                            retiring_markets: tuple[OutcomeMarketSpec, ...] = (),
                            market_context: dict[str, object] | None = None) -> LiveExecutionResult:
+        """Run S0 and durably record its final admission or rejection reason."""
+        admission: dict[str, object] = {}
+        result = self._tick_live_strategy(
+            market=market, entry_side_index=entry_side_index, entry_reason=entry_reason,
+            entry_evidence=entry_evidence, retiring_markets=retiring_markets,
+            market_context=market_context, admission=admission,
+        )
+        self._record_entry_admission_decision(
+            market=market, entry_side_index=entry_side_index, entry_reason=entry_reason,
+            entry_evidence=entry_evidence, admission=admission, result=result,
+        )
+        return result
+
+    def _tick_live_strategy(self, *, market: OutcomeMarketSpec, entry_side_index: int | None,
+                            entry_reason: str, entry_evidence: dict[str, object],
+                            retiring_markets: tuple[OutcomeMarketSpec, ...],
+                            market_context: dict[str, object] | None,
+                            admission: dict[str, object]) -> LiveExecutionResult:
         """Run one explicitly gated S0 live strategy lifecycle.
 
         The caller supplies a pure, already fail-closed OI/spot decision.  The
@@ -878,6 +928,7 @@ class OutcomeLiveExecutionRuntime:
         order submission and durable evidence.
         """
         if not self.live_strategy_enabled():
+            admission["execution_gate"] = "live_strategy_disabled"
             return LiveExecutionResult("disabled", "live strategy requires automated, SDK, and OUTCOME_LIVE_STRATEGY_ENABLED gates")
         if self.ledger is None:
             return LiveExecutionResult("blocked", "live strategy requires an execution ledger")
@@ -885,6 +936,10 @@ class OutcomeLiveExecutionRuntime:
         config = OutcomeLiveStrategyConfig.from_env()
         tracked_markets = (market, *retiring_markets)
         report = self.recovery.reconcile(tracked_markets)
+        admission["account_recovery"] = {
+            "safe_for_new_entry": bool(getattr(report, "safe_for_new_entry", False)),
+            "reason": str(getattr(report, "reason", "unknown")),
+        }
         # An IOC may fill between the previous tick and this account snapshot.
         # Import official fills before evaluating its durable loss/re-entry
         # consequence; otherwise an emergency close could be misclassified as
@@ -904,11 +959,13 @@ class OutcomeLiveExecutionRuntime:
             if finding.market_id != market.outcome_id and finding.state != "flat"
         ]
         if retired_active:
+            admission["rollover_gate"] = "retiring_market_active"
             return LiveExecutionResult(
                 "blocked",
                 "market rollover pending: retiring Outcome has live inventory or order; new entry refused",
             )
         active = [finding for finding in report.findings if finding.market_id == market.outcome_id and finding.state != "flat"]
+        admission["active_current_market_count"] = len(active)
         self._record_entry_gate_decision(
             market=market, entry_side_index=entry_side_index, entry_reason=entry_reason,
             entry_evidence=entry_evidence, active=active,
@@ -929,7 +986,9 @@ class OutcomeLiveExecutionRuntime:
                 return entry_requote
         health_error = self._stream_ready(market)
         if health_error:
+            admission["market_data_gate"] = health_error.detail
             return health_error
+        admission["market_data_gate"] = "ws_fresh"
         if len(active) == 1:
             requote = self._maybe_requote_p3_exit(market=market, finding=active[0])
             if requote is not None:
@@ -940,12 +999,17 @@ class OutcomeLiveExecutionRuntime:
         if not report.safe_for_new_entry:
             return LiveExecutionResult("blocked", f"account recovery blocked live strategy: {report.reason}")
         if active:
+            admission["account_gate"] = "existing_outcome_inventory_or_order"
             return LiveExecutionResult("blocked", "live strategy has existing Outcome inventory or order")
         if entry_side_index not in (0, 1):
+            admission["signal_gate"] = "no_directional_signal"
             return LiveExecutionResult("flat", f"live strategy no entry: {entry_reason}")
+        admission["selected_side_index"] = entry_side_index
+        admission["selected_coin"] = self.machine.gateway.outcome_coin(market, entry_side_index)
         if self.loss_reentry_gate is not None:
             reentry = self.loss_reentry_gate.evaluate(outcome_id=market.outcome_id)
             if not reentry.allowed:
+                admission["loss_reentry_gate"] = reentry.reason
                 return LiveExecutionResult("flat", f"live strategy no entry: {reentry.reason}")
         fees = self.recovery.account.get_user_fees_sync(self.recovery.wallet)
         maker_close_fee = Decimal(str(fees["userSpotAddRate"]))
@@ -953,11 +1017,14 @@ class OutcomeLiveExecutionRuntime:
         try:
             price = Decimal(str(book["bids"][0]["price"]))
         except (IndexError, KeyError, TypeError, ValueError):
+            admission["book_gate"] = "selected_entry_book_unavailable"
             return LiveExecutionResult("blocked", "live strategy entry book unavailable")
+        admission["selected_best_bid"] = str(price)
         # The opening 50/50 region is an uncertainty regime, not a bargain
         # by itself.  S0 is a momentum/confirmation experiment and therefore
         # never tries to call a reversal from the centre of the binary range.
         if price < config.min_entry_price:
+            admission["entry_price_gate"] = "selected_bid_in_no_trade_band"
             return LiveExecutionResult(
                 "flat",
                 f"live strategy no-trade band: selected bid {price} < {config.min_entry_price}",
@@ -970,14 +1037,30 @@ class OutcomeLiveExecutionRuntime:
             maker_close_fee_rate=maker_close_fee,
         )
         if target_price_preview is None:
+            admission["target_gate"] = "fee_after_target_exceeds_price_ceiling"
             return LiveExecutionResult("flat", "live strategy dynamic fee-after target exceeds Outcome price ceiling")
+        admission["target_return_pct"] = str(target_decision.target_return_pct)
+        admission["target_policy_source"] = target_decision.source
+        admission["target_price_preview"] = str(target_price_preview)
         shares = whole_share_size(price)
         risk = self.risk_gate.evaluate(
             balances=self.recovery.account.get_spot_clearinghouse_state_sync(self.recovery.wallet).get("balances", []),
             open_orders=self.recovery.account.get_open_orders_sync(self.recovery.wallet), price=price, shares=shares,
         )
         if not risk.allowed:
+            admission["risk_gate"] = {
+                "allowed": False, "reason": risk.reason,
+                "entry_notional": str(risk.entry_notional),
+                "available_collateral": str(risk.available_collateral),
+                "current_exposure": str(risk.current_exposure),
+            }
             return LiveExecutionResult("blocked", f"risk gate: {risk.reason}")
+        admission["risk_gate"] = {
+            "allowed": True, "reason": risk.reason,
+            "entry_notional": str(risk.entry_notional),
+            "available_collateral": str(risk.available_collateral),
+            "current_exposure": str(risk.current_exposure),
+        }
         # Persist the target decision on the ORDER_SUBMIT record itself.  The
         # follow-up strategy event remains useful for research queries, but
         # it is deliberately not the sole source of truth for an accepted
