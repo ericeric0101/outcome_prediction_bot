@@ -575,10 +575,24 @@ class OutcomeClient:
             await self._ws.send(json.dumps({"method": "subscribe", "subscription": sub}))
 
     async def _ws_loop(self) -> None:
+        """Maintain one public WS connection until the caller explicitly stops it.
+
+        A public-market stream can be interrupted by the venue, a local network
+        transition, or a transient TLS/open-handshake failure.  New entries are
+        intentionally fail-closed while that happens, but a temporary outage
+        must not turn into a permanently dead stream that requires an operator
+        restart.  Active subscriptions are retained in ``_subscriptions`` and
+        replayed after every successful reconnect.
+        """
         reconnect_attempt = 0
         while self._ws_running:
             try:
-                async with websockets.connect(self.ws_url, ping_interval=20, ping_timeout=10) as ws:
+                async with websockets.connect(
+                    self.ws_url,
+                    ping_interval=20,
+                    ping_timeout=10,
+                    open_timeout=self.timeout_sec,
+                ) as ws:
                     self._ws = ws
                     reconnect_attempt = 0
                     logger.info(f"OutcomeClient connected to WebSocket: {self.ws_url}")
@@ -598,20 +612,16 @@ class OutcomeClient:
             except Exception as e:
                 if not self._ws_running:
                     break
+                # Do not leave callers holding a closed connection while the
+                # next connection attempt is pending.
+                self._ws = None
                 self._dispatch_callback("__lifecycle__", {
                     "event": "disconnected", "received_at_ms": int(time.time() * 1000), "error": str(e),
                 })
                 reconnect_attempt += 1
-                if reconnect_attempt > 10:
-                    self._dispatch_callback("__lifecycle__", {
-                        "event": "reconnect_exhausted", "received_at_ms": int(time.time() * 1000),
-                        "error": str(e),
-                    })
-                    self._ws_running = False
-                    break
                 delay_sec = min(30.0, float(2 ** (reconnect_attempt - 1)))
                 logger.warning(
                     f"OutcomeClient WebSocket disconnected ({e}), reconnecting in {delay_sec:.0f}s "
-                    f"(attempt {reconnect_attempt}/10)..."
+                    f"(attempt {reconnect_attempt}; continues until stopped)..."
                 )
                 await asyncio.sleep(delay_sec)

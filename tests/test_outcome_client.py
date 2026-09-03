@@ -43,6 +43,37 @@ def test_sync_user_fees_uses_the_official_read_only_info_request(monkeypatch):
 
 
 @pytest.mark.anyio
+async def test_ws_reconnects_past_ten_transient_failures_until_stopped(monkeypatch):
+    """A venue outage must not require a launcher restart after ten attempts."""
+    client = OutcomeClient(OutcomeAuth(wallet_address="0x" + "a" * 40, is_testnet=True))
+    attempts: list[int] = []
+    lifecycle: list[str] = []
+
+    class FailingConnection:
+        async def __aenter__(self):
+            attempts.append(1)
+            raise OSError("temporary opening-handshake failure")
+
+        async def __aexit__(self, *_args):
+            return False
+
+    async def stop_after_twelfth_backoff(_seconds):
+        if len(attempts) >= 12:
+            client._ws_running = False
+
+    client.register_callback("__lifecycle__", lambda payload: lifecycle.append(str(payload["event"])))
+    client._ws_running = True
+    monkeypatch.setattr("bot.adapters.outcome_client.websockets.connect", lambda *_args, **_kwargs: FailingConnection())
+    monkeypatch.setattr("bot.adapters.outcome_client.asyncio.sleep", stop_after_twelfth_backoff)
+
+    await client._ws_loop()
+
+    assert len(attempts) == 12
+    assert lifecycle == ["disconnected"] * 12
+    assert "reconnect_exhausted" not in lifecycle
+
+
+@pytest.mark.anyio
 async def test_outcome_client_mock_requests(monkeypatch):
     test_eoa = Account.create()
     auth = OutcomeAuth(
