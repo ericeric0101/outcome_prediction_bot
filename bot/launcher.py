@@ -37,10 +37,12 @@ from bot.pricing.outcome_pricing import (
 from bot.outcome_live_execution_runtime import OutcomeLiveExecutionRuntime
 from bot.outcome_live_strategy import OutcomeOiEntryGate
 from bot.outcome_settlement import OutcomeSettlementAdapter
+from bot.outcome_pnl_reconciliation import OutcomePnLReconciler
 from bot.outcome_ws_recorder import OutcomeWebSocketRecorder
 from bot.outcome_execution_ledger import OutcomeExecutionLedger
 from bot.outcome_operations_monitor import OutcomeOperationsMonitor
 from bot.outcome_research_capture import OutcomeResearchCapture
+from bot.outcome_research_worker import OutcomeResearchWorker
 from bot.outcome_rollover import OutcomeRolloverCoordinator
 from monitoring.trade_journal_db import TradeJournalDB
 from bot.enums import MarketPhase
@@ -202,9 +204,20 @@ def run_integrated_hyperliquid_bot(
     # This is a venue-read-only capture path.  It shares the live journal but
     # never owns /exchange submission; the live runtime remains the sole
     # wallet writer.
-    research_capture = OutcomeResearchCapture(
-        client=client, wallet_address=auth.wallet_address, journal=live_journal,
-    ) if not simulation else None
+    research_capture = None
+    research_worker = None
+    if not simulation:
+        # Keep capture off the wallet/execution loop.  This client is used
+        # exclusively by the worker, whose code has no order submission or
+        # cancellation path.
+        research_client = OutcomeClient(auth, timeout_sec=5.0)
+        research_capture = OutcomeResearchCapture(
+            client=research_client, wallet_address=auth.wallet_address, journal=live_journal,
+        )
+        research_worker = OutcomeResearchWorker(
+            client=research_client, capture=research_capture, journal=live_journal,
+        )
+        research_worker.start()
     ops_monitor = OutcomeOperationsMonitor(live_journal, f"outcome-ops-{uuid.uuid4().hex[:10]}")
     live_execution = OutcomeLiveExecutionRuntime(
         account=client, wallet=auth.wallet_address,
@@ -212,6 +225,7 @@ def run_integrated_hyperliquid_bot(
     )
     live_strategy_gate = OutcomeOiEntryGate(live_journal.db_path) if live_execution.live_strategy_enabled() else None
     settlement_adapter = OutcomeSettlementAdapter()
+    pnl_reconciler = OutcomePnLReconciler(live_journal, f"outcome-pnl-{uuid.uuid4().hex[:10]}")
 
     dashboard_state = DashboardState(
         strike_price=0.0,
@@ -251,6 +265,7 @@ def run_integrated_hyperliquid_bot(
     inventory_entry_px: float = 0.0
     settled_markets: Set[int] = set()
     settlement_last_attempt_at: dict[int, float] = {}
+    pnl_last_attempt_at = 0.0
     rollover = OutcomeRolloverCoordinator()
 
     refresh_interval = 1.5 if not test_mode else 1.0
@@ -285,7 +300,24 @@ def run_integrated_hyperliquid_bot(
                 continue
 
             current_market = market
+            if research_worker is not None:
+                research_worker.set_market(market)
             retiring_markets = rollover.observe(selected=market, discovered=configured_markets)
+
+            # Derived accounting uses only prior official fills.  Keep it out
+            # of the high-frequency decision path; it has no venue-write side
+            # effects and is idempotent across restarts.
+            if not simulation and time.monotonic() - pnl_last_attempt_at >= 30.0:
+                pnl_last_attempt_at = time.monotonic()
+                try:
+                    written = pnl_reconciler.reconcile_sells()
+                    if written:
+                        logger.info(f"[OUTCOME PNL] recorded {written} canonical FIFO sell lots")
+                except Exception as e:
+                    live_journal.log_strategy_event("outcome-pnl-error", "OUTCOME_PNL_RECONCILE_ERROR", {
+                        "venue": "hyperliquid_outcome", "stage": "sell_fifo",
+                        "error_type": type(e).__name__, "error": str(e),
+                    })
 
             # 2. Update pricing feeds
             book_yes: dict[str, Any] | None = None
@@ -338,26 +370,6 @@ def run_integrated_hyperliquid_bot(
                         f"auto_execution={operational.automated_execution_enabled}"
                     )
                     last_log_time = time.time()
-                if research_capture and book_yes is not None and book_no is not None:
-                    try:
-                        research = research_capture.capture_if_due(
-                            market=market, yes_book=book_yes, no_book=book_no,
-                            yes_local_received_at_ms=yes_received_at_ms,
-                            no_local_received_at_ms=no_received_at_ms,
-                            capture_complete_at_ms=capture_complete_at_ms,
-                        )
-                        if research.captured:
-                            logger.debug(
-                                f"[OUTCOME RESEARCH CAPTURE] accepted={research.accepted} "
-                                f"p3_markouts={research.p3_markouts_written}"
-                            )
-                    except Exception as e:
-                        live_journal.log_strategy_event("outcome-research-error", "OUTCOME_RESEARCH_CAPTURE_ERROR", {
-                            "venue": "hyperliquid_outcome", "read_only": True,
-                            "error_type": type(e).__name__, "error": str(e),
-                            "action": "capture_skipped_will_retry_next_interval",
-                        })
-                        logger.warning(f"Outcome research capture failed; execution remains fail-closed: {e}")
 
             phase = evaluate_outcome_market_phase(market)
             time_left = market.time_to_expiry_sec()
@@ -496,34 +508,52 @@ def run_integrated_hyperliquid_bot(
             # Settlement outlives active-market selection.  Keep requesting
             # official evidence for retiring instances until confirmed; BTC
             # price and UI state are never used as a settlement proxy.
-            settlement_candidates = list(retiring_markets)
+            settlement_candidates = {retiring_market.outcome_id for retiring_market in retiring_markets}
             if phase == MarketPhase.SETTLING:
-                settlement_candidates.append(market)
-            for settlement_market in settlement_candidates:
-                if settlement_market.outcome_id not in settled_markets:
+                settlement_candidates.add(market.outcome_id)
+            # Process restarts must not lose a previous daily market's
+            # settlement evidence.  Recover open journal inventory by market
+            # id; the official SDK endpoint only needs that id.
+            if not simulation:
+                settlement_candidates.update(pnl_reconciler.unresolved_outcome_ids())
+            for settlement_market_id in settlement_candidates:
+                if settlement_market_id not in settled_markets:
                     now_monotonic = time.monotonic()
-                    if now_monotonic - settlement_last_attempt_at.get(settlement_market.outcome_id, 0.0) < 30.0:
+                    if now_monotonic - settlement_last_attempt_at.get(settlement_market_id, 0.0) < 30.0:
                         continue
-                    settlement_last_attempt_at[settlement_market.outcome_id] = now_monotonic
+                    settlement_last_attempt_at[settlement_market_id] = now_monotonic
                     if not simulation:
                         try:
-                            settlement = settlement_adapter.fetch(settlement_market)
+                            settlement = settlement_adapter.fetch_outcome_id(settlement_market_id)
                             if not settlement.settled:
-                                logger.info(f"[OUTCOME SETTLEMENT] #{settlement_market.outcome_id} not yet confirmed by official SDK; holding state.")
+                                logger.info(f"[OUTCOME SETTLEMENT] #{settlement_market_id} not yet confirmed by official SDK; holding state.")
                             else:
-                                settled_markets.add(settlement_market.outcome_id)
                                 logger.info(
-                                    f"[OUTCOME SETTLEMENT] #{settlement_market.outcome_id} confirmed by official SDK "
+                                    f"[OUTCOME SETTLEMENT] #{settlement_market_id} confirmed by official SDK "
                                     f"fraction={settlement.settle_fraction} details={settlement.details}"
                                 )
-                                # A standalone binary side has no generic SDK
-                                # redeem action.  Do not infer one from BTC price.
+                                # Confirmation alone is not PnL.  Require the
+                                # official account's payout or zero-balance
+                                # evidence before a canonical settlement row.
+                                account_fills = client.get_user_fills_sync(auth.wallet_address)
+                                clearinghouse = client.get_spot_clearinghouse_state_sync(auth.wallet_address)
+                                status = pnl_reconciler.reconcile_settlement(
+                                    settlement=settlement, raw_fills=account_fills, clearinghouse=clearinghouse,
+                                )
+                                if status in {"recorded", "already_recorded"}:
+                                    settled_markets.add(settlement_market_id)
+                                    logger.info(f"[OUTCOME SETTLEMENT] #{settlement_market_id} canonical PnL {status}")
+                                else:
+                                    logger.info(
+                                        f"[OUTCOME SETTLEMENT] #{settlement_market_id} confirmation retained; "
+                                        f"canonical PnL {status}"
+                                    )
                         except Exception as e:
                             logger.warning(f"[OUTCOME SETTLEMENT] official confirmation unavailable: {e}")
                     else:
-                        settled_markets.add(settlement_market.outcome_id)
+                        settled_markets.add(settlement_market_id)
                         logger.info(
-                            f"[OUTCOME SETTLEMENT] simulation marked #{settlement_market.outcome_id} "
+                            f"[OUTCOME SETTLEMENT] simulation marked #{settlement_market_id} "
                             "terminal without inferring payout from BTC price"
                         )
 
@@ -581,6 +611,8 @@ def run_integrated_hyperliquid_bot(
     except KeyboardInterrupt:
         logger.info("Hyperliquid trading bot stopped by user.")
     finally:
+        if research_worker is not None:
+            research_worker.stop()
         if live_ws_recorder is not None:
             live_ws_recorder.stop()
         if terminal_dash:

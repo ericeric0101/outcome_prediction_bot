@@ -6,9 +6,16 @@ from __future__ import annotations
 
 import argparse
 import sqlite3
+import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from monitoring.trade_journal_db import TradeJournalDB
 
 
 def _to_iso_utc(hours: int) -> str:
@@ -32,6 +39,9 @@ def main() -> int:
     if not db_path.exists():
         print(f"找不到資料庫：{db_path}")
         return 1
+
+    # Apply additive journal migrations before querying canonical Outcome lots.
+    TradeJournalDB(str(db_path))
 
     cutoff = _to_iso_utc(args.hours) if args.hours and args.hours > 0 else None
 
@@ -85,6 +95,21 @@ def main() -> int:
         """,
         strategy_params,
     ).fetchone()
+
+    # Outcome fills are immutable venue facts.  Their realised PnL is stored
+    # as idempotent FIFO allocations instead of mutating historical fill rows.
+    # The table is journal-global, so a --run-id filter cannot safely pretend
+    # it is a per-run result.
+    canonical = cur.execute(
+        """
+        SELECT close_kind, COUNT(*) AS rows,
+               SUM(CAST(realized_net_usdc AS REAL)) AS pnl_usdc,
+               SUM(CAST(cost_usdc AS REAL)) AS cost_usdc,
+               SUM(CAST(proceeds_usdc AS REAL)) AS proceeds_usdc
+        FROM outcome_realized_pnl_lots
+        GROUP BY close_kind
+        """
+    ).fetchall()
 
     quality = cur.execute(
         f"""
@@ -148,6 +173,18 @@ def main() -> int:
     print(f"勝/負：{wins}/{losses}（勝率={win_rate:.2f}%）")
     print(f"已實現損益（USDC）：{_fmt_num(realized_pnl)}")
     print(f"成交手續費總額（USDC）：{_fmt_num(commissions)}")
+
+    canonical_by_kind = {str(row[0]): row for row in canonical}
+    canonical_sell = canonical_by_kind.get("sell")
+    canonical_settlement = canonical_by_kind.get("settlement")
+    canonical_sell_pnl = float(canonical_sell[2] or 0.0) if canonical_sell else 0.0
+    canonical_settlement_pnl = float(canonical_settlement[2] or 0.0) if canonical_settlement else 0.0
+    print("\n[Outcome canonical FIFO 對帳（全 journal；不以 run_id 切分）]")
+    print(f"已賣出 lot 數：{int(canonical_sell[1] or 0) if canonical_sell else 0}")
+    print(f"已賣出 canonical PnL（USDC）：{_fmt_num(canonical_sell_pnl)}")
+    print(f"已結算 lot 數：{int(canonical_settlement[1] or 0) if canonical_settlement else 0}")
+    print(f"已結算 canonical PnL（USDC）：{_fmt_num(canonical_settlement_pnl)}")
+    print(f"Outcome canonical 合計（USDC）：{_fmt_num(canonical_sell_pnl + canonical_settlement_pnl)}")
 
     print("\n[結算損益]")
     print(f"結算事件筆數（MARKET_SETTLEMENT）：{settlement_rows}")

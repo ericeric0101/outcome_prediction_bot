@@ -49,6 +49,35 @@ def test_gate_persists_nonexecuting_ablation_variants_without_relaxing_s0(tmp_pa
     assert decision.evidence["gate_variants"]["spot_mark_oi"] == {"eligible": False, "side_index": None}
 
 
+def test_tier_b_uses_fresh_spot_mark_but_not_oi_direction_when_enabled(tmp_path):
+    db = TradeJournalDB(tmp_path / "strategy.db")
+    _oi(db, timestamp=1_000_000, oi="100", mark="100", tag="old")
+    # OI falls while spot and mark both confirm UP.  Baseline stays blocked;
+    # the explicit Tier-B experiment may select UP without treating falling
+    # OI as a direction signal.
+    _oi(db, timestamp=1_300_000, oi="99", mark="101", tag="new")
+    gate = OutcomeOiEntryGate(
+        db.db_path,
+        OutcomeLiveStrategyConfig(oi_max_age_sec=90, tier_b_enabled=True),
+    )
+    decision = gate.evaluate(spot_price=Decimal("101"), strike_price=Decimal("100"), now_ms=1_330_000)
+    assert decision.side_index == 0
+    assert decision.reason == "up_spot_mark_tier_b_confirmed"
+    assert decision.evidence["entry_tier"] == "tier_b_spot_mark"
+    assert decision.evidence["tier_b_enabled"] is True
+
+
+def test_tier_b_remains_off_by_default(tmp_path):
+    db = TradeJournalDB(tmp_path / "strategy.db")
+    _oi(db, timestamp=1_000_000, oi="100", mark="100", tag="old")
+    _oi(db, timestamp=1_300_000, oi="99", mark="101", tag="new")
+    decision = OutcomeOiEntryGate(
+        db.db_path, OutcomeLiveStrategyConfig(oi_max_age_sec=90),
+    ).evaluate(spot_price=Decimal("101"), strike_price=Decimal("100"), now_ms=1_330_000)
+    assert decision.side_index is None
+    assert decision.evidence["tier_b_enabled"] is False
+
+
 def test_live_strategy_config_has_no_daily_entry_count_parameter(monkeypatch):
     monkeypatch.setenv("OUTCOME_LIVE_STRATEGY_MAX_DAILY_ENTRIES", "0")
     assert not hasattr(OutcomeLiveStrategyConfig.from_env(), "max_daily_entries")

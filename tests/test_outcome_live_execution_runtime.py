@@ -178,6 +178,38 @@ def test_s0_live_strategy_logs_explicit_oi_policy_entry(monkeypatch, tmp_path):
     assert runtime._persisted_p3_exit_policy(market=market(), coin="#11531").target_return_pct == Decimal("0.03")
 
 
+def test_s0_tier_b_entry_keeps_auditable_recovery_policy(monkeypatch, tmp_path):
+    monkeypatch.setenv("OUTCOME_AUTOMATED_EXECUTION_ENABLED", "1")
+    monkeypatch.setenv("OUTCOME_SDK_EXECUTION_ENABLED", "1")
+    monkeypatch.setenv("OUTCOME_LIVE_STRATEGY_ENABLED", "1")
+    journal = TradeJournalDB(tmp_path / "tier_b.db")
+
+    class TierBGateway(Gateway):
+        def place_alo(self, **_): return {"orderId": "tier-b-buy"}
+
+    runtime = OutcomeLiveExecutionRuntime(
+        account=CalibrationAccount(), wallet="w", gateway=TierBGateway(), stream_health=healthy_stream(),
+        ledger=OutcomeExecutionLedger(journal, "run"),
+    )
+    result = runtime.tick_live_strategy(
+        market=market(), entry_side_index=0, entry_reason="up_spot_mark_tier_b_confirmed",
+        entry_evidence={"entry_tier": "tier_b_spot_mark", "tier_b_enabled": True, "oi_age_ms": 10},
+    )
+    assert result.state == "buy_placed"
+    import sqlite3
+    with sqlite3.connect(journal.db_path) as conn:
+        payload = conn.execute(
+            "SELECT payload_json FROM strategy_events WHERE event_type='OUTCOME_LIVE_STRATEGY_ENTRY_PLACED'"
+        ).fetchone()[0]
+        submit = conn.execute(
+            "SELECT payload_json FROM order_events WHERE event_type='ORDER_SUBMIT' AND venue_order_id='tier-b-buy'"
+        ).fetchone()[0]
+    assert '"entry_tier": "tier_b_spot_mark"' in payload
+    assert '"sampling_policy": "spot_mark_tier_b"' in payload
+    assert '"entry_policy_kind": "s0_spot_mark_tier_b"' in submit
+    assert runtime._persisted_entry_policy_evidence(market=market(), coin="#11530") is not None
+
+
 def test_s0_live_strategy_blocks_selected_bid_in_50_to_55_no_trade_band(monkeypatch, tmp_path):
     monkeypatch.setenv("OUTCOME_AUTOMATED_EXECUTION_ENABLED", "1")
     monkeypatch.setenv("OUTCOME_SDK_EXECUTION_ENABLED", "1")

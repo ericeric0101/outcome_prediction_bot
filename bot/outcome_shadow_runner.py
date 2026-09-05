@@ -33,6 +33,7 @@ from bot.outcome_event_bridge import OutcomeJournalBridge
 from bot.outcome_spec_audit import OutcomeSpecAudit
 from bot.outcome_ws_recorder import OutcomeWebSocketRecorder
 from bot.outcome_p3_pipeline import OutcomeP3Pipeline
+from bot.outcome_markout import OutcomeQuote
 from bot.outcome_p2_quality import P2_SCHEMA_VERSION, build_p2_capture_quality
 from bot.position_manager import PositionManager, PositionManagerConfig
 from bot.pricing.outcome_pricing import OutcomePricingState
@@ -335,7 +336,9 @@ class OutcomeShadowRunner:
 
         for fill in account.fills:
             observed_period = market.period if fill.outcome_id == market.outcome_id else "unknown"
-            self.p3_pipeline.record_actual_fill(fill, period=observed_period)
+            self.p3_pipeline.record_actual_fill(
+                fill, period=observed_period, observed_at_ms=int(time.time() * 1000),
+            )
 
         mids = self.client.get_all_mids_sync(ttl_sec=0)
         self.pricing.update_btc_mark_price(mids["BTC"])
@@ -374,7 +377,7 @@ class OutcomeShadowRunner:
             maker_close_fee_rate=maker_close_fee_rate,
             taker_close_fee_rate=taker_close_fee_rate,
         ).analyze(market, raw_books[market.yes_coin], raw_books[market.no_coin])
-        self.journal.log_strategy_event(self.run_id, "OUTCOME_P2_PARITY_SNAPSHOT", {
+        snapshot_event_id = self.journal.log_strategy_event(self.run_id, "OUTCOME_P2_PARITY_SNAPSHOT", {
             "venue": "hyperliquid_outcome", "period": market.period,
             "p2_schema_version": P2_SCHEMA_VERSION,
             "snapshot_timestamp_ms": capture_complete_at_ms,
@@ -384,14 +387,44 @@ class OutcomeShadowRunner:
             "fee_evidence": fee_evidence,
             **parity.as_dict(),
         })
-        yes_top = self.pricing.get_book_top(market.yes_coin)
-        p3_written = self.p3_pipeline.observe_quotes(
-            outcome_id=market.outcome_id, period=market.period,
-            quotes=self.p3_pipeline.quotes_from_journal(outcome_id=market.outcome_id, period=market.period),
-            time_left_sec=market.time_to_expiry_sec(),
-            spread=(yes_top.spread if yes_top else None),
-            depth=(yes_top.bid_size if yes_top else None), volatility_regime="unknown",
-        )
+        p3_written = 0
+        if capture_quality.get("status") == "accepted" and snapshot_event_id is not None:
+            def _top(book: dict[str, Any]) -> tuple[Decimal | None, Decimal | None, Decimal | None]:
+                levels = book.get("levels", [[], []])
+                bids = levels[0] if isinstance(levels, list) and levels else []
+                asks = levels[1] if isinstance(levels, list) and len(levels) > 1 else []
+                bid = Decimal(str(bids[0]["px"])) if bids else None
+                ask = Decimal(str(asks[0]["px"])) if asks else None
+                depth = Decimal(str(bids[0]["sz"])) if bids else None
+                return bid, ask, depth
+
+            yes_bid, yes_ask, yes_depth = _top(raw_books[market.yes_coin])
+            no_bid, no_ask, no_depth = _top(raw_books[market.no_coin])
+            time_left_sec = market.time_to_expiry_sec(current_timestamp=capture_complete_at_ms // 1000)
+            p3_written = self.p3_pipeline.record_quote_snapshot(
+                snapshot_event_id=snapshot_event_id,
+                outcome_id=market.outcome_id,
+                period=market.period,
+                snapshot_timestamp_ms=capture_complete_at_ms,
+                quotes=(
+                    OutcomeQuote(market.yes_coin, capture_complete_at_ms, yes_bid, yes_ask, snapshot_event_id),
+                    OutcomeQuote(market.no_coin, capture_complete_at_ms, no_bid, no_ask, snapshot_event_id),
+                ),
+                quote_contexts={
+                    market.yes_coin: {
+                        "time_left_sec": time_left_sec,
+                        "spread": str(yes_ask - yes_bid) if yes_ask is not None and yes_bid is not None else None,
+                        "depth": str(yes_depth) if yes_depth is not None else None,
+                        "volatility_regime": "unknown",
+                    },
+                    market.no_coin: {
+                        "time_left_sec": time_left_sec,
+                        "spread": str(no_ask - no_bid) if no_ask is not None and no_bid is not None else None,
+                        "depth": str(no_depth) if no_depth is not None else None,
+                        "volatility_regime": "unknown",
+                    },
+                },
+            )
 
         if self.ws_recorder:
             if self._last_market and self._last_market.outcome_id != market.outcome_id:

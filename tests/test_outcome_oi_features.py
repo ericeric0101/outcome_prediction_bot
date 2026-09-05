@@ -68,11 +68,12 @@ def test_x3_fill_overlay_uses_only_actual_maker_markout(tmp_path):
     _oi(journal, exchange=base - 10, local=base - 5, oi="100")
     journal.log_order_event("live", "ORDER_FILLED", side="BUY", payload={"actual_fill": True, "period": "1d",
         "outcome_id": 9, "trade_id": "fill-1", "timestamp_ms": base, "liquidity_class": "maker", "price": "0.4", "quantity": "10"})
-    journal.log_order_event("p3", "FILL_MARKOUT", side="BUY", payload={"actual_fill": True, "fill_id": "fill-1",
-        "horizon_sec": 60, "signed_markout_ps": "0.02", "fee_per_share": "0.001", "executable_quote": True})
+    journal.log_order_event("p3", "FILL_MARKOUT", side="BUY", payload={"actual_fill": True, "p3_markout_schema_version": 2, "fill_context_status": "asof_or_before_fill", "fill_id": "fill-1",
+        "horizon_sec": 10, "horizon_tolerance_ms": 2500, "target_lag_ms": 0, "actual_elapsed_ms": 10000,
+        "signed_markout_ps": "0.02", "fee_per_share": "0.001", "executable_quote": True})
     result = OutcomeOiFeaturePipeline(journal).build()
     assert result.maker_fill_rows == 1
     with sqlite3.connect(journal.db_path) as conn:
         features, marks = conn.execute("SELECT features_json,actual_markouts_json FROM outcome_oi_fill_feature_rows").fetchone()
     assert json.loads(features)["actual_fill"] is True
-    assert json.loads(marks)["60"]["signed_markout_ps"] == "0.02"
+    assert json.loads(marks)["10"]["signed_markout_ps"] == "0.02"

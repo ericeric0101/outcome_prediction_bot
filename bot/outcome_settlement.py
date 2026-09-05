@@ -25,11 +25,15 @@ class OutcomeSettlementAdapter:
         self.sidecar = sidecar or OutcomeSdkSidecarClient()
 
     def fetch(self, market: OutcomeMarketSpec) -> OutcomeSettlement:
-        raw = self.sidecar.request("fetch_settled_outcome", payload={"marketId": str(market.outcome_id)})
+        return self.fetch_outcome_id(market.outcome_id)
+
+    def fetch_outcome_id(self, outcome_id: int) -> OutcomeSettlement:
+        """Fetch settlement for a journal-recovered retired market by id."""
+        raw = self.sidecar.request("fetch_settled_outcome", payload={"marketId": str(outcome_id)})
         if raw is None:
-            return OutcomeSettlement(market.outcome_id, False, None, None, None)
+            return OutcomeSettlement(int(outcome_id), False, None, None, None)
         fraction = raw.get("settleFraction")
-        return OutcomeSettlement(market.outcome_id, True, Decimal(str(fraction)) if fraction is not None else None, raw.get("details"), raw)
+        return OutcomeSettlement(int(outcome_id), True, Decimal(str(fraction)) if fraction is not None else None, raw.get("details"), raw)
 
     def merge_paired_shares(self, *, market: OutcomeMarketSpec, amount: Decimal) -> dict[str, Any]:
         """Merge paired Yes+No shares only after official settlement confirmation.

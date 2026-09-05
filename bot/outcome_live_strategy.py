@@ -28,6 +28,7 @@ class OutcomeLiveStrategyConfig:
     oi_lookback_sec: int = 300
     oi_max_age_sec: int = 90
     min_entry_price: Decimal = Decimal("0.55")
+    tier_b_enabled: bool = False
 
     @classmethod
     def from_env(cls) -> "OutcomeLiveStrategyConfig":
@@ -43,6 +44,7 @@ class OutcomeLiveStrategyConfig:
             oi_lookback_sec=int(os.environ.get("OUTCOME_LIVE_STRATEGY_OI_LOOKBACK_SEC", "300")),
             oi_max_age_sec=int(os.environ.get("OUTCOME_LIVE_STRATEGY_OI_MAX_AGE_SEC", "90")),
             min_entry_price=Decimal(os.environ.get("OUTCOME_LIVE_STRATEGY_MIN_ENTRY_PRICE", "0.55")),
+            tier_b_enabled=os.environ.get("OUTCOME_TIER_B_ENABLED", "0").strip().lower() in {"1", "true", "yes", "on"},
         )
         if not (Decimal("0") <= value.floor_return_pct <= value.narrow_return_pct <= value.target_return_pct < Decimal("1")):
             raise ValueError("live strategy return tiers must satisfy 0 <= floor <= narrow <= target < 1")
@@ -153,12 +155,27 @@ class OutcomeOiEntryGate:
                 oi_return_bps=oi_return_bps,
             ),
         }
-        if (spot_strike_bps >= self.config.spot_strike_min_bps
-                and mark_return_bps >= self.config.mark_return_min_bps
-                and oi_return_bps >= self.config.oi_return_min_bps):
-            return OutcomeOiEntryDecision(0, "up_spot_mark_oi_confirmed", evidence)
-        if (spot_strike_bps <= -self.config.spot_strike_min_bps
-                and mark_return_bps <= -self.config.mark_return_min_bps
-                and oi_return_bps >= self.config.oi_return_min_bps):
-            return OutcomeOiEntryDecision(1, "down_spot_mark_oi_confirmed", evidence)
+        baseline = evidence["gate_variants"]["spot_mark_oi"]
+        tier_b = evidence["gate_variants"]["spot_mark"]
+        evidence["tier_b_enabled"] = self.config.tier_b_enabled
+        # Keep the proven baseline as the preferred path.  Tier B relaxes
+        # only the OI-direction/activity predicate: fresh OI observations
+        # remain mandatory because they supply the Binance mark series.
+        if baseline["eligible"]:
+            side_index = int(baseline["side_index"])
+            evidence["entry_tier"] = "tier_a_spot_mark_oi"
+            return OutcomeOiEntryDecision(
+                side_index,
+                "up_spot_mark_oi_confirmed" if side_index == 0 else "down_spot_mark_oi_confirmed",
+                evidence,
+            )
+        if self.config.tier_b_enabled and tier_b["eligible"]:
+            side_index = int(tier_b["side_index"])
+            evidence["entry_tier"] = "tier_b_spot_mark"
+            return OutcomeOiEntryDecision(
+                side_index,
+                "up_spot_mark_tier_b_confirmed" if side_index == 0 else "down_spot_mark_tier_b_confirmed",
+                evidence,
+            )
+        evidence["entry_tier"] = None
         return OutcomeOiEntryDecision(None, "directional_confirmation_not_met", evidence)

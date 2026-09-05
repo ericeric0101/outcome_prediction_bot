@@ -54,7 +54,7 @@ def test_p3_report_requires_actual_maker_fills_and_positive_fee_adjusted_lcb(tmp
     with sqlite3.connect(db) as conn:
         conn.execute("CREATE TABLE order_events (event_type TEXT, payload_json TEXT)")
         for _ in range(30):
-            conn.execute("INSERT INTO order_events VALUES (?, ?)", ("FILL_MARKOUT", json.dumps({"actual_fill": True, "executable_quote": True, "counterfactual": False, "period": "1d", "horizon_sec": 10, "entry_regime_bucket": "bucket", "signed_markout_ps": 0.02, "fee_per_share": 0.001})))
+            conn.execute("INSERT INTO order_events VALUES (?, ?)", ("FILL_MARKOUT", json.dumps({"actual_fill": True, "executable_quote": True, "counterfactual": False, "p3_markout_schema_version": 2, "fill_context_status": "asof_or_before_fill", "period": "1d", "horizon_sec": 10, "horizon_tolerance_ms": 2500, "target_lag_ms": 0, "actual_elapsed_ms": 10000, "entry_regime_bucket": "bucket", "signed_markout_ps": 0.02, "fee_per_share": 0.001})))
     report = p3_report(db, periods=("1d",), min_actual_fills=30)[0]
     assert report.ready and report.actual_maker_fill_count == 30 and report.fee_adjusted_lcb95_per_share > 0
 
@@ -66,3 +66,32 @@ def test_p3_report_excludes_counterfactual_and_does_not_cross_periods(tmp_path):
         conn.execute("INSERT INTO order_events VALUES (?, ?)", ("FILL_MARKOUT", json.dumps({"actual_fill": False, "counterfactual": True, "period": "1d", "horizon_sec": 10})))
     report = p3_report(db, periods=("15m",), min_actual_fills=1)[0]
     assert report.period == "15m" and not report.ready and report.actual_maker_fill_count == 0
+
+
+def test_p3_report_excludes_v2_payload_when_elapsed_is_outside_tolerance(tmp_path):
+    db = tmp_path / "journal.db"
+    payload = {
+        "actual_fill": True, "executable_quote": True, "counterfactual": False,
+        "p3_markout_schema_version": 2, "fill_context_status": "asof_or_before_fill", "period": "1d", "horizon_sec": 5,
+        "horizon_tolerance_ms": 2500, "target_lag_ms": 28000, "actual_elapsed_ms": 33000,
+        "entry_regime_bucket": "bucket", "signed_markout_ps": 0.5,
+    }
+    with sqlite3.connect(db) as conn:
+        conn.execute("CREATE TABLE order_events (event_type TEXT, payload_json TEXT)")
+        conn.execute("INSERT INTO order_events VALUES (?, ?)", ("FILL_MARKOUT", json.dumps(payload)))
+    report = p3_report(db, periods=("1d",), min_actual_fills=1)[0]
+    assert report.actual_maker_fill_count == 0
+
+
+def test_p3_report_excludes_exact_timing_row_without_fill_time_context(tmp_path):
+    db = tmp_path / "journal.db"
+    payload = {
+        "actual_fill": True, "executable_quote": True, "counterfactual": False,
+        "p3_markout_schema_version": 2, "period": "1d", "horizon_sec": 5,
+        "horizon_tolerance_ms": 2500, "target_lag_ms": 0, "actual_elapsed_ms": 5000,
+        "entry_regime_bucket": "bucket", "signed_markout_ps": 0.5,
+    }
+    with sqlite3.connect(db) as conn:
+        conn.execute("CREATE TABLE order_events (event_type TEXT, payload_json TEXT)")
+        conn.execute("INSERT INTO order_events VALUES (?, ?)", ("FILL_MARKOUT", json.dumps(payload)))
+    assert p3_report(db, periods=("1d",), min_actual_fills=1)[0].actual_maker_fill_count == 0

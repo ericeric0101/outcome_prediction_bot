@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from bot.outcome_p2_quality import is_eligible_p2_snapshot
+from bot.outcome_markout import P3_MARKOUT_HORIZONS_SEC, P3_MARKOUT_SCHEMA_VERSION
 from monitoring.trade_journal_db import TradeJournalDB
 
 FEATURE_SCHEMA_VERSION = 2
@@ -130,11 +131,25 @@ class OutcomeOiFeaturePipeline:
                 continue
             if not isinstance(payload, dict) or payload.get("actual_fill") is not True:
                 continue
+            if int(payload.get("p3_markout_schema_version") or 0) != P3_MARKOUT_SCHEMA_VERSION:
+                continue
+            if payload.get("fill_context_status") != "asof_or_before_fill":
+                continue
             fill_id, horizon = payload.get("fill_id"), payload.get("horizon_sec")
-            if fill_id and isinstance(horizon, int):
+            try:
+                valid_timing = (
+                    int(horizon) in P3_MARKOUT_HORIZONS_SEC
+                    and int(payload["actual_elapsed_ms"]) >= 0
+                    and abs(int(payload["target_lag_ms"])) <= int(payload["horizon_tolerance_ms"])
+                )
+            except (KeyError, TypeError, ValueError):
+                valid_timing = False
+            if fill_id and isinstance(horizon, int) and valid_timing:
                 output.setdefault(str(fill_id), {})[str(horizon)] = {
                     "signed_markout_ps": payload.get("signed_markout_ps"), "fee_per_share": payload.get("fee_per_share"),
                     "executable_quote": payload.get("executable_quote") is True,
+                    "actual_elapsed_ms": payload.get("actual_elapsed_ms"),
+                    "target_lag_ms": payload.get("target_lag_ms"),
                 }
         return output
 

@@ -127,7 +127,9 @@ class OutcomeLiveExecutionRuntime:
             # cancel/requote ownership.  P3 and manual orders remain outside
             # this controller's authority.
             try:
-                if result.audit.get("entry_policy_schema_version") == 1 and result.audit.get("entry_policy_kind") == "s0_oi_spot_mark_confirmation":
+                if result.audit.get("entry_policy_schema_version") == 1 and result.audit.get("entry_policy_kind") in {
+                    "s0_oi_spot_mark_confirmation", "s0_spot_mark_tier_b",
+                }:
                     self.entry_lifecycle_store.record(OutcomeEntryLifecycle(
                         wallet=self.recovery.wallet, outcome_id=market.outcome_id, coin=coin,
                         order_id=str(result.order_id), price=Decimal(str(result.audit["entry_bid_at_decision"])),
@@ -210,7 +212,9 @@ class OutcomeLiveExecutionRuntime:
                     # For new S0 entries, verify the matching order record
                     # whenever it is present, without making old positions
                     # impossible to reconcile after deployment.
-                    if str(payload.get("sampling_policy", "")) == "oi_spot_mark_confirmation":
+                    if str(payload.get("sampling_policy", "")) in {
+                        "oi_spot_mark_confirmation", "spot_mark_tier_b",
+                    }:
                         order_id = str(payload.get("order_id") or "")
                         if order_id:
                             audit_row = conn.execute(
@@ -243,7 +247,11 @@ class OutcomeLiveExecutionRuntime:
             for timestamp, raw_payload in rows:
                 order_payload = json.loads(raw_payload or "{}")
                 audit = order_payload.get("audit") if isinstance(order_payload, dict) else None
-                if isinstance(audit, dict) and audit.get("entry_policy_schema_version") == 1 and audit.get("entry_policy_kind") == "s0_oi_spot_mark_confirmation":
+                if (
+                    isinstance(audit, dict)
+                    and audit.get("entry_policy_schema_version") == 1
+                    and audit.get("entry_policy_kind") in {"s0_oi_spot_mark_confirmation", "s0_spot_mark_tier_b"}
+                ):
                     return str(timestamp), audit
             return None
         except (KeyError, TypeError, ValueError, sqlite3.Error, json.JSONDecodeError):
@@ -295,8 +303,8 @@ class OutcomeLiveExecutionRuntime:
             # presence of the full tier contract identifies that legacy S0
             # shape without mistaking a P3 calibration record for S0.
             is_s0 = (
-                str(payload.get("entry_policy_kind", "")) == "s0_oi_spot_mark_confirmation"
-                or str(payload.get("sampling_policy", "")) == "oi_spot_mark_confirmation"
+                str(payload.get("entry_policy_kind", "")) in {"s0_oi_spot_mark_confirmation", "s0_spot_mark_tier_b"}
+                or str(payload.get("sampling_policy", "")) in {"oi_spot_mark_confirmation", "spot_mark_tier_b"}
                 or all(key in payload for key in ("narrow_after_sec", "narrow_return_pct", "floor_after_sec", "floor_return_pct"))
             )
             if not is_s0:
@@ -1065,9 +1073,14 @@ class OutcomeLiveExecutionRuntime:
         # follow-up strategy event remains useful for research queries, but
         # it is deliberately not the sole source of truth for an accepted
         # live entry order.
+        entry_tier = str(entry_evidence.get("entry_tier") or "tier_a_spot_mark_oi")
+        tier_b = entry_tier == "tier_b_spot_mark"
+        entry_policy_kind = "s0_spot_mark_tier_b" if tier_b else "s0_oi_spot_mark_confirmation"
+        sampling_policy = "spot_mark_tier_b" if tier_b else "oi_spot_mark_confirmation"
         entry_audit = {
             "entry_policy_schema_version": 1,
-            "entry_policy_kind": "s0_oi_spot_mark_confirmation",
+            "entry_policy_kind": entry_policy_kind,
+            "entry_tier": entry_tier,
             "target_return_pct": str(target_decision.target_return_pct),
             "target_policy_source": target_decision.source,
             "target_estimated_move_pct": (
@@ -1108,7 +1121,8 @@ class OutcomeLiveExecutionRuntime:
                 "narrow_after_sec": config.narrow_after_sec, "narrow_return_pct": str(config.narrow_return_pct),
                 "floor_after_sec": config.floor_after_sec, "floor_return_pct": str(config.floor_return_pct),
                 "order_id": result.order_id, "entry_reason": entry_reason,
-                "entry_evidence": entry_evidence, "sampling_policy": "oi_spot_mark_confirmation",
+                "entry_evidence": entry_evidence, "entry_tier": entry_tier,
+                "sampling_policy": sampling_policy,
                 "directional_signal_used": True,
             })
         return self._record(market, entry_side_index, result)

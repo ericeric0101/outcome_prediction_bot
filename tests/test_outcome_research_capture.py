@@ -6,6 +6,7 @@ from decimal import Decimal
 
 from bot.lifecycle.outcome_lifecycle import OutcomeMarketSpec
 from bot.outcome_research_capture import OutcomeResearchCapture
+from bot.outcome_research_worker import OutcomeResearchWorker
 from monitoring.trade_journal_db import TradeJournalDB
 
 
@@ -24,6 +25,9 @@ class Client:
 
     def get_user_fills_sync(self, _wallet):
         return [{"coin": "#5160", "tid": "fill-1", "side": "B", "px": "0.60", "sz": "10", "fee": "0", "time": 1, "crossed": False}]
+
+    def get_l2_book_sync(self, coin, ttl_sec=1.0):
+        return book(2_000, "0.60", "0.61") if coin.endswith("0") else book(2_000, "0.39", "0.40")
 
 
 def test_live_research_capture_writes_p2_p3_heartbeat_and_gap(tmp_path):
@@ -88,3 +92,19 @@ def test_duplicate_fill_repair_keeps_first_row_and_logs_audit(tmp_path):
         audit = conn.execute("SELECT payload_json FROM strategy_events WHERE event_type='OUTCOME_FILL_DEDUPE_REPAIR' ORDER BY id DESC").fetchone()[0]
     assert rows == 1
     assert json.loads(audit)["removed_count"] == 1
+
+
+def test_dedicated_worker_captures_without_live_loop_books(tmp_path):
+    journal = TradeJournalDB(tmp_path / "journal.db")
+    capture = OutcomeResearchCapture(
+        client=Client(), wallet_address="0x" + "a" * 40, journal=journal,
+        interval_sec=1, heartbeat_sec=1, gap_alert_sec=3, account_sync_async=False,
+    )
+    worker = OutcomeResearchWorker(client=Client(), capture=capture, journal=journal)
+    worker.set_market(market())
+    assert worker.run_once().captured
+    with sqlite3.connect(journal.db_path) as conn:
+        count = conn.execute(
+            "SELECT COUNT(*) FROM strategy_events WHERE event_type='OUTCOME_P2_PARITY_SNAPSHOT'"
+        ).fetchone()[0]
+    assert count == 1

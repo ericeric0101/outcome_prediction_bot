@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from bot.outcome_p2_quality import is_eligible_p2_snapshot
+from bot.outcome_markout import P3_MARKOUT_HORIZONS_SEC, P3_MARKOUT_SCHEMA_VERSION
 
 
 @dataclass(frozen=True)
@@ -79,7 +80,7 @@ def _bootstrap_lcb95(values: list[float], *, draws: int = 1000) -> float | None:
 def p3_report(db_path: str | Path, *, periods: tuple[str, ...], min_actual_fills: int = 30) -> tuple[P3BucketReport, ...]:
     path = Path(db_path)
     if not path.exists():
-        return tuple(P3BucketReport(period, horizon, "none", 0, None, None, False, ("journal_missing",)) for period in periods for horizon in (1, 5, 10, 30))
+        return tuple(P3BucketReport(period, horizon, "none", 0, None, None, False, ("journal_missing",)) for period in periods for horizon in P3_MARKOUT_HORIZONS_SEC)
     with sqlite3.connect(path) as conn:
         rows = conn.execute("SELECT payload_json FROM order_events WHERE event_type='FILL_MARKOUT'").fetchall()
     groups: dict[tuple[str, int, str], list[float]] = {}
@@ -88,7 +89,16 @@ def p3_report(db_path: str | Path, *, periods: tuple[str, ...], min_actual_fills
             payload = json.loads(raw)
             if not (payload.get("actual_fill") is True and payload.get("executable_quote") is True and payload.get("counterfactual") is False):
                 continue
+            if int(payload.get("p3_markout_schema_version") or 0) != P3_MARKOUT_SCHEMA_VERSION:
+                continue
+            if payload.get("fill_context_status") != "asof_or_before_fill":
+                continue
             period, horizon = str(payload["period"]), int(payload["horizon_sec"])
+            tolerance_ms = int(payload["horizon_tolerance_ms"])
+            target_lag_ms = int(payload["target_lag_ms"])
+            actual_elapsed_ms = int(payload["actual_elapsed_ms"])
+            if horizon not in P3_MARKOUT_HORIZONS_SEC or actual_elapsed_ms < 0 or abs(target_lag_ms) > tolerance_ms:
+                continue
             value = float(payload["signed_markout_ps"]) - float(payload.get("fee_per_share") or 0)
             groups.setdefault((period, horizon, str(payload.get("entry_regime_bucket") or "unknown")), []).append(value)
         except (KeyError, TypeError, ValueError, json.JSONDecodeError):
@@ -97,7 +107,7 @@ def p3_report(db_path: str | Path, *, periods: tuple[str, ...], min_actual_fills
     for period in periods:
         period_groups = [(key, values) for key, values in groups.items() if key[0] == period]
         if not period_groups:
-            reports.extend(P3BucketReport(period, horizon, "none", 0, None, None, False, ("no_actual_maker_markouts",)) for horizon in (1, 5, 10, 30))
+            reports.extend(P3BucketReport(period, horizon, "none", 0, None, None, False, ("no_exact_horizon_v2_actual_maker_markouts",)) for horizon in P3_MARKOUT_HORIZONS_SEC)
             continue
         for (_, horizon, bucket), values in sorted(period_groups):
             lcb = _bootstrap_lcb95(values)

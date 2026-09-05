@@ -15,6 +15,7 @@ from typing import Any, Mapping
 
 from bot.lifecycle.outcome_lifecycle import OutcomeMarketSpec
 from bot.outcome_event_bridge import OutcomeFillEvent
+from bot.outcome_markout import OutcomeQuote
 from bot.outcome_p2_quality import P2_SCHEMA_VERSION, build_p2_capture_quality
 from bot.outcome_market_authority import publish_outcome_market_authority
 from bot.outcome_p3_pipeline import OutcomeP3Pipeline
@@ -103,7 +104,7 @@ class OutcomeResearchCapture:
                 except ValueError:
                     continue
                 observed_period = market.period if fill.outcome_id == market.outcome_id else "unknown"
-                self._p3.record_actual_fill(fill, period=observed_period)
+                self._p3.record_actual_fill(fill, period=observed_period, observed_at_ms=now_ms)
         except Exception as exc:
             fill_error = type(exc).__name__
 
@@ -181,7 +182,7 @@ class OutcomeResearchCapture:
         )
         maker_fee, taker_fee, fee_evidence = self._account_snapshot(now_ms=capture_complete_at_ms)
         parity = OutcomeParityAnalyzer(maker_close_fee_rate=maker_fee, taker_close_fee_rate=taker_fee).analyze(market, yes_book, no_book)
-        self.journal.log_strategy_event(self.run_id, "OUTCOME_P2_PARITY_SNAPSHOT", {
+        snapshot_event_id = self.journal.log_strategy_event(self.run_id, "OUTCOME_P2_PARITY_SNAPSHOT", {
             "venue": "hyperliquid_outcome", "period": market.period, "p2_schema_version": P2_SCHEMA_VERSION,
             "snapshot_timestamp_ms": capture_complete_at_ms, "outcome_id": market.outcome_id,
             # These are decision-time facts, not retrospective metadata.  X4
@@ -193,17 +194,44 @@ class OutcomeResearchCapture:
             "yes_coin": market.yes_coin, "no_coin": market.no_coin, "yes_l2": dict(yes_book), "no_l2": dict(no_book),
             "capture_quality": quality, "fee_evidence": fee_evidence, **parity.as_dict(),
         })
-        quotes = self._p3.quotes_from_journal(outcome_id=market.outcome_id, period=market.period)
-        yes_levels = yes_book.get("levels", [[], []])
-        bids = yes_levels[0] if isinstance(yes_levels, list) and yes_levels else []
-        asks = yes_levels[1] if isinstance(yes_levels, list) and len(yes_levels) > 1 else []
-        bid = Decimal(str(bids[0]["px"])) if bids else None
-        ask = Decimal(str(asks[0]["px"])) if asks else None
-        p3_written = self._p3.observe_quotes(
-            outcome_id=market.outcome_id, period=market.period, quotes=quotes,
-            time_left_sec=market.time_to_expiry_sec(), spread=(ask - bid if ask is not None and bid is not None else None),
-            depth=Decimal(str(bids[0]["sz"])) if bids else None, volatility_regime="unknown",
-        )
+        p3_written = 0
+        if quality.get("status") == "accepted" and snapshot_event_id is not None:
+            def _top(book: Mapping[str, Any]) -> tuple[Decimal | None, Decimal | None, Decimal | None]:
+                levels = book.get("levels", [[], []])
+                bids = levels[0] if isinstance(levels, list) and levels else []
+                asks = levels[1] if isinstance(levels, list) and len(levels) > 1 else []
+                bid = Decimal(str(bids[0]["px"])) if bids else None
+                ask = Decimal(str(asks[0]["px"])) if asks else None
+                depth = Decimal(str(bids[0]["sz"])) if bids else None
+                return bid, ask, depth
+
+            yes_bid, yes_ask, yes_depth = _top(yes_book)
+            no_bid, no_ask, no_depth = _top(no_book)
+            time_left_sec = market.time_to_expiry_sec(current_timestamp=capture_complete_at_ms // 1000)
+            p3_written = self._p3.record_quote_snapshot(
+                snapshot_event_id=snapshot_event_id,
+                outcome_id=market.outcome_id,
+                period=market.period,
+                snapshot_timestamp_ms=capture_complete_at_ms,
+                quotes=(
+                    OutcomeQuote(market.yes_coin, capture_complete_at_ms, yes_bid, yes_ask, snapshot_event_id),
+                    OutcomeQuote(market.no_coin, capture_complete_at_ms, no_bid, no_ask, snapshot_event_id),
+                ),
+                quote_contexts={
+                    market.yes_coin: {
+                        "time_left_sec": time_left_sec,
+                        "spread": str(yes_ask - yes_bid) if yes_ask is not None and yes_bid is not None else None,
+                        "depth": str(yes_depth) if yes_depth is not None else None,
+                        "volatility_regime": "unknown",
+                    },
+                    market.no_coin: {
+                        "time_left_sec": time_left_sec,
+                        "spread": str(no_ask - no_bid) if no_ask is not None and no_bid is not None else None,
+                        "depth": str(no_depth) if no_depth is not None else None,
+                        "volatility_regime": "unknown",
+                    },
+                },
+            )
         self._last_capture_ms = capture_complete_at_ms
         accepted = quality.get("status") == "accepted"
         self._heartbeat(now_ms=capture_complete_at_ms, market=market, accepted=accepted, p3_written=p3_written)

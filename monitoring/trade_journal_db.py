@@ -121,6 +121,37 @@ class TradeJournalDB:
             first_seen_at TEXT NOT NULL
         );
 
+        -- Canonical, idempotent Outcome lot accounting.  Original exchange
+        -- fills remain append-only evidence; this table stores the exact FIFO
+        -- allocation which made a realised PnL observation possible.
+        CREATE TABLE IF NOT EXISTS outcome_realized_pnl_lots (
+            close_trade_id TEXT NOT NULL,
+            open_trade_id TEXT NOT NULL,
+            outcome_id INTEGER NOT NULL,
+            side_index INTEGER NOT NULL,
+            close_kind TEXT NOT NULL,
+            quantity TEXT NOT NULL,
+            cost_usdc TEXT NOT NULL,
+            proceeds_usdc TEXT NOT NULL,
+            realized_net_usdc TEXT NOT NULL,
+            source_json TEXT NOT NULL,
+            recorded_at TEXT NOT NULL,
+            PRIMARY KEY (close_trade_id, open_trade_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_outcome_pnl_market
+            ON outcome_realized_pnl_lots(outcome_id, side_index, close_kind);
+
+        -- A settlement row is emitted only after the official SDK settlement
+        -- result and the relevant payout/zero-balance evidence agree.
+        CREATE TABLE IF NOT EXISTS outcome_market_settlement_registry (
+            outcome_id INTEGER PRIMARY KEY,
+            winning_side_index INTEGER NOT NULL,
+            settlement_source TEXT NOT NULL,
+            settle_fraction TEXT NOT NULL,
+            payout_evidence_json TEXT NOT NULL,
+            recorded_at TEXT NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS strategy_events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             ts TEXT NOT NULL,
@@ -130,6 +161,47 @@ class TradeJournalDB:
         );
 
         CREATE INDEX IF NOT EXISTS idx_strategy_events_run_ts ON strategy_events(run_id, ts);
+
+        -- Compact, short-lived P3 index.  The raw P2 event remains the
+        -- authority; this table prevents the 5-second research worker from
+        -- replaying multi-gigabyte JSON history to price pending fills.
+        CREATE TABLE IF NOT EXISTS outcome_p3_quote_index (
+            snapshot_event_id INTEGER NOT NULL,
+            outcome_id INTEGER NOT NULL,
+            period TEXT NOT NULL,
+            coin TEXT NOT NULL,
+            snapshot_timestamp_ms INTEGER NOT NULL,
+            best_bid TEXT,
+            best_ask TEXT,
+            context_json TEXT NOT NULL,
+            recorded_at TEXT NOT NULL,
+            PRIMARY KEY (snapshot_event_id, coin)
+        );
+        CREATE INDEX IF NOT EXISTS idx_outcome_p3_quote_window
+            ON outcome_p3_quote_index(outcome_id, period, coin, snapshot_timestamp_ms);
+
+        -- Pending is durable across a short process restart window, but is
+        -- aggressively expired once the final exact P3 horizon has passed.
+        CREATE TABLE IF NOT EXISTS outcome_p3_pending_fills (
+            fill_id TEXT PRIMARY KEY,
+            outcome_id INTEGER NOT NULL,
+            period TEXT NOT NULL,
+            side_index INTEGER NOT NULL,
+            coin TEXT NOT NULL,
+            client_order_id TEXT,
+            venue_order_id TEXT,
+            side TEXT NOT NULL,
+            fill_price TEXT NOT NULL,
+            quantity TEXT NOT NULL,
+            fee_usdc TEXT NOT NULL,
+            fee_token TEXT NOT NULL,
+            fill_timestamp_ms INTEGER NOT NULL,
+            fill_context_json TEXT NOT NULL,
+            expires_at_ms INTEGER NOT NULL,
+            recorded_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_outcome_p3_pending_market_expiry
+            ON outcome_p3_pending_fills(outcome_id, period, expires_at_ms);
 
         -- Append-only Binance USDⓈ-M observations for Outcome BTC 1d research.
         -- A dedicated table avoids treating a historical REST backfill as if
@@ -721,11 +793,11 @@ class TradeJournalDB:
             logger.debug(f"TradeJournalDB load_fair_edge_bucket_shadow_simulations failed: {e}")
             return []
 
-    def log_strategy_event(self, run_id: str, event_type: str, payload: Optional[Dict[str, Any]] = None) -> None:
+    def log_strategy_event(self, run_id: str, event_type: str, payload: Optional[Dict[str, Any]] = None) -> Optional[int]:
         sql = "INSERT INTO strategy_events (ts, run_id, event_type, payload_json) VALUES (?, ?, ?, ?)"
         try:
             with self._connect() as conn:
-                conn.execute(
+                cursor = conn.execute(
                     sql,
                     (
                         _utc_now_iso(),
@@ -735,8 +807,193 @@ class TradeJournalDB:
                     ),
                 )
                 conn.commit()
+                return int(cursor.lastrowid)
         except Exception as e:
             logger.debug(f"TradeJournalDB log_strategy_event failed: {e}")
+            return None
+
+    def record_outcome_p3_quote(
+        self,
+        *,
+        snapshot_event_id: int,
+        outcome_id: int,
+        period: str,
+        coin: str,
+        snapshot_timestamp_ms: int,
+        best_bid: Optional[Decimal],
+        best_ask: Optional[Decimal],
+        context: Dict[str, Any],
+    ) -> None:
+        """Store a small, indexed quote mirror for the bounded P3 window."""
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    """INSERT OR IGNORE INTO outcome_p3_quote_index
+                    (snapshot_event_id,outcome_id,period,coin,snapshot_timestamp_ms,best_bid,best_ask,context_json,recorded_at)
+                    VALUES (?,?,?,?,?,?,?,?,?)""",
+                    (
+                        int(snapshot_event_id), int(outcome_id), str(period), str(coin), int(snapshot_timestamp_ms),
+                        str(best_bid) if best_bid is not None else None,
+                        str(best_ask) if best_ask is not None else None,
+                        _json_dumps(context), _utc_now_iso(),
+                    ),
+                )
+                conn.commit()
+        except Exception as e:
+            logger.debug(f"TradeJournalDB record_outcome_p3_quote failed: {e}")
+
+    def outcome_p3_quote_before(
+        self, *, outcome_id: int, period: str, coin: str, timestamp_ms: int,
+    ) -> Optional[tuple[int, int, Optional[str], Optional[str], Dict[str, Any]]]:
+        try:
+            with self._connect() as conn:
+                row = conn.execute(
+                    """SELECT snapshot_event_id,snapshot_timestamp_ms,best_bid,best_ask,context_json
+                    FROM outcome_p3_quote_index
+                    WHERE outcome_id=? AND period=? AND coin=? AND snapshot_timestamp_ms<=?
+                    ORDER BY snapshot_timestamp_ms DESC LIMIT 1""",
+                    (int(outcome_id), str(period), str(coin), int(timestamp_ms)),
+                ).fetchone()
+            if row is None:
+                return None
+            try:
+                context = json.loads(row[4] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                context = {}
+            return int(row[0]), int(row[1]), row[2], row[3], context if isinstance(context, dict) else {}
+        except Exception as e:
+            logger.debug(f"TradeJournalDB outcome_p3_quote_before failed: {e}")
+            return None
+
+    def outcome_p3_quote_near(
+        self, *, outcome_id: int, period: str, coin: str, target_timestamp_ms: int, tolerance_ms: int,
+    ) -> Optional[tuple[int, int, Optional[str], Optional[str]]]:
+        try:
+            with self._connect() as conn:
+                row = conn.execute(
+                    """SELECT snapshot_event_id,snapshot_timestamp_ms,best_bid,best_ask
+                    FROM outcome_p3_quote_index
+                    WHERE outcome_id=? AND period=? AND coin=?
+                      AND snapshot_timestamp_ms BETWEEN ? AND ?
+                    ORDER BY ABS(snapshot_timestamp_ms-?), snapshot_timestamp_ms LIMIT 1""",
+                    (
+                        int(outcome_id), str(period), str(coin),
+                        int(target_timestamp_ms - tolerance_ms), int(target_timestamp_ms + tolerance_ms),
+                        int(target_timestamp_ms),
+                    ),
+                ).fetchone()
+            return None if row is None else (int(row[0]), int(row[1]), row[2], row[3])
+        except Exception as e:
+            logger.debug(f"TradeJournalDB outcome_p3_quote_near failed: {e}")
+            return None
+
+    def record_outcome_p3_pending_fill(self, *, fill: Dict[str, Any]) -> None:
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    """INSERT OR IGNORE INTO outcome_p3_pending_fills
+                    (fill_id,outcome_id,period,side_index,coin,client_order_id,venue_order_id,side,fill_price,quantity,
+                     fee_usdc,fee_token,fill_timestamp_ms,fill_context_json,expires_at_ms,recorded_at)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        str(fill["fill_id"]), int(fill["outcome_id"]), str(fill["period"]), int(fill["side_index"]),
+                        str(fill["coin"]), fill.get("client_order_id"), fill.get("venue_order_id"), str(fill["side"]),
+                        str(fill["fill_price"]), str(fill["quantity"]), str(fill["fee_usdc"]), str(fill["fee_token"]),
+                        int(fill["fill_timestamp_ms"]), _json_dumps(fill["fill_context"]), int(fill["expires_at_ms"]), _utc_now_iso(),
+                    ),
+                )
+                conn.commit()
+        except Exception as e:
+            logger.debug(f"TradeJournalDB record_outcome_p3_pending_fill failed: {e}")
+
+    def outcome_p3_pending_fills(self, *, outcome_id: int, period: str) -> list[Dict[str, Any]]:
+        try:
+            with self._connect() as conn:
+                rows = conn.execute(
+                    """SELECT fill_id,outcome_id,period,side_index,coin,client_order_id,venue_order_id,side,fill_price,quantity,
+                              fee_usdc,fee_token,fill_timestamp_ms,fill_context_json,expires_at_ms
+                    FROM outcome_p3_pending_fills WHERE outcome_id=? AND period=? ORDER BY fill_timestamp_ms""",
+                    (int(outcome_id), str(period)),
+                ).fetchall()
+            output: list[Dict[str, Any]] = []
+            for row in rows:
+                try:
+                    context = json.loads(row[13] or "{}")
+                except (TypeError, json.JSONDecodeError):
+                    context = {}
+                output.append({
+                    "fill_id": row[0], "outcome_id": int(row[1]), "period": row[2], "side_index": int(row[3]),
+                    "coin": row[4], "client_order_id": row[5], "venue_order_id": row[6], "side": row[7],
+                    "fill_price": row[8], "quantity": row[9], "fee_usdc": row[10], "fee_token": row[11],
+                    "fill_timestamp_ms": int(row[12]), "fill_context": context if isinstance(context, dict) else {},
+                    "expires_at_ms": int(row[14]),
+                })
+            return output
+        except Exception as e:
+            logger.debug(f"TradeJournalDB outcome_p3_pending_fills failed: {e}")
+            return []
+
+    def prune_outcome_p3_window(self, *, before_quote_timestamp_ms: int, before_pending_expiry_ms: int) -> None:
+        try:
+            with self._connect() as conn:
+                conn.execute("DELETE FROM outcome_p3_quote_index WHERE snapshot_timestamp_ms<?", (int(before_quote_timestamp_ms),))
+                conn.execute("DELETE FROM outcome_p3_pending_fills WHERE expires_at_ms<?", (int(before_pending_expiry_ms),))
+                conn.commit()
+        except Exception as e:
+            logger.debug(f"TradeJournalDB prune_outcome_p3_window failed: {e}")
+
+    def record_outcome_realized_pnl_lot(
+        self, *, close_trade_id: str, open_trade_id: str, outcome_id: int, side_index: int,
+        close_kind: str, quantity: Decimal, cost_usdc: Decimal, proceeds_usdc: Decimal,
+        source: Dict[str, Any],
+    ) -> bool:
+        """Persist one FIFO allocation; returns false when already journaled."""
+        sql = """
+        INSERT OR IGNORE INTO outcome_realized_pnl_lots (
+          close_trade_id,open_trade_id,outcome_id,side_index,close_kind,quantity,cost_usdc,
+          proceeds_usdc,realized_net_usdc,source_json,recorded_at
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+        """
+        try:
+            with self._connect() as conn:
+                cursor = conn.execute(sql, (
+                    str(close_trade_id), str(open_trade_id), int(outcome_id), int(side_index), str(close_kind),
+                    str(quantity), str(cost_usdc), str(proceeds_usdc), str(proceeds_usdc - cost_usdc),
+                    _json_dumps(source), _utc_now_iso(),
+                ))
+                conn.commit()
+                return cursor.rowcount == 1
+        except Exception as e:
+            logger.debug(f"TradeJournalDB record_outcome_realized_pnl_lot failed: {e}")
+            return False
+
+    def record_outcome_market_settlement_once(
+        self, *, run_id: str, outcome_id: int, winning_side_index: int, settlement_source: str,
+        settle_fraction: Decimal, payout_evidence: Dict[str, Any], payload: Dict[str, Any],
+    ) -> bool:
+        """Record a market settlement only after verifier supplied both facts."""
+        if winning_side_index not in (0, 1):
+            raise ValueError("winning_side_index must be binary")
+        try:
+            with self._connect() as conn:
+                cursor = conn.execute(
+                    """INSERT OR IGNORE INTO outcome_market_settlement_registry
+                       (outcome_id,winning_side_index,settlement_source,settle_fraction,payout_evidence_json,recorded_at)
+                       VALUES (?,?,?,?,?,?)""",
+                    (int(outcome_id), int(winning_side_index), str(settlement_source), str(settle_fraction),
+                     _json_dumps(payout_evidence), _utc_now_iso()),
+                )
+                if cursor.rowcount != 1:
+                    return False
+                conn.execute(
+                    "INSERT INTO strategy_events (ts,run_id,event_type,payload_json) VALUES (?,?,?,?)",
+                    (_utc_now_iso(), run_id, "MARKET_SETTLEMENT", _json_dumps(payload)),
+                )
+                conn.commit()
+                return True
+        except Exception as e:
+            logger.debug(f"TradeJournalDB record_outcome_market_settlement_once failed: {e}")
+            return False
 
     def upsert_outcome_oi_feature_row(self, *, feature_schema_version: int, outcome_snapshot_event_id: int,
                                       outcome_id: int, period: str, snapshot_timestamp_ms: int,
