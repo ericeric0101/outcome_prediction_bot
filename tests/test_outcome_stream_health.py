@@ -30,3 +30,19 @@ def test_stream_health_fails_closed_after_disconnect_or_market_rollover():
     health.on_l2_book("#11530", 1); health.on_l2_book("#11531", 1)
     health.on_lifecycle("disconnected")
     assert health.check(market(), now=1).reason == "ws_disconnected"
+
+
+def test_stream_health_exposes_only_a_healthy_ws_bbo_keep_hint():
+    health = OutcomeStreamHealth()
+    health.configure_market(market())
+    health.on_lifecycle("connected")
+    health.mark_rest_resynced()
+    health.on_l2_book("#11530", payload={
+        "levels": [[{"px": "0.60"}], [{"px": "0.61"}]],
+    })
+    health.on_l2_book("#11531", payload={
+        "levels": [[{"px": "0.39"}], [{"px": "0.40"}]],
+    })
+    assert health.fresh_bbo(market(), "#11530") == (Decimal("0.60"), Decimal("0.61"))
+    health.on_lifecycle("disconnected")
+    assert health.fresh_bbo(market(), "#11530") is None

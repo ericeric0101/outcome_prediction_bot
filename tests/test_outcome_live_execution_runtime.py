@@ -489,6 +489,22 @@ def test_e4_flag_on_requires_managed_lifecycle_then_calls_controller(monkeypatch
     assert result.order_id == "new-sell"
 
 
+def test_managed_sell_uses_healthy_ws_bbo_to_keep_without_second_rest_book(monkeypatch, tmp_path):
+    """A WS BBO may reject a reprice cheaply; it never authorizes mutation."""
+    runtime, controller, gateway, _ = _managed_exit_runtime(tmp_path, monkeypatch, enabled=True)
+    health = healthy_stream()
+    health.on_l2_book("#11530", payload={
+        "levels": [[{"px": "0.84"}], [{"px": "0.85"}]],
+    })
+    runtime.stream_health = health
+    result = runtime.tick_market(market=market(), entry_side_index=None)
+    assert result.state == "sell_resting"
+    assert controller.calls == 0
+    # Holding telemetry needs one REST BBO.  The stable managed sell must not
+    # immediately perform a second identical REST read just to decide KEEP.
+    assert gateway.calls == ["book"]
+
+
 def test_e4_new_sell_is_written_as_durable_owned_lifecycle(monkeypatch, tmp_path):
     monkeypatch.setenv("OUTCOME_AUTOMATED_EXECUTION_ENABLED", "1")
     monkeypatch.setenv("OUTCOME_SDK_EXECUTION_ENABLED", "1")
@@ -600,6 +616,27 @@ def test_s3_emergency_exit_requires_durable_loss_band_then_uses_price_protected_
     assert result is not None and result.state == "emergency_exit_submitted"
     assert [name for name, _ in gateway.calls] == ["cancel", "ioc"]
     assert gateway.calls[-1][1]["limit_price"] == Decimal("0.70450")
+
+
+def test_s3_young_protected_holding_skips_fee_and_l2_reads(monkeypatch, tmp_path):
+    """Ordinary holdings must not pay S3's expensive reads before eligibility."""
+    journal = TradeJournalDB(tmp_path / "s3_fast_skip.db")
+    ledger = OutcomeExecutionLedger(journal, "run")
+    class YoungAccount(CalibrationAccount):
+        def __init__(self):
+            super().__init__(balances=[{"coin": "+11530", "total": "13", "entryNtl": "10.4"}], orders=[{"coin": "#11530", "side": "A", "oid": "old-sell", "sz": "13"}])
+        def get_user_fees_sync(self, _):
+            raise AssertionError("young S3 candidate must not read fees")
+    class NoBookGateway(Gateway):
+        def fetch_order_book(self, **_):
+            raise AssertionError("young S3 candidate must not read L2")
+    store = OutcomeExitLifecycleStore(journal, "run")
+    store.record(OutcomeExitLifecycle("w", 1153, "#11530", "old-sell", Decimal("13"), Decimal("0.76"), 0, "SELL_RESTING"), reason="fixture")
+    runtime = OutcomeLiveExecutionRuntime(
+        account=YoungAccount(), wallet="w", gateway=NoBookGateway(), ledger=ledger, exit_lifecycle_store=store,
+    )
+    finding = type("Finding", (), {"coin": "#11530", "inventory": Decimal("13"), "sell_order_ids": ("old-sell",)})()
+    assert runtime._maybe_emergency_exit(market=market(), finding=finding) is None
 
 
 def test_s3_uses_exact_durable_fill_fallback_when_exchange_history_is_temporarily_empty(monkeypatch, tmp_path):

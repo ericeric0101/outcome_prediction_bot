@@ -74,7 +74,7 @@ class OutcomeWebSocketRecorder:
                     # Recording and stream health must remain available even if
                     # a malformed display update is rejected.
                     pass
-            self.health.on_l2_book(data["coin"])
+            self.health.on_l2_book(data["coin"], payload=dict(data))
         self._record("OUTCOME_WS_L2_BOOK", payload)
 
     def _on_mids(self, payload: Mapping[str, Any]) -> None:

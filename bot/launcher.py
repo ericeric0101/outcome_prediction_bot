@@ -281,6 +281,7 @@ def run_integrated_hyperliquid_bot(
 
     refresh_interval = 1.5 if not test_mode else 1.0
     last_log_time = 0.0
+    last_slow_loop_warning_at = 0.0
     market_preferences, market_allow_fallback = resolve_daily_outcome_scope(os.environ)
 
     try:
@@ -606,7 +607,12 @@ def run_integrated_hyperliquid_bot(
                     "target_interval_ms": round(refresh_interval * 1000),
                 }
                 live_journal.log_strategy_event("outcome-loop-timing", "OUTCOME_LOOP_TIMING", timing_payload)
-                logger.warning(f"[OUTCOME LOOP SLOW] total_ms={timing_payload['total_ms']} stages={loop_stages_ms}")
+                # Persist every slow turn for post-run diagnosis, but terminal
+                # output is a rate-limited operational summary rather than a
+                # five-second wall of identical `sell_resting` warnings.
+                if time.time() - last_slow_loop_warning_at >= 30.0:
+                    last_slow_loop_warning_at = time.time()
+                    logger.warning(f"[OUTCOME LOOP SLOW] total_ms={timing_payload['total_ms']} stages={loop_stages_ms}")
             time.sleep(max(0.1, refresh_interval - elapsed))
 
     except KeyboardInterrupt:
