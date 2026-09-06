@@ -1,6 +1,4 @@
-"""
-SQLite trade journal for run_bot live/simulation diagnostics and analytics.
-"""
+"""SQLite journal for Outcome execution diagnostics and analytics."""
 from __future__ import annotations
 
 import json

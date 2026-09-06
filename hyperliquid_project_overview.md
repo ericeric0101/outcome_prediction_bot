@@ -1,6 +1,6 @@
 # Hyperliquid Outcome (HIP-4) BTC Daily Prediction Market Trading Bot — Current Authority
 
-> **權威架構版本 (Authority Version)**：2.2.0 (Outcome-only, capacity-aware scaling baseline)
+> **權威架構版本 (Authority Version)**：2.2.1 (Outcome-only, reproducible CI baseline)
 > **建立與審計日期**：2026-08-23；最近修訂：2026-09-06
 > **目標系統**：Hyperliquid HyperCore L1 原生預測市場 — Outcome (HIP-4 協議標準)  
 > **單一權威聲明**：本文件取代原 `project_overview.md`，為系統唯一的設計、架構、量化模型與執行權威規範。
@@ -555,9 +555,9 @@ X3 是離線建構，沒有網路或交易呼叫；collector 持續寫入後可�
 
 **F5 verification。** 新增 partial capacity（$20 at 60c: 33 desired / 38 visible → 30 submitted）、低於 official opening minimum 的安全容量拒絕、同一 WS trade id 去重且 flow 只能收緊 book capacity、$11 時 portfolio guard dormant、$20 時 $200／-$8、$50 時 $500／-$20 的比例化 guard regression，以及單 market 三個 confirmed loss stop。F5 focused regression **55 passed**；Outcome-only Python suite **240 passed**、`compileall`、launcher `--help` 與 `git diff --check` 均通過。明天前不得將兩個既有 notional limits 改為 $20、不得用此程式提交 $20 order，也不需要新增任何 `.env` flag。
 
-**G8 — legacy venue decommission（2026-09-06）。** 舊 Polymarket/Nautilus root、`run_bot.py`、CLOB shim、legacy execution/exit/forecast/shadow modules、相依 scripts/tests、profiles 和 migration-only documents 已刪除；`OutcomePricingState` 改為使用本地 `OutcomeQuoteEconomics`，`OutcomeAccountSynchronizer` 保持 official read-only account normalization，不再映射到舊 PositionManager／ExitPolicy。launcher 已移除 Polymarket credential fallback 和 `--venue polymarket`。`runtime_env` 不再讀 profile 或 alias，僅從 `.env` 載入 Outcome allowlist；因此現有私密 `.env` 裡遺留的 `POLYMARKET_*`／`VENUE` 等 key 不會進入 process environment。新 `.env.example` 是唯一受支援的本機參數清單。
+**G8 — legacy venue decommission（2026-09-06）。** 舊 Polymarket/Nautilus root、`run_bot.py`、CLOB shim、legacy execution/exit/forecast/shadow modules、相依 scripts/tests、profiles 和 migration-only documents 已刪除；`OutcomePricingState` 改為使用本地 `OutcomeQuoteEconomics`，`OutcomeAccountSynchronizer` 保持 official read-only account normalization，不再映射到舊 PositionManager／ExitPolicy。launcher 已移除 Polymarket credential fallback 和 `--venue polymarket`。`runtime_env` 不再讀 profile 或 alias，僅從 `.env` 載入 Outcome allowlist；實際私密 `.env` 與 `.env.example` 都已移除 `POLYMARKET_*`／`VENUE` 等舊 key，唯一保留的是 Outcome 所需參數。
 
-**G8 verification。** 移除後以 repository-wide import scan 確認沒有 production/test import 指向已刪除 legacy module，`rg` 僅保留 README 的歷史移除敘述；Outcome-only suite **240 passed**，本機 `.env` allowlist smoke 確認 entry/exposure 仍為 **$11/$11** 且 `legacy_loaded=False`。本次不改 `.env` 的 live notional/exposure，也沒有呼叫任何 live order path。
+**G8 verification。** 移除後以 repository-wide import scan 確認沒有 production/test import 指向已刪除 legacy module，`rg` 僅保留 README 的歷史移除敘述與 runtime-env regression assertion；Outcome-only suite **240 passed**，本機 `.env` allowlist smoke 確認 entry/exposure 仍為 **$11/$11** 且 `legacy_loaded=False`。GitHub Actions 現在固定先以 Node 22 執行 `outcome_sdk_sidecar/npm ci` 和 `npm run build`，再執行 pytest；這使乾淨 runner 與本機驗證使用同一完整流程。本次不改 `.env` 的 live notional/exposure，也沒有呼叫任何 live order path。
 
 **F5 sizing 與 re-entry 的關係。** 同一 daily market的首次 loss 後，S2-3 仍只給一張 cooldown/reclaim-qualified re-entry token；F5 的 dynamic size 只決定該合格 entry 的安全 shares，不能繞過 S2-3、增加 re-entry 次數或以小單規避 portfolio circuit breaker。所有上限是程式內固定 product policy，目的是降低 `.env` 人工輸入與因操作錯誤改變 live risk 的機會。
 

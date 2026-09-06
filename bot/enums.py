@@ -1,9 +1,4 @@
-"""
-bot/enums.py – Shared enumerations extracted from run_bot.py.
-
-Kept here so that both run_bot.py and bot/side_decision.py
-(and future mixins) can safely import them without circular dependencies.
-"""
+"""Shared lifecycle enumerations for the active Outcome runtime."""
 from __future__ import annotations
 
 from enum import Enum

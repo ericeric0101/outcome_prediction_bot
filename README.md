@@ -12,6 +12,8 @@ working tree. It is not a fallback venue and cannot be selected at runtime.
 ```bash
 python3 -m venv .venv
 ./.venv/bin/pip install -r requirements.txt
+npm ci --prefix outcome_sdk_sidecar
+npm run build --prefix outcome_sdk_sidecar
 cp .env.example .env
 ```
 
@@ -43,3 +45,7 @@ explicitly authorizes the F5 canary.
 ```bash
 ./.venv/bin/python -m pytest -q
 ```
+
+The Python suite exercises the official SDK sidecar health protocol, so its
+TypeScript dependencies must be installed and built first. GitHub Actions runs
+the same `npm ci`, build, and pytest sequence on every push and pull request.
