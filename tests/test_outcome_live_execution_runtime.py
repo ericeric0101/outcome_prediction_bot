@@ -28,7 +28,7 @@ class CalibrationAccount(Account):
 
 class Gateway:
     def outcome_coin(self, _, i): return "#11530" if i == 0 else "#11531"
-    def fetch_order_book(self, **_): return {"bids": [{"price": "0.77"}], "asks": [{"price": "0.78"}]}
+    def fetch_order_book(self, **_): return {"bids": [{"price": "0.77", "size": "100"}], "asks": [{"price": "0.779", "size": "100"}]}
     def place_alo(self, **_): return {"orderId": "1"}
     def cancel_owned_order(self, **_): return {}
 
@@ -129,7 +129,7 @@ def test_p3_calibration_places_one_balanced_post_only_entry_and_logs_it(monkeypa
         ledger=OutcomeExecutionLedger(journal, "run"),
     )
     result = runtime.tick_p3_calibration(market=market())
-    assert result.state == "buy_placed"
+    assert result.state == "buy_placed", result.detail
     assert gateway.calls[0]["is_buy"] is True
 
 
@@ -148,7 +148,7 @@ def test_s0_live_strategy_logs_explicit_oi_policy_entry(monkeypatch, tmp_path):
     )
     result = runtime.tick_live_strategy(market=market(), entry_side_index=1,
         entry_reason="down_spot_mark_oi_confirmed", entry_evidence={"oi_age_ms": 10})
-    assert result.state == "buy_placed"
+    assert result.state == "buy_placed", result.detail
     assert gateway.calls[0]["is_buy"] is True
     import sqlite3
     with sqlite3.connect(journal.db_path) as conn:
@@ -176,6 +176,57 @@ def test_s0_live_strategy_logs_explicit_oi_policy_entry(monkeypatch, tmp_path):
     assert recovered is not None
     assert recovered[1]["target_policy_source"] == "fallback_no_accepted_l2"
     assert runtime._persisted_p3_exit_policy(market=market(), coin="#11531").target_return_pct == Decimal("0.03")
+
+
+def test_20_canary_submits_only_capacity_safe_partial_size(monkeypatch, tmp_path):
+    monkeypatch.setenv("OUTCOME_AUTOMATED_EXECUTION_ENABLED", "1")
+    monkeypatch.setenv("OUTCOME_SDK_EXECUTION_ENABLED", "1")
+    monkeypatch.setenv("OUTCOME_LIVE_STRATEGY_ENABLED", "1")
+    monkeypatch.setenv("OUTCOME_MAX_ENTRY_NOTIONAL_USDC", "20")
+    monkeypatch.setenv("OUTCOME_MAX_OUTCOME_EXPOSURE_USDC", "20")
+    journal = TradeJournalDB(tmp_path / "strategy.db")
+
+    class PartialGateway(Gateway):
+        def __init__(self): self.calls = []
+        def fetch_order_book(self, **_):
+            return {"bids": [{"price": "0.60", "size": "20"}, {"price": "0.60", "size": "18"}],
+                    "asks": [{"price": "0.601", "size": "100"}]}
+        def place_alo(self, **kwargs): self.calls.append(kwargs); return {"orderId": "partial"}
+
+    gateway = PartialGateway()
+    runtime = OutcomeLiveExecutionRuntime(
+        account=CalibrationAccount(balances=[{"coin": "USDH", "total": "100", "hold": "0"}]), wallet="w", gateway=gateway,
+        stream_health=healthy_stream(), ledger=OutcomeExecutionLedger(journal, "run"),
+    )
+    result = runtime.tick_live_strategy(
+        market=market(), entry_side_index=0, entry_reason="up_spot_mark_oi_confirmed", entry_evidence={"oi_age_ms": 10},
+    )
+    assert result.state == "buy_placed", result.detail
+    # $20 at 60c desires 33 shares, but 38 visible / 1.25 = 30 safe shares.
+    assert gateway.calls[0]["requested_shares"] == Decimal("30")
+
+
+def test_20_canary_refuses_capacity_below_opening_minimum(monkeypatch, tmp_path):
+    monkeypatch.setenv("OUTCOME_AUTOMATED_EXECUTION_ENABLED", "1")
+    monkeypatch.setenv("OUTCOME_SDK_EXECUTION_ENABLED", "1")
+    monkeypatch.setenv("OUTCOME_LIVE_STRATEGY_ENABLED", "1")
+    monkeypatch.setenv("OUTCOME_MAX_ENTRY_NOTIONAL_USDC", "20")
+    monkeypatch.setenv("OUTCOME_MAX_OUTCOME_EXPOSURE_USDC", "20")
+    journal = TradeJournalDB(tmp_path / "strategy.db")
+
+    class ThinGateway(Gateway):
+        def fetch_order_book(self, **_):
+            return {"bids": [{"price": "0.60", "size": "10"}], "asks": [{"price": "0.601", "size": "100"}]}
+
+    runtime = OutcomeLiveExecutionRuntime(
+        account=CalibrationAccount(balances=[{"coin": "USDH", "total": "100", "hold": "0"}]), wallet="w", gateway=ThinGateway(),
+        stream_health=healthy_stream(), ledger=OutcomeExecutionLedger(journal, "run"),
+    )
+    result = runtime.tick_live_strategy(
+        market=market(), entry_side_index=0, entry_reason="up_spot_mark_oi_confirmed", entry_evidence={"oi_age_ms": 10},
+    )
+    assert result.state == "flat"
+    assert "safe_capacity_below_venue_minimum" in result.detail
 
 
 def test_s0_tier_b_entry_keeps_auditable_recovery_policy(monkeypatch, tmp_path):

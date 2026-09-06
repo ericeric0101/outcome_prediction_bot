@@ -12,7 +12,7 @@ import sqlite3
 import time
 from dataclasses import dataclass
 from datetime import datetime
-from decimal import Decimal
+from decimal import Decimal, ROUND_FLOOR
 
 from bot.adapters.outcome_client import OutcomeClient
 from bot.lifecycle.outcome_lifecycle import OutcomeMarketSpec
@@ -42,6 +42,7 @@ from bot.outcome_holding_path import OutcomeHoldingPathObservation, OutcomeHoldi
 from bot.outcome_reversal import OutcomeReversalClassifier, OutcomeReversalInput, OutcomeReversalState
 from bot.outcome_loss_reentry import OutcomeLossReentryGate
 from bot.outcome_tier_b_execution_gate import OutcomeTierBExecutionGate
+from bot.outcome_portfolio_guard import OutcomePortfolioGuard
 from bot.outcome_emergency_exit import (
     EmergencyExitAction,
     OutcomeEmergencyExitController,
@@ -98,6 +99,7 @@ class OutcomeLiveExecutionRuntime:
         self.reversal_classifier = OutcomeReversalClassifier()
         self.loss_reentry_gate = OutcomeLossReentryGate(ledger.journal, ledger.run_id) if ledger else None
         self.tier_b_execution_gate = OutcomeTierBExecutionGate(ledger.journal.db_path) if ledger else None
+        self.portfolio_guard = OutcomePortfolioGuard(ledger.journal.db_path) if ledger else None
         self.emergency_exit_policy = OutcomeEmergencyExitPolicy()
         self.emergency_exit_controller = (
             OutcomeEmergencyExitController(
@@ -1273,7 +1275,81 @@ class OutcomeLiveExecutionRuntime:
         admission["target_return_pct"] = str(target_decision.target_return_pct)
         admission["target_policy_source"] = target_decision.source
         admission["target_price_preview"] = str(target_price_preview)
+        # Persist the target decision on the ORDER_SUBMIT record itself.  The
+        # follow-up strategy event remains useful for research queries, but
+        # it is deliberately not the sole source of truth for an accepted
+        # live entry order.
+        entry_tier = str(entry_evidence.get("entry_tier") or "tier_a_spot_mark_oi")
+        tier_b = entry_tier == "tier_b_spot_mark"
+        entry_policy_kind = "s0_spot_mark_tier_b" if tier_b else "s0_oi_spot_mark_confirmation"
+        sampling_policy = "spot_mark_tier_b" if tier_b else "oi_spot_mark_confirmation"
+        capacity_canary = (
+            self.risk_gate.limits.max_entry_notional_usdc >= Decimal("20")
+            and self.risk_gate.limits.max_total_outcome_exposure_usdc >= Decimal("20")
+        )
         shares = whole_share_size(price)
+        entry_max_submit_price: Decimal | None = None
+        execution_audit: dict[str, object] = {"entry_capacity_canary_enabled": capacity_canary}
+        if capacity_canary:
+            min_opening_shares = whole_share_size(price)
+            # Size to the configured dollar ceiling without rounding *above*
+            # it.  The venue minimum is still separately enforced below.
+            desired_shares = max(
+                min_opening_shares,
+                int((self.risk_gate.limits.max_entry_notional_usdc / price).to_integral_value(rounding=ROUND_FLOOR)),
+            )
+            gate = self.tier_b_execution_gate
+            quality = gate.evaluate(
+                bid=price, ask=entry_ask, bid_levels=book.get("bids", ()), requested_shares=Decimal(desired_shares),
+                coin=str(admission["selected_coin"]),
+            ) if gate is not None else None
+            if quality is None:
+                admission["entry_execution_gate"] = {"allowed": False, "reason": "entry_execution_gate_unavailable"}
+                return LiveExecutionResult("blocked", "entry execution-quality gate unavailable")
+            safe_shares = min(Decimal(desired_shares), quality.safe_max_shares or Decimal("0"))
+            # Do not let whole_share_size round inadequate capacity up to the
+            # venue minimum.  Capacity is a ceiling, never a hint.
+            shares = int(safe_shares) if safe_shares >= min_opening_shares else 0
+            execution_audit.update({
+                "entry_execution_tier": entry_tier,
+                "entry_spread_bps": str(quality.spread_bps) if quality.spread_bps is not None else None,
+                "entry_top3_depth_shares": str(quality.top_depth_shares) if quality.top_depth_shares is not None else None,
+                "entry_safe_max_shares": str(quality.safe_max_shares) if quality.safe_max_shares is not None else None,
+                "entry_recent_trade_shares_5m": str(quality.recent_trade_shares) if quality.recent_trade_shares is not None else None,
+                "entry_requested_shares": desired_shares,
+                "entry_submitted_shares": shares,
+                "entry_max_submit_drift_bps": str(quality.policy.max_submit_drift_bps),
+                "entry_policy_sample_count": quality.policy.sample_count,
+                "entry_policy_source": quality.policy.source,
+                "entry_decision_bid": str(quality.decision_bid) if quality.decision_bid is not None else None,
+            })
+            admission["entry_execution_gate"] = {"allowed": quality.allowed, "reason": quality.reason, **execution_audit}
+            if not quality.allowed or quality.max_submit_bid is None:
+                return LiveExecutionResult("flat", f"live strategy no entry: {quality.reason}")
+            if shares < min_opening_shares:
+                return LiveExecutionResult("flat", "live strategy no entry: entry_safe_capacity_below_venue_minimum")
+            entry_max_submit_price = quality.max_submit_bid
+        elif tier_b:
+            # Preserve the existing $11 Tier-B quality behavior until the
+            # operator explicitly starts the $20 canary.
+            gate = self.tier_b_execution_gate
+            quality = gate.evaluate(
+                bid=price, ask=entry_ask, bid_levels=book.get("bids", ()), requested_shares=Decimal(shares),
+                coin=str(admission["selected_coin"]),
+            ) if gate is not None else None
+            if quality is None or not quality.allowed or quality.max_submit_bid is None:
+                reason = quality.reason if quality is not None else "tier_b_execution_gate_unavailable"
+                admission["tier_b_execution_gate"] = {"allowed": False, "reason": reason}
+                return LiveExecutionResult("flat", f"live strategy no entry: {reason}")
+            entry_max_submit_price = quality.max_submit_bid
+            execution_audit.update({
+                "tier_b_spread_bps": str(quality.spread_bps) if quality.spread_bps is not None else None,
+                "tier_b_top_depth_shares": str(quality.top_depth_shares) if quality.top_depth_shares is not None else None,
+                "tier_b_max_submit_drift_bps": str(quality.policy.max_submit_drift_bps),
+                "tier_b_policy_sample_count": quality.policy.sample_count,
+                "tier_b_policy_source": quality.policy.source,
+                "tier_b_decision_bid": str(quality.decision_bid) if quality.decision_bid is not None else None,
+            })
         risk = self.risk_gate.evaluate(
             balances=self.recovery.account.get_spot_clearinghouse_state_sync(self.recovery.wallet).get("balances", []),
             open_orders=self.recovery.account.get_open_orders_sync(self.recovery.wallet), price=price, shares=shares,
@@ -1292,36 +1368,22 @@ class OutcomeLiveExecutionRuntime:
             "available_collateral": str(risk.available_collateral),
             "current_exposure": str(risk.current_exposure),
         }
-        # Persist the target decision on the ORDER_SUBMIT record itself.  The
-        # follow-up strategy event remains useful for research queries, but
-        # it is deliberately not the sole source of truth for an accepted
-        # live entry order.
-        entry_tier = str(entry_evidence.get("entry_tier") or "tier_a_spot_mark_oi")
-        tier_b = entry_tier == "tier_b_spot_mark"
-        entry_policy_kind = "s0_spot_mark_tier_b" if tier_b else "s0_oi_spot_mark_confirmation"
-        sampling_policy = "spot_mark_tier_b" if tier_b else "oi_spot_mark_confirmation"
-        entry_max_submit_price: Decimal | None = None
-        tier_b_execution_audit: dict[str, object] | None = None
-        if tier_b:
-            gate = self.tier_b_execution_gate
-            tier_b_decision = gate.evaluate(
-                bid=price, ask=entry_ask, bid_levels=book.get("bids", ()), requested_shares=Decimal(shares),
-            ) if gate is not None else None
-            if tier_b_decision is None:
-                admission["tier_b_execution_gate"] = {"allowed": False, "reason": "tier_b_execution_gate_unavailable"}
-                return LiveExecutionResult("blocked", "Tier-B entry execution-quality gate unavailable")
-            tier_b_execution_audit = {
-                "tier_b_spread_bps": str(tier_b_decision.spread_bps) if tier_b_decision.spread_bps is not None else None,
-                "tier_b_top_depth_shares": str(tier_b_decision.top_depth_shares) if tier_b_decision.top_depth_shares is not None else None,
-                "tier_b_max_submit_drift_bps": str(tier_b_decision.policy.max_submit_drift_bps),
-                "tier_b_policy_sample_count": tier_b_decision.policy.sample_count,
-                "tier_b_policy_source": tier_b_decision.policy.source,
-                "tier_b_decision_bid": str(tier_b_decision.decision_bid) if tier_b_decision.decision_bid is not None else None,
-            }
-            admission["tier_b_execution_gate"] = {"allowed": tier_b_decision.allowed, "reason": tier_b_decision.reason, **tier_b_execution_audit}
-            if not tier_b_decision.allowed or tier_b_decision.max_submit_bid is None:
-                return LiveExecutionResult("flat", f"live strategy no entry: {tier_b_decision.reason}")
-            entry_max_submit_price = tier_b_decision.max_submit_bid
+        portfolio = self.portfolio_guard.evaluate(
+            outcome_id=market.outcome_id, prospective_notional=risk.entry_notional,
+            phase_entry_cap=self.risk_gate.limits.max_entry_notional_usdc,
+            phase_exposure_cap=self.risk_gate.limits.max_total_outcome_exposure_usdc,
+        ) if self.portfolio_guard is not None else None
+        if portfolio is None or not portfolio.allowed:
+            reason = portfolio.reason if portfolio is not None else "portfolio_guard_unavailable"
+            admission["portfolio_guard"] = {"allowed": False, "reason": reason}
+            return LiveExecutionResult("flat", f"live strategy no entry: {reason}")
+        admission["portfolio_guard"] = {
+            "allowed": True, "reason": portfolio.reason, "enabled": portfolio.enabled,
+            "daily_gross_entry_usdc": str(portfolio.daily_gross_entry_usdc),
+            "daily_realized_net_usdc": str(portfolio.daily_realized_net_usdc),
+            "consecutive_loss_exits": portfolio.consecutive_loss_exits,
+            "market_loss_exits": portfolio.market_loss_exits,
+        }
         entry_audit = {
             "entry_policy_schema_version": 1,
             "entry_policy_kind": entry_policy_kind,
@@ -1350,11 +1412,13 @@ class OutcomeLiveExecutionRuntime:
             "loss_reentry_prior_exit_price": (
                 str(reentry.prior_exit_price) if reentry is not None and reentry.prior_exit_price is not None else None
             ),
-            **(tier_b_execution_audit or {}),
+            **execution_audit,
         }
         result = self.machine.tick(
             market=market, side_index=entry_side_index, entry_permitted=True,
             entry_audit=entry_audit, entry_max_submit_price=entry_max_submit_price,
+            entry_requested_shares=Decimal(shares),
+            entry_max_notional=self.risk_gate.limits.max_entry_notional_usdc,
         )
         if result.state == "buy_placed":
             if reentry is not None and reentry.is_limited_reentry and self.loss_reentry_gate is not None:

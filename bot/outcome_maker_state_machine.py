@@ -151,6 +151,8 @@ class OutcomeMakerStateMachine:
         loss_band_authorized: bool = False,
         entry_audit: Mapping[str, object] | None = None,
         entry_max_submit_price: Decimal | None = None,
+        entry_requested_shares: Decimal | None = None,
+        entry_max_notional: Decimal | None = None,
     ) -> MakerTickResult:
         coin = self.gateway.outcome_coin(market, side_index)
         inventory, entry_notional = self._coin_position(self.account.get_spot_clearinghouse_state_sync(self.wallet), coin)
@@ -262,6 +264,11 @@ class OutcomeMakerStateMachine:
 
         book = self.gateway.fetch_order_book(market=market, side_index=side_index)
         bid = self._best(book["bids"], "bid")
+        requested_shares = entry_requested_shares
+        if requested_shares is not None and (requested_shares <= 0 or requested_shares != requested_shares.to_integral_value()):
+            return MakerTickResult("blocked", "entry requested shares must be positive whole inventory")
+        if entry_max_notional is not None and requested_shares is not None and bid * requested_shares > entry_max_notional:
+            return MakerTickResult("flat", "entry submit notional exceeds configured cap after price drift")
         if entry_max_submit_price is not None and bid > entry_max_submit_price:
             audit = dict(entry_audit or {})
             decision_bid = audit.get("entry_bid_at_decision")
@@ -271,8 +278,11 @@ class OutcomeMakerStateMachine:
                     (bid / Decimal(str(decision_bid)) - Decimal("1")) * Decimal("10000")
                 ) if decision_bid is not None and Decimal(str(decision_bid)) > 0 else None,
             })
-            return MakerTickResult("flat", "Tier-B entry submit price drift exceeds calibrated ceiling", audit=audit)
-        result = self.gateway.place_alo(market=market, side_index=side_index, is_buy=True, price=bid)
+            return MakerTickResult("flat", "entry submit price drift exceeds calibrated ceiling", audit=audit)
+        result = self.gateway.place_alo(
+            market=market, side_index=side_index, is_buy=True, price=bid,
+            requested_shares=requested_shares,
+        )
         self._invalidate_account_reads()
         # The ledger records this ``audit`` payload on the same durable
         # ORDER_SUBMIT row as the exchange order id.  In particular, a live
@@ -283,6 +293,11 @@ class OutcomeMakerStateMachine:
             "buy_placed", "placed first-level ALO buy", str(result["orderId"]),
             audit={
                 **dict(entry_audit or {}), "entry_submit_bid": str(bid),
+                "entry_submitted_shares": str(result.get("shares")),
+                "entry_submit_drift_bps": str(
+                    (bid / Decimal(str((entry_audit or {}).get("entry_bid_at_decision"))) - Decimal("1")) * Decimal("10000")
+                ) if (entry_audit or {}).get("entry_bid_at_decision") is not None
+                and Decimal(str((entry_audit or {}).get("entry_bid_at_decision"))) > 0 else None,
                 "sdk_submit_timing": dict(getattr(self.gateway, "last_sidecar_timing", {}) or {}),
             },
         )
