@@ -42,6 +42,24 @@ def test_sync_user_fees_uses_the_official_read_only_info_request(monkeypatch):
     assert calls == [{"type": "userFees", "user": "0x" + "b" * 40}]
 
 
+def test_execution_client_can_fail_fast_without_retry_backoff(monkeypatch):
+    client = OutcomeClient(OutcomeAuth(wallet_address="0x" + "a" * 40, is_testnet=True), timeout_sec=3, info_max_retries=1)
+    request = httpx.Request("POST", "https://example.test/info")
+    calls = []
+
+    class FailingSyncClient:
+        is_closed = False
+        def post(self, *_args, **_kwargs):
+            calls.append(1)
+            return httpx.Response(502, request=request)
+
+    monkeypatch.setattr(client, "get_sync_client", lambda: FailingSyncClient())
+    monkeypatch.setattr("bot.adapters.outcome_client.time.sleep", lambda _seconds: pytest.fail("must not retry execution read"))
+    with pytest.raises(httpx.HTTPStatusError):
+        client.post_info_sync({"type": "l2Book"})
+    assert calls == [1]
+
+
 @pytest.mark.anyio
 async def test_ws_reconnects_past_ten_transient_failures_until_stopped(monkeypatch):
     """A venue outage must not require a launcher restart after ten attempts."""

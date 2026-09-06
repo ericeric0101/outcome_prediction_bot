@@ -186,6 +186,11 @@ def test_s0_tier_b_entry_keeps_auditable_recovery_policy(monkeypatch, tmp_path):
 
     class TierBGateway(Gateway):
         def place_alo(self, **_): return {"orderId": "tier-b-buy"}
+        def fetch_order_book(self, **_):
+            return {
+                "bids": [{"price": "0.77", "size": "10"}, {"price": "0.769", "size": "10"}],
+                "asks": [{"price": "0.779", "size": "10"}],
+            }
 
     runtime = OutcomeLiveExecutionRuntime(
         account=CalibrationAccount(), wallet="w", gateway=TierBGateway(), stream_health=healthy_stream(),
@@ -269,6 +274,79 @@ def test_s0_persists_gate_decision_and_cancels_only_owned_stale_entry_before_nex
         cancellation = conn.execute("SELECT status FROM order_events WHERE event_type='ORDER_CANCEL'").fetchone()[0]
     assert '"entry_reason": "down_spot_mark_oi_confirmed"' in decision
     assert cancellation == "CANCELLED"
+
+
+def test_s0_young_resting_entry_skips_unneeded_fresh_book_read(monkeypatch, tmp_path):
+    monkeypatch.setenv("OUTCOME_AUTOMATED_EXECUTION_ENABLED", "1")
+    monkeypatch.setenv("OUTCOME_SDK_EXECUTION_ENABLED", "1")
+    monkeypatch.setenv("OUTCOME_LIVE_STRATEGY_ENABLED", "1")
+    journal = TradeJournalDB(tmp_path / "young_entry.db")
+    journal.log_order_event("run", "ORDER_SUBMIT", venue_order_id="owned-buy", side="BUY", status="RESTING", instrument_id="#11531", payload={
+        "venue": "hyperliquid_outcome", "outcome_id": 1153, "coin": "#11531",
+        "audit": {"entry_policy_schema_version": 1, "entry_policy_kind": "s0_oi_spot_mark_confirmation", "entry_bid_at_decision": "0.77"},
+    })
+    class YoungAccount(CalibrationAccount):
+        def __init__(self): super().__init__(orders=[{"coin": "#11531", "side": "B", "oid": "owned-buy", "limitPx": "0.77", "sz": "13"}])
+    class NoBookGateway(Gateway):
+        def fetch_order_book(self, **_): raise AssertionError("young resting buy must not fetch a re-quote book")
+    runtime = OutcomeLiveExecutionRuntime(
+        account=YoungAccount(), wallet="w", gateway=NoBookGateway(), stream_health=healthy_stream(),
+        ledger=OutcomeExecutionLedger(journal, "run"),
+    )
+    result = runtime.tick_live_strategy(
+        market=market(), entry_side_index=1, entry_reason="down_spot_mark_oi_confirmed", entry_evidence={"oi_age_ms": 5},
+    )
+    assert result.state == "buy_resting"
+    assert result.detail.endswith("entry_requote_interval_not_elapsed")
+
+
+def test_s0_filled_owned_buy_cancels_remainder_then_places_protective_sell_same_tick(monkeypatch, tmp_path):
+    monkeypatch.setenv("OUTCOME_AUTOMATED_EXECUTION_ENABLED", "1")
+    monkeypatch.setenv("OUTCOME_SDK_EXECUTION_ENABLED", "1")
+    monkeypatch.setenv("OUTCOME_LIVE_STRATEGY_ENABLED", "1")
+    journal = TradeJournalDB(tmp_path / "filled_entry_same_tick.db")
+    journal.log_order_event("run", "ORDER_SUBMIT", venue_order_id="owned-buy", side="BUY", status="RESTING", instrument_id="#11530", payload={
+        "venue": "hyperliquid_outcome", "outcome_id": 1153, "coin": "#11530",
+        "audit": {
+            "entry_policy_schema_version": 1, "entry_policy_kind": "s0_oi_spot_mark_confirmation",
+            "entry_bid_at_decision": "0.60", "target_return_pct": "0.05",
+            "maker_close_fee_rate": "0.0004", "loss_reprice_pct": "0.05",
+            "narrow_after_sec": 3600, "narrow_return_pct": "0.03",
+            "floor_after_sec": 7200, "floor_return_pct": "0.02",
+        },
+    })
+
+    class FilledAccount(CalibrationAccount):
+        def __init__(self):
+            super().__init__(
+                balances=[{"coin": "+11530", "total": "18", "entryNtl": "10.8"}],
+                orders=[{"coin": "#11530", "side": "B", "oid": "owned-buy", "limitPx": "0.60", "sz": "18"}],
+            )
+        def get_user_fills_sync(self, _):
+            return [{"coin": "#11530", "side": "B", "px": "0.60", "sz": "18", "time": 1}]
+
+    class TrackingGateway(Gateway):
+        def __init__(self, account): self.account, self.calls = account, []
+        def cancel_owned_order(self, **kwargs):
+            self.calls.append(("cancel", kwargs)); self.account.orders = []; return {}
+        def fetch_order_book(self, **_):
+            self.calls.append(("book", {})); return {"bids": [{"price": "0.61"}], "asks": [{"price": "0.62"}]}
+        def place_alo(self, **kwargs):
+            self.calls.append(("place", kwargs)); return {"orderId": "protective-sell"}
+
+    account = FilledAccount(); gateway = TrackingGateway(account)
+    runtime = OutcomeLiveExecutionRuntime(
+        account=account, wallet="w", gateway=gateway, stream_health=healthy_stream(),
+        ledger=OutcomeExecutionLedger(journal, "run"),
+    )
+    result = runtime.tick_live_strategy(
+        market=market(), entry_side_index=None, entry_reason="directional_confirmation_not_met", entry_evidence={},
+    )
+    assert result.state == "sell_placed"
+    assert [name for name, _ in gateway.calls] == ["cancel", "book", "place"]
+    assert gateway.calls[-1][1]["is_buy"] is False
+    assert gateway.calls[-1][1]["reduce_only"] is True
+    assert gateway.calls[-1][1]["price"] == Decimal("0.60") * Decimal("1.05") / Decimal("0.9996")
 
 
 def test_s0_live_strategy_blocks_new_market_while_known_retiring_market_has_resting_order(monkeypatch, tmp_path):

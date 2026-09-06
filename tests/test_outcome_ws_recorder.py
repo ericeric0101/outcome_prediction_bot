@@ -23,6 +23,7 @@ def test_ws_recorder_persists_raw_messages_and_lifecycle_resync(tmp_path):
     db = tmp_path / "stream.db"
     recorder = OutcomeWebSocketRecorder(client, TradeJournalDB(db), "stream-run")
     recorder._market_id = 1145
+    recorder._coins = ("#11450", "#11451")
     recorder._on_lifecycle({"event": "connected", "received_at_ms": 123})
     recorder._on_l2({"channel": "l2Book", "data": {"time": 456, "coin": "#11450"}})
     recorder._on_mids({"channel": "allMids", "data": {"mids": {"#11450": "0.6"}}})
@@ -38,6 +39,8 @@ def test_ws_recorder_persists_raw_messages_and_lifecycle_resync(tmp_path):
     assert l2["outcome_id"] == 1145
     assert l2["server_timestamp_ms"] == 456
     assert l2["sequence_available"] is False
+    mids = json.loads(rows[2][1])
+    assert mids["raw"]["data"]["mids"] == {"#11450": "0.6"}
     trades = json.loads(rows[3][1])
     assert trades["server_timestamp_ms"] == 789
 
@@ -60,3 +63,24 @@ def test_l2_callback_keeps_terminal_pricing_cache_fresh(tmp_path):
         "levels": [[{"px": "0.60", "sz": "10"}], [{"px": "0.61", "sz": "11"}]],
     }})
     assert pricing.get_best_bid_ask("#11450") == (Decimal("0.60"), Decimal("0.61"))
+
+
+def test_all_mids_callback_keeps_btc_mark_cache_fresh(tmp_path):
+    pricing = OutcomePricingState(stale_timeout_sec=5)
+    recorder = OutcomeWebSocketRecorder(
+        CallbackClient(), TradeJournalDB(tmp_path / "stream.db"), "stream-run", pricing_state=pricing,
+    )
+    recorder._on_mids({"channel": "allMids", "data": {"mids": {"BTC": "80000.5"}}})
+    assert pricing.get_btc_mark_price() == Decimal("80000.5")
+
+
+def test_all_mids_journal_payload_never_copies_unrelated_market_map(tmp_path):
+    db = tmp_path / "stream.db"
+    recorder = OutcomeWebSocketRecorder(CallbackClient(), TradeJournalDB(db), "stream-run")
+    recorder._coins = ("#yes", "#no")
+    recorder._on_mids({"channel": "allMids", "data": {"time": 7, "mids": {
+        "BTC": "80000", "#yes": "0.6", "#no": "0.4", "ETH": "2000", "#other": "0.9",
+    }}})
+    with sqlite3.connect(db) as conn:
+        payload = json.loads(conn.execute("SELECT payload_json FROM strategy_events").fetchone()[0])
+    assert payload["raw"]["data"]["mids"] == {"BTC": "80000", "#yes": "0.6", "#no": "0.4"}

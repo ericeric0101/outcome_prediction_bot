@@ -8,7 +8,7 @@ import uuid
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
@@ -36,8 +36,7 @@ from bot.pricing.outcome_pricing import (
 )
 from bot.outcome_live_execution_runtime import OutcomeLiveExecutionRuntime
 from bot.outcome_live_strategy import OutcomeOiEntryGate
-from bot.outcome_settlement import OutcomeSettlementAdapter
-from bot.outcome_pnl_reconciliation import OutcomePnLReconciler
+from bot.outcome_settlement_worker import OutcomeSettlementWorker
 from bot.outcome_ws_recorder import OutcomeWebSocketRecorder
 from bot.outcome_execution_ledger import OutcomeExecutionLedger
 from bot.outcome_operations_monitor import OutcomeOperationsMonitor
@@ -189,7 +188,10 @@ def run_integrated_hyperliquid_bot(
     if not auth:
         raise RuntimeError("Cannot resolve Hyperliquid auth (provide HL_WALLET_ADDRESS and HL_PRIVATE_KEY in .env).")
 
-    client = OutcomeClient(auth)
+    # This client is the execution lane.  Read-only failures must release the
+    # lane quickly and fail closed for this tick, not consume several retry
+    # backoffs while a position needs management.
+    client = OutcomeClient(auth, timeout_sec=3.0, info_max_retries=1, ws_open_timeout_sec=10.0)
     pricing = OutcomePricingState()
     # Live orders are only dispatched through the recovery-aware official SDK
     # runtime; this remains inert without both explicit execution gates.
@@ -224,8 +226,20 @@ def run_integrated_hyperliquid_bot(
         ledger=OutcomeExecutionLedger(live_journal, f"outcome-live-{uuid.uuid4().hex[:10]}"),
     )
     live_strategy_gate = OutcomeOiEntryGate(live_journal.db_path) if live_execution.live_strategy_enabled() else None
-    settlement_adapter = OutcomeSettlementAdapter()
-    pnl_reconciler = OutcomePnLReconciler(live_journal, f"outcome-pnl-{uuid.uuid4().hex[:10]}")
+    settlement_worker = None
+    if not simulation:
+        # Settlement/payout evidence is read-only housekeeping.  It receives
+        # its own client and never shares the execution lane's synchronous
+        # HTTP connection or order authority.
+        from bot.outcome_settlement import OutcomeSettlementAdapter
+        from bot.outcome_pnl_reconciliation import OutcomePnLReconciler
+        settlement_worker = OutcomeSettlementWorker(
+            account=OutcomeClient(auth, timeout_sec=10.0, info_max_retries=3),
+            settlement_adapter=OutcomeSettlementAdapter(),
+            pnl_reconciler=OutcomePnLReconciler(live_journal, f"outcome-pnl-{uuid.uuid4().hex[:10]}"),
+            journal=live_journal,
+        )
+        settlement_worker.start()
 
     dashboard_state = DashboardState(
         strike_price=0.0,
@@ -263,9 +277,6 @@ def run_integrated_hyperliquid_bot(
     inventory_side: Optional[str] = None
     inventory_shares: float = 0.0
     inventory_entry_px: float = 0.0
-    settled_markets: Set[int] = set()
-    settlement_last_attempt_at: dict[int, float] = {}
-    pnl_last_attempt_at = 0.0
     rollover = OutcomeRolloverCoordinator()
 
     refresh_interval = 1.5 if not test_mode else 1.0
@@ -274,9 +285,11 @@ def run_integrated_hyperliquid_bot(
 
     try:
         while True:
-            cycle_start = time.time()
+            cycle_start = time.monotonic()
+            loop_stages_ms: dict[str, int] = {}
 
             # 1. Discover active market (with 20s TTL cache to respect API rate limits)
+            stage_start = time.monotonic()
             try:
                 meta = client.get_outcome_meta_sync(ttl_sec=20.0)
                 market, status, selected_period, fallback_used = select_configured_btc_market(
@@ -291,6 +304,7 @@ def run_integrated_hyperliquid_bot(
                 logger.warning(f"Error fetching outcome metadata: {e}")
                 time.sleep(3.0)
                 continue
+            loop_stages_ms["market_discovery"] = round((time.monotonic() - stage_start) * 1000)
 
             if market is None:
                 if time.time() - last_log_time > 10:
@@ -304,42 +318,10 @@ def run_integrated_hyperliquid_bot(
                 research_worker.set_market(market)
             retiring_markets = rollover.observe(selected=market, discovered=configured_markets)
 
-            # Derived accounting uses only prior official fills.  Keep it out
-            # of the high-frequency decision path; it has no venue-write side
-            # effects and is idempotent across restarts.
-            if not simulation and time.monotonic() - pnl_last_attempt_at >= 30.0:
-                pnl_last_attempt_at = time.monotonic()
-                try:
-                    written = pnl_reconciler.reconcile_sells()
-                    if written:
-                        logger.info(f"[OUTCOME PNL] recorded {written} canonical FIFO sell lots")
-                except Exception as e:
-                    live_journal.log_strategy_event("outcome-pnl-error", "OUTCOME_PNL_RECONCILE_ERROR", {
-                        "venue": "hyperliquid_outcome", "stage": "sell_fifo",
-                        "error_type": type(e).__name__, "error": str(e),
-                    })
-
-            # 2. Update pricing feeds
-            book_yes: dict[str, Any] | None = None
-            book_no: dict[str, Any] | None = None
-            yes_received_at_ms = no_received_at_ms = capture_complete_at_ms = 0
-            try:
-                all_mids = client.get_all_mids_sync()
-                btc_mark_str = all_mids.get("BTC", "0")
-                btc_mark = float(btc_mark_str)
-                if btc_mark > 0:
-                    pricing.update_btc_mark_price(btc_mark)
-
-                book_yes = client.get_l2_book_sync(market.yes_coin)
-                yes_received_at_ms = int(time.time() * 1000)
-                book_no = client.get_l2_book_sync(market.no_coin)
-                no_received_at_ms = int(time.time() * 1000)
-                capture_complete_at_ms = int(time.time() * 1000)
-                pricing.update_l2_book(market.yes_coin, book_yes)
-                pricing.update_l2_book(market.no_coin, book_no)
-            except Exception as e:
-                logger.debug(f"Pricing update note: {e}")
-
+            # Start/reconfigure the public stream before selecting a pricing
+            # source.  A new/reconnected stream still needs one REST snapshot
+            # before it can authorise entries; an already healthy stream can
+            # provide public display/signal pricing without serial REST reads.
             if not simulation:
                 try:
                     if live_ws_recorder is None or live_ws_recorder._market_id != market.outcome_id:
@@ -350,12 +332,50 @@ def run_integrated_hyperliquid_bot(
                             pricing_state=pricing,
                         )
                     live_ws_recorder.start(outcome_id=market.outcome_id, yes_coin=market.yes_coin, no_coin=market.no_coin)
-                    if live_ws_recorder.resync_required.is_set():
-                        # The REST reads above are the mandatory post-connect
-                        # snapshot before a WS stream can permit entry.
+                    live_execution.stream_health = live_ws_recorder.health
+                except Exception as e:
+                    logger.warning(f"Outcome WS health setup failed; runtime will fail closed: {e}")
+
+            # 2. Update pricing feeds
+            stage_start = time.monotonic()
+            stream_ready_for_pricing = bool(
+                live_ws_recorder is not None and live_ws_recorder.health.check(market).ready
+            ) if not simulation else False
+            ws_yes = pricing.get_book_top(market.yes_coin, max_age_sec=15.0)
+            ws_no = pricing.get_book_top(market.no_coin, max_age_sec=15.0)
+            ws_btc = pricing.get_btc_mark_price(max_age_sec=15.0)
+            rest_books_complete = False
+            # A fresh/resynced WS cache is sufficient for public display and
+            # pure S0 signal inputs.  Execution continues to obtain its own
+            # REST book immediately before every submit/cancel-rebook action.
+            requires_rest_resync = bool(
+                not simulation and live_ws_recorder is not None and live_ws_recorder.resync_required.is_set()
+            )
+            if requires_rest_resync or not (stream_ready_for_pricing and ws_yes and ws_no and ws_btc):
+                try:
+                    if ws_btc is None:
+                        all_mids = client.get_all_mids_sync()
+                        btc_mark_str = all_mids.get("BTC", "0")
+                        btc_mark = float(btc_mark_str)
+                        if btc_mark > 0:
+                            pricing.update_btc_mark_price(btc_mark)
+                    if requires_rest_resync or ws_yes is None:
+                        pricing.update_l2_book(market.yes_coin, client.get_l2_book_sync(market.yes_coin))
+                    if requires_rest_resync or ws_no is None:
+                        pricing.update_l2_book(market.no_coin, client.get_l2_book_sync(market.no_coin))
+                    rest_books_complete = requires_rest_resync
+                except Exception as e:
+                    logger.debug(f"Pricing update note: {e}")
+            loop_stages_ms["pricing_reads"] = round((time.monotonic() - stage_start) * 1000)
+
+            if not simulation:
+                try:
+                    if live_ws_recorder is not None and live_ws_recorder.resync_required.is_set() and rest_books_complete:
+                        # Only a direct dual-book REST snapshot can clear the
+                        # reconnect/new-market resync gate; a cached WS book
+                        # never self-certifies a reconnect.
                         live_ws_recorder.mark_rest_resynced()
                         live_ws_recorder.resync_required.clear()
-                    live_execution.stream_health = live_ws_recorder.health
                 except Exception as e:
                     logger.warning(f"Outcome WS health setup failed; runtime will fail closed: {e}")
                 operational = ops_monitor.observe(
@@ -404,10 +424,13 @@ def run_integrated_hyperliquid_bot(
                 if not simulation:
                     try:
                         if live_strategy_gate is not None:
+                            stage_start = time.monotonic()
                             decision = live_strategy_gate.evaluate(
                                 spot_price=Decimal(str(spot_px)) if spot_px > 0 else None,
                                 strike_price=Decimal(str(strike_px)) if strike_px > 0 else None,
                             )
+                            loop_stages_ms["entry_gate"] = round((time.monotonic() - stage_start) * 1000)
+                            stage_start = time.monotonic()
                             runtime_result = live_execution.tick_live_strategy(
                                 market=market, entry_side_index=decision.side_index,
                                 entry_reason=decision.reason, entry_evidence=decision.evidence,
@@ -418,14 +441,21 @@ def run_integrated_hyperliquid_bot(
                                 },
                             )
                         elif live_execution.calibration_enabled():
+                            stage_start = time.monotonic()
                             runtime_result = live_execution.tick_p3_calibration(market=market)
                         else:
+                            stage_start = time.monotonic()
                             entry_side_index = 0 if active_side == "UP" else 1 if active_side == "DOWN" else None
                             runtime_result = live_execution.tick_market(market=market, entry_side_index=entry_side_index)
                         active_order_id = runtime_result.order_id if runtime_result.state in {"buy_placed", "buy_resting"} else None
                         logger.info(f"[LIVE OUTCOME RUNTIME] state={runtime_result.state} detail={runtime_result.detail} order={runtime_result.order_id}")
                     except Exception as e:
                         logger.error(f"Outcome live runtime failed closed: {e}")
+                    finally:
+                        # ``entry_gate`` above is intentionally isolated: it
+                        # lets production telemetry distinguish signal work
+                        # from account reconciliation and order lifecycle IO.
+                        loop_stages_ms["live_runtime"] = round((time.monotonic() - stage_start) * 1000)
                 # Maker Buy quoting logic (1 entry per market invariant)
                 if simulation and inventory_shares <= 0 and active_order_id is None and active_side in ("UP", "DOWN"):
                     target_coin = market.yes_coin if active_side == "UP" else market.no_coin
@@ -505,57 +535,15 @@ def run_integrated_hyperliquid_bot(
                             f"buy-cancel reconciliation failed: {e}"
                         )
 
-            # Settlement outlives active-market selection.  Keep requesting
-            # official evidence for retiring instances until confirmed; BTC
-            # price and UI state are never used as a settlement proxy.
+            # Settlement outlives active-market selection, but is explicitly
+            # off the execution lane.  The read-only worker retains candidates
+            # until official SDK plus payout/zero-balance evidence is enough
+            # to write canonical PnL.
             settlement_candidates = {retiring_market.outcome_id for retiring_market in retiring_markets}
             if phase == MarketPhase.SETTLING:
                 settlement_candidates.add(market.outcome_id)
-            # Process restarts must not lose a previous daily market's
-            # settlement evidence.  Recover open journal inventory by market
-            # id; the official SDK endpoint only needs that id.
-            if not simulation:
-                settlement_candidates.update(pnl_reconciler.unresolved_outcome_ids())
-            for settlement_market_id in settlement_candidates:
-                if settlement_market_id not in settled_markets:
-                    now_monotonic = time.monotonic()
-                    if now_monotonic - settlement_last_attempt_at.get(settlement_market_id, 0.0) < 30.0:
-                        continue
-                    settlement_last_attempt_at[settlement_market_id] = now_monotonic
-                    if not simulation:
-                        try:
-                            settlement = settlement_adapter.fetch_outcome_id(settlement_market_id)
-                            if not settlement.settled:
-                                logger.info(f"[OUTCOME SETTLEMENT] #{settlement_market_id} not yet confirmed by official SDK; holding state.")
-                            else:
-                                logger.info(
-                                    f"[OUTCOME SETTLEMENT] #{settlement_market_id} confirmed by official SDK "
-                                    f"fraction={settlement.settle_fraction} details={settlement.details}"
-                                )
-                                # Confirmation alone is not PnL.  Require the
-                                # official account's payout or zero-balance
-                                # evidence before a canonical settlement row.
-                                account_fills = client.get_user_fills_sync(auth.wallet_address)
-                                clearinghouse = client.get_spot_clearinghouse_state_sync(auth.wallet_address)
-                                status = pnl_reconciler.reconcile_settlement(
-                                    settlement=settlement, raw_fills=account_fills, clearinghouse=clearinghouse,
-                                )
-                                if status in {"recorded", "already_recorded"}:
-                                    settled_markets.add(settlement_market_id)
-                                    logger.info(f"[OUTCOME SETTLEMENT] #{settlement_market_id} canonical PnL {status}")
-                                else:
-                                    logger.info(
-                                        f"[OUTCOME SETTLEMENT] #{settlement_market_id} confirmation retained; "
-                                        f"canonical PnL {status}"
-                                    )
-                        except Exception as e:
-                            logger.warning(f"[OUTCOME SETTLEMENT] official confirmation unavailable: {e}")
-                    else:
-                        settled_markets.add(settlement_market_id)
-                        logger.info(
-                            f"[OUTCOME SETTLEMENT] simulation marked #{settlement_market_id} "
-                            "terminal without inferring payout from BTC price"
-                        )
+            if settlement_worker is not None:
+                settlement_worker.add_candidates(settlement_candidates)
 
             # 5. Update dashboard state
             with dashboard_state._lock:
@@ -605,7 +593,20 @@ def run_integrated_hyperliquid_bot(
                     f"Pos: {inventory_shares:.1f} {inventory_side or '-'}"
                 )
 
-            elapsed = time.time() - cycle_start
+            elapsed = time.monotonic() - cycle_start
+            # Keep ordinary journal volume bounded.  A timing event exists
+            # only when the intended 1.5-second execution lane was missed,
+            # making a later operational diagnosis independent of terminal
+            # print cadence.
+            if not simulation and elapsed >= 3.0:
+                timing_payload = {
+                    "venue": "hyperliquid_outcome", "read_only": True,
+                    "market_id": market.outcome_id, "period": market.period,
+                    "total_ms": round(elapsed * 1000), "stage_ms": loop_stages_ms,
+                    "target_interval_ms": round(refresh_interval * 1000),
+                }
+                live_journal.log_strategy_event("outcome-loop-timing", "OUTCOME_LOOP_TIMING", timing_payload)
+                logger.warning(f"[OUTCOME LOOP SLOW] total_ms={timing_payload['total_ms']} stages={loop_stages_ms}")
             time.sleep(max(0.1, refresh_interval - elapsed))
 
     except KeyboardInterrupt:
@@ -613,6 +614,8 @@ def run_integrated_hyperliquid_bot(
     finally:
         if research_worker is not None:
             research_worker.stop()
+        if settlement_worker is not None:
+            settlement_worker.stop()
         if live_ws_recorder is not None:
             live_ws_recorder.stop()
         if terminal_dash:

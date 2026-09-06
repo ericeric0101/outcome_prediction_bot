@@ -6,7 +6,7 @@ import { createInterface } from "node:readline";
 
 type Command = "health" | "fetch_markets" | "fetch_order_book" | "fetch_settled_outcome" | "fetch_account_snapshot" | "place_limit_order" | "place_emergency_ioc_exit" | "cancel_order" | "merge_outcome";
 type Request = { id: string; command: Command; testnet?: boolean; payload?: Record<string, unknown> };
-type Response = { id: string; ok: boolean; result?: unknown; error?: { code: string; message: string } };
+type Response = { id: string; ok: boolean; result?: unknown; error?: { code: string; message: string }; timingMs?: number; command?: Command };
 type LimitOrderPayload = { marketId: string; outcome: string; side: "buy" | "sell"; price: string; amount: string; timeInForce?: "GTC" | "GTD" | "FOK" | "FAK" | "ALO"; skipMinNotionalCheck?: boolean };
 type CancelPayload = { marketId: string; outcome: string; orderId: string };
 type MergePayload = { marketId: string; amount: string };
@@ -21,6 +21,49 @@ function parseRequest(line: string): Request {
   return request as Request;
 }
 function executionEnabled(): boolean { return process.env.OUTCOME_SDK_EXECUTION_ENABLED === "1"; }
+// The Python parent keeps this JSON-lines process alive.  Cache the *official*
+// SDK adapter here as well: a long-lived Node process alone would not remove
+// the expensive initialize/auth work if it happened for every request.
+const adapters = new Map<boolean, Promise<ReturnType<typeof createHIP4Adapter>>>();
+const authenticatedAdapters = new Map<string, Promise<void>>();
+const settledClients = new Map<boolean, HIP4Client>();
+
+function adapterKey(testnet: boolean): boolean { return testnet; }
+function getAdapter(testnet: boolean): Promise<ReturnType<typeof createHIP4Adapter>> {
+  const key = adapterKey(testnet);
+  let adapter = adapters.get(key);
+  if (!adapter) {
+    adapter = (async () => {
+      const created = createHIP4Adapter({ testnet });
+      await created.initialize();
+      return created;
+    })();
+    adapters.set(key, adapter);
+    // A failed initialization must not poison all future requests.
+    adapter.catch(() => adapters.delete(key));
+  }
+  return adapter;
+}
+function getSettledClient(testnet: boolean): HIP4Client {
+  let client = settledClients.get(testnet);
+  if (!client) {
+    client = new HIP4Client({ testnet });
+    settledClients.set(testnet, client);
+  }
+  return client;
+}
+async function ensureAuthenticated(hip4: ReturnType<typeof createHIP4Adapter>, testnet: boolean): Promise<{ wallet: string }> {
+  const { wallet, signer } = getWalletAndSigner();
+  const key = `${testnet}:${wallet.toLowerCase()}:${signer.address.toLowerCase()}`;
+  let authenticated = authenticatedAdapters.get(key);
+  if (!authenticated) {
+    authenticated = hip4.auth.initAuth(wallet, signer).then(() => undefined);
+    authenticatedAdapters.set(key, authenticated);
+    authenticated.catch(() => authenticatedAdapters.delete(key));
+  }
+  await authenticated;
+  return { wallet };
+}
 function getWalletAndSigner() {
   const wallet = process.env.HL_WALLET_ADDRESS;
   const agentKey = process.env.HL_AGENT_PRIVATE_KEY;
@@ -84,12 +127,12 @@ async function requireAloIsMaker(hip4: ReturnType<typeof createHIP4Adapter>, pay
   if ((payload.side === "buy" && price >= opposing) || (payload.side === "sell" && price <= opposing)) throw new Error(`ALO would cross the book at ${opposing}`);
 }
 
-async function handle(request: Request): Promise<Response> {
+async function handleCommand(request: Request): Promise<Response> {
   if (request.command === "health") return { id: request.id, ok: true, result: { protocol: "outcome-sdk-sidecar/v1", execution: "disabled_by_default" } };
   if (!(["fetch_markets", "fetch_order_book", "fetch_settled_outcome", "fetch_account_snapshot", "place_limit_order", "place_emergency_ioc_exit", "cancel_order", "merge_outcome"] as string[]).includes(request.command)) return { id: request.id, ok: false, error: { code: "UNKNOWN_COMMAND", message: request.command } };
   if ((request.command === "place_limit_order" || request.command === "place_emergency_ioc_exit" || request.command === "cancel_order" || request.command === "merge_outcome") && !executionEnabled()) return { id: request.id, ok: false, error: { code: "EXECUTION_DISABLED", message: "Set OUTCOME_SDK_EXECUTION_ENABLED=1 after explicit operator approval." } };
-  const hip4 = createHIP4Adapter({ testnet: request.testnet ?? false });
-  await hip4.initialize();
+  const testnet = request.testnet ?? false;
+  const hip4 = await getAdapter(testnet);
   if (request.command === "fetch_markets") {
     const markets = (await hip4.events.fetchMarkets({ type: "defaultBinary" })) as DefaultBinaryMarket[];
     return { id: request.id, ok: true, result: markets.map((market) => ({ outcomeId: market.outcomeId, name: market.name, underlying: market.underlying, targetPrice: market.targetPrice, period: market.period, expiry: market.expiry.toISOString(), sides: market.sides.map((side) => ({ name: side.name, coin: side.coin, asset: side.asset })) })) };
@@ -103,7 +146,7 @@ async function handle(request: Request): Promise<Response> {
   }
   if (request.command === "fetch_settled_outcome") {
     const marketId = requireString(request.payload?.marketId, "payload.marketId");
-    const client = new HIP4Client({ testnet: request.testnet ?? false });
+    const client = getSettledClient(testnet);
     return { id: request.id, ok: true, result: await client.fetchSettledOutcome(Number(marketId)) };
   }
   if (request.command === "fetch_account_snapshot") {
@@ -113,8 +156,7 @@ async function handle(request: Request): Promise<Response> {
     ]);
     return { id: request.id, ok: true, result: { positions, balances, openOrders: orders, activity } };
   }
-  const { wallet, signer } = getWalletAndSigner();
-  await hip4.auth.initAuth(wallet, signer);
+  const { wallet } = await ensureAuthenticated(hip4, testnet);
   if (request.command === "place_limit_order") {
     const payload = parseLimitPayload(request.payload);
     const sideIndex = await requireMarketSide(hip4, payload.marketId, payload.outcome);
@@ -135,7 +177,7 @@ async function handle(request: Request): Promise<Response> {
   if (request.command === "merge_outcome") {
     if (process.env.OUTCOME_SETTLEMENT_ACTION_ENABLED !== "1") return { id: request.id, ok: false, error: { code: "SETTLEMENT_ACTION_DISABLED", message: "Set OUTCOME_SETTLEMENT_ACTION_ENABLED=1 after explicit operator approval." } };
     const merge = parseMergePayload(request.payload);
-    const client = new HIP4Client({ testnet: request.testnet ?? false });
+    const client = getSettledClient(testnet);
     if (!(await client.fetchSettledOutcome(Number(merge.marketId)))) return { id: request.id, ok: false, error: { code: "NOT_SETTLED", message: "Outcome is not settled; merge is not a redemption substitute." } };
     const result = await hip4.trading.mergeOutcome({ outcome: Number(merge.marketId), amount: merge.amount });
     return result.success ? { id: request.id, ok: true, result } : { id: request.id, ok: false, result, error: { code: "MERGE_REJECTED", message: result.error ?? "merge rejected" } };
@@ -146,6 +188,19 @@ async function handle(request: Request): Promise<Response> {
   if (!ownedOrder || ownedOrder.coin !== payload.outcome) throw new Error("order is not an open order owned by the configured wallet with the requested outcome");
   const result = await hip4.trading.cancelOrder([payload]);
   return { id: request.id, ok: true, result };
+}
+
+async function handle(request: Request): Promise<Response> {
+  const startedAt = performance.now();
+  try {
+    const response = await handleCommand(request);
+    return { ...response, command: request.command, timingMs: performance.now() - startedAt };
+  } catch (error) {
+    return {
+      id: request.id, ok: false, command: request.command, timingMs: performance.now() - startedAt,
+      error: { code: "REQUEST_FAILED", message: error instanceof Error ? error.message : String(error) },
+    };
+  }
 }
 
 const input = createInterface({ input: process.stdin, crlfDelay: Infinity });

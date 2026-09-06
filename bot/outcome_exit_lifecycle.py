@@ -45,6 +45,33 @@ class OutcomeExitLifecycleStore:
             "state": lifecycle.state, "reason": reason, **(extra or {}),
         })
 
+    def record_replacement_submit(
+        self, lifecycle: OutcomeExitLifecycle, *, old_order_id: str, trigger_bbo: dict[str, Any],
+        loss_threshold: Decimal | None, current_signal: dict[str, Any], plan_reason: str,
+        execution_timing: dict[str, Any] | None = None,
+    ) -> None:
+        """Make every rebook joinable to its later exchange fill.
+
+        ``OUTCOME_EXIT_LIFECYCLE`` proves ownership state.  This separate
+        canonical ``ORDER_SUBMIT`` row supplies the venue order id used by the
+        fill reconciler and preserves the decision-time (not post-cancel) BBO.
+        """
+        self.journal.log_order_event(
+            self.run_id, "ORDER_SUBMIT", venue_order_id=lifecycle.order_id,
+            side="SELL", price=float(lifecycle.target_price), qty=float(lifecycle.inventory),
+            status="ALO_REPLACEMENT_SUBMITTED", reason=plan_reason, instrument_id=lifecycle.coin,
+            payload={
+                "venue": "hyperliquid_outcome", "outcome_id": lifecycle.outcome_id,
+                "coin": lifecycle.coin, "execution_type": "exit_cancel_confirm_rebook_alo",
+                "old_order_id": old_order_id, "replacement_price": str(lifecycle.target_price),
+                "replacement_count": lifecycle.replacement_count,
+                "trigger_bbo": trigger_bbo,
+                "loss_threshold": str(loss_threshold) if loss_threshold is not None else None,
+                "current_signal": current_signal,
+                "execution_timing": execution_timing or {},
+            },
+        )
+
     def recover(self, *, wallet: str, outcome_id: int, coin: str) -> OutcomeExitLifecycle | None:
         try:
             with sqlite3.connect(self.journal.db_path) as conn:

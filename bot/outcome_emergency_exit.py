@@ -177,6 +177,11 @@ class OutcomeEmergencyExitController:
         self.account, self.gateway, self.store, self.wallet, self.policy = account, gateway, store, wallet, policy
         self._in_flight: set[tuple[int, str]] = set()
 
+    def _invalidate_account_reads(self) -> None:
+        invalidate = getattr(self.account, "invalidate", None)
+        if callable(invalidate):
+            invalidate()
+
     def execute(self, *, market: OutcomeMarketSpec, side_index: int,
                 lifecycle: OutcomeExitLifecycle, item: OutcomeEmergencyExitInput,
                 plan: OutcomeEmergencyExitPlan) -> EmergencyExitExecutionResult:
@@ -205,6 +210,7 @@ class OutcomeEmergencyExitController:
             except Exception as exc:
                 self.store.record(lifecycle, reason=f"emergency_cancel_exception:{type(exc).__name__}", extra={"state": "RECONCILE_REQUIRED"})
                 return EmergencyExitExecutionResult("reconcile_required", "emergency_cancel_request_failed", lifecycle.order_id)
+            self._invalidate_account_reads()
             after_orders = self.account.get_open_orders_sync(self.wallet)
             if any(str(row.get("oid")) == lifecycle.order_id for row in after_orders):
                 self.store.record(lifecycle, reason="emergency_cancel_not_confirmed", extra={"state": "RECONCILE_REQUIRED"})
@@ -235,6 +241,7 @@ class OutcomeEmergencyExitController:
             except Exception as exc:
                 self.store.record(lifecycle, reason=f"emergency_ioc_exception:{type(exc).__name__}", extra={"state": "RECONCILE_REQUIRED"})
                 return EmergencyExitExecutionResult("reconcile_required", "emergency_ioc_submission_failed", lifecycle.order_id)
+            self._invalidate_account_reads()
             emergency_order_id = str(result.get("orderId") or "")
             if not emergency_order_id:
                 self.store.record(lifecycle, reason="emergency_ioc_missing_order_id", extra={"state": "RECONCILE_REQUIRED"})

@@ -25,7 +25,8 @@ def test_replay_is_journal_only_and_uses_future_snapshots(tmp_path):
         raw = conn.execute("SELECT payload_json FROM strategy_events WHERE event_type='OUTCOME_EXIT_REQUOTE_REPLAY'").fetchone()[0]
     payload = json.loads(raw)
     assert payload["read_only"] is True and payload["execution_submitted"] is False
-    assert payload["plan"]["action"] == "CANCEL_REPLACE"
+    assert payload["loss_band_authorized"] is False
+    assert payload["plan"]["action"] == "KEEP"
 
 
 def test_replay_ignores_other_period_and_never_needs_gateway(tmp_path):

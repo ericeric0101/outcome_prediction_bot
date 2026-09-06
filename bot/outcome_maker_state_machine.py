@@ -41,6 +41,11 @@ class OutcomeMakerStateMachine:
         self.wallet = wallet
         self.journal = journal
 
+    def _invalidate_account_reads(self) -> None:
+        invalidate = getattr(self.account, "invalidate", None)
+        if callable(invalidate):
+            invalidate()
+
     @staticmethod
     def _coin_position(state: dict[str, Any], coin: str) -> tuple[Decimal, Decimal]:
         # HIP-4 books use ``#<id>`` while spot-clearinghouse inventory is
@@ -143,7 +148,9 @@ class OutcomeMakerStateMachine:
         self, *, market: OutcomeMarketSpec, side_index: int, entry_permitted: bool,
         minimum_return_pct: Decimal | None = None, maker_close_fee_rate: Decimal | None = None,
         loss_reprice_pct: Decimal | None = None,
-        entry_audit: Mapping[str, str | int | None] | None = None,
+        loss_band_authorized: bool = False,
+        entry_audit: Mapping[str, object] | None = None,
+        entry_max_submit_price: Decimal | None = None,
     ) -> MakerTickResult:
         coin = self.gateway.outcome_coin(market, side_index)
         inventory, entry_notional = self._coin_position(self.account.get_spot_clearinghouse_state_sync(self.wallet), coin)
@@ -186,10 +193,14 @@ class OutcomeMakerStateMachine:
                 book = self.gateway.fetch_order_book(market=market, side_index=side_index)
                 bid, ask = self._best(book["bids"], "bid"), self._best(book["asks"], "ask")
                 midpoint = (bid + ask) / Decimal("2")
-                loss_triggered = loss_floor is not None and midpoint <= avg_entry * (Decimal("1") - loss_reprice_pct)
+                loss_triggered = bool(
+                    loss_band_authorized and loss_floor is not None
+                    and midpoint <= avg_entry * (Decimal("1") - loss_reprice_pct)
+                )
                 existing_price = Decimal(str(covering.get("limitPx", covering.get("px", "0"))))
                 if loss_triggered and existing_price > loss_floor:
                     self.gateway.cancel_owned_order(market=market, side_index=side_index, order_id=str(covering["oid"]))
+                    self._invalidate_account_reads()
                     return MakerTickResult("blocked", "loss threshold crossed; cancelled old profit sell for maker-only protection reprice", str(covering["oid"]), audit)
                 return MakerTickResult("sell_resting", "inventory is protected by owned ALO sell", str(covering.get("oid")), audit)
             if buys:
@@ -197,6 +208,7 @@ class OutcomeMakerStateMachine:
                 # the cancelled remainder and then post the protective sale.
                 order = buys[0]
                 self.gateway.cancel_owned_order(market=market, side_index=side_index, order_id=str(order["oid"]))
+                self._invalidate_account_reads()
                 return MakerTickResult("blocked", "cancelled unfilled buy remainder before protective sell", str(order["oid"]), audit)
             # There is no safe generic fallback sell.  In particular, using
             # current best ask here can realize a loss while the journal calls
@@ -210,7 +222,10 @@ class OutcomeMakerStateMachine:
             book = self.gateway.fetch_order_book(market=market, side_index=side_index)
             bid, ask = self._best(book["bids"], "bid"), self._best(book["asks"], "ask")
             midpoint = (bid + ask) / Decimal("2")
-            loss_triggered = loss_floor is not None and midpoint <= avg_entry * (Decimal("1") - loss_reprice_pct)
+            loss_triggered = bool(
+                loss_band_authorized and loss_floor is not None
+                and midpoint <= avg_entry * (Decimal("1") - loss_reprice_pct)
+            )
             target = loss_floor if loss_triggered else profit_target
             assert target is not None or minimum_return_pct is None
             target = target or ask
@@ -231,6 +246,10 @@ class OutcomeMakerStateMachine:
                 # allow the official SDK's documented residual-close exception.
                 reduce_only=True,
             )
+            self._invalidate_account_reads()
+            timing = getattr(self.gateway, "last_sidecar_timing", None)
+            if isinstance(timing, dict):
+                audit["sdk_submit_timing"] = dict(timing)
             detail = "placed maker-only loss-band protection sell" if loss_triggered else "placed net take-profit ALO sell for reconciled inventory"
             return MakerTickResult("sell_placed", detail, str(result["orderId"]), audit)
 
@@ -243,7 +262,18 @@ class OutcomeMakerStateMachine:
 
         book = self.gateway.fetch_order_book(market=market, side_index=side_index)
         bid = self._best(book["bids"], "bid")
+        if entry_max_submit_price is not None and bid > entry_max_submit_price:
+            audit = dict(entry_audit or {})
+            decision_bid = audit.get("entry_bid_at_decision")
+            audit.update({
+                "entry_submit_bid": str(bid), "entry_max_submit_bid": str(entry_max_submit_price),
+                "tier_b_submit_drift_bps": str(
+                    (bid / Decimal(str(decision_bid)) - Decimal("1")) * Decimal("10000")
+                ) if decision_bid is not None and Decimal(str(decision_bid)) > 0 else None,
+            })
+            return MakerTickResult("flat", "Tier-B entry submit price drift exceeds calibrated ceiling", audit=audit)
         result = self.gateway.place_alo(market=market, side_index=side_index, is_buy=True, price=bid)
+        self._invalidate_account_reads()
         # The ledger records this ``audit`` payload on the same durable
         # ORDER_SUBMIT row as the exchange order id.  In particular, a live
         # strategy's chosen exit target must not exist only in a later,
@@ -251,5 +281,8 @@ class OutcomeMakerStateMachine:
         # would otherwise make the order impossible to audit accurately.
         return MakerTickResult(
             "buy_placed", "placed first-level ALO buy", str(result["orderId"]),
-            audit=dict(entry_audit or {}),
+            audit={
+                **dict(entry_audit or {}), "entry_submit_bid": str(bid),
+                "sdk_submit_timing": dict(getattr(self.gateway, "last_sidecar_timing", {}) or {}),
+            },
         )

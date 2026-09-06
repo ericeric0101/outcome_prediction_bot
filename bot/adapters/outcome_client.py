@@ -54,12 +54,18 @@ class OutcomeClient:
         self,
         auth: OutcomeAuth,
         timeout_sec: float = 10.0,
+        info_max_retries: int = 3,
+        ws_open_timeout_sec: float | None = None,
     ) -> None:
         self.auth = auth
         self.base_url = auth.base_url
         self.ws_url = auth.ws_url
         self.wallet_address = auth.wallet_address
         self.timeout_sec = timeout_sec
+        self.info_max_retries = max(1, int(info_max_retries))
+        # HTTP execution reads may be budgeted tightly without making a
+        # healthy WebSocket handshake unnecessarily fragile.
+        self.ws_open_timeout_sec = float(ws_open_timeout_sec or timeout_sec)
         self._async_client: Optional[httpx.AsyncClient] = None
         self._sync_client: Optional[httpx.Client] = None
         self._ws: Optional[websockets.WebSocketClientProtocol] = None
@@ -105,13 +111,16 @@ class OutcomeClient:
         """Bounded exponential backoff for rate limits and transient upstream errors."""
         return min(8.0, float(2 ** (attempt - 1)))
 
-    async def post_info(self, payload: Dict[str, Any], max_retries: int = 3) -> Any:
+    async def post_info(self, payload: Dict[str, Any], max_retries: int | None = None) -> Any:
         """Raw POST request to /info with retry for 429, 5xx, and transport failures."""
+        max_retries = self.info_max_retries if max_retries is None else max(1, int(max_retries))
         client = await self.get_async_client()
         for attempt in range(1, max_retries + 1):
             try:
                 resp = await client.post("/info", json=payload)
                 if resp.status_code == 429 or 500 <= resp.status_code <= 599:
+                    if attempt == max_retries:
+                        resp.raise_for_status()
                     wait_sec = self._info_retry_delay(attempt)
                     logger.warning(
                         f"Hyperliquid /info transient HTTP {resp.status_code} for {payload.get('type')}; "
@@ -135,13 +144,16 @@ class OutcomeClient:
                     raise
                 await asyncio.sleep(self._info_retry_delay(attempt))
 
-    def post_info_sync(self, payload: Dict[str, Any], max_retries: int = 3) -> Any:
+    def post_info_sync(self, payload: Dict[str, Any], max_retries: int | None = None) -> Any:
         """Synchronous /info request with retry for 429, 5xx, and transport failures."""
+        max_retries = self.info_max_retries if max_retries is None else max(1, int(max_retries))
         client = self.get_sync_client()
         for attempt in range(1, max_retries + 1):
             try:
                 resp = client.post("/info", json=payload)
                 if resp.status_code == 429 or 500 <= resp.status_code <= 599:
+                    if attempt == max_retries:
+                        resp.raise_for_status()
                     wait_sec = self._info_retry_delay(attempt)
                     logger.warning(
                         f"Hyperliquid /info transient HTTP {resp.status_code} for {payload.get('type')}; "
@@ -591,7 +603,7 @@ class OutcomeClient:
                     self.ws_url,
                     ping_interval=20,
                     ping_timeout=10,
-                    open_timeout=self.timeout_sec,
+                    open_timeout=self.ws_open_timeout_sec,
                 ) as ws:
                     self._ws = ws
                     reconnect_attempt = 0

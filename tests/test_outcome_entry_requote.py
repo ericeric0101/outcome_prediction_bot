@@ -10,6 +10,7 @@ from bot.outcome_entry_requote import (
     OutcomeEntryQuotePlannerConfig,
     OutcomeEntryRequoteController,
 )
+from bot.outcome_account_read_cache import OutcomeAccountReadCache
 from monitoring.trade_journal_db import TradeJournalDB
 
 
@@ -87,4 +88,44 @@ def test_entry_cancel_requires_truth_then_waits_for_next_tick_to_rebook(tmp_path
                                        plan=EntryQuotePlan(EntryQuoteAction.CANCEL, "entry_first_level_bid_changed"))
     assert result.state == "cancelled"
     assert gateway.calls[0]["order_id"] == "buy-1"
+    assert store.recover(wallet="w", outcome_id=1356, coin="#13561") is None
+
+
+def test_entry_cancel_invalidates_shared_account_cache_before_confirmation(tmp_path):
+    """A cancel confirmation must never read the stale pre-cancel order cache."""
+    journal = TradeJournalDB(tmp_path / "entry_cached.db")
+    store = OutcomeEntryLifecycleStore(journal, "run")
+    _audited_submit(journal)
+    raw_account = Account(); gateway = Gateway(raw_account)
+    lifecycle = store.recover_or_adopt_audited_submit(
+        wallet="w", outcome_id=1356, coin="#13561", open_orders=raw_account.orders,
+    )
+    cached_account = OutcomeAccountReadCache(raw_account)
+    # Populate the same per-tick cache that the controller will use.
+    assert cached_account.get_open_orders_sync("w")
+    controller = OutcomeEntryRequoteController(account=cached_account, gateway=gateway, store=store, wallet="w")
+    result = controller.execute_cancel(
+        market=market(), side_index=1, lifecycle=lifecycle,
+        plan=EntryQuotePlan(EntryQuoteAction.CANCEL, "entry_first_level_bid_changed"),
+    )
+    assert result.state == "cancelled"
+
+
+def test_filled_entry_cancel_confirms_remainder_is_gone_before_protective_exit(tmp_path):
+    journal = TradeJournalDB(tmp_path / "filled_entry.db")
+    store = OutcomeEntryLifecycleStore(journal, "run")
+    _audited_submit(journal)
+
+    class FilledAccount(Account):
+        def get_spot_clearinghouse_state_sync(self, _):
+            return {"balances": [{"coin": "+13561", "total": "7"}]}
+
+    account = FilledAccount(); gateway = Gateway(account)
+    lifecycle = store.recover_or_adopt_audited_submit(
+        wallet="w", outcome_id=1356, coin="#13561", open_orders=account.orders,
+    )
+    controller = OutcomeEntryRequoteController(account=account, gateway=gateway, store=store, wallet="w")
+    result = controller.execute_cancel_after_fill(market=market(), side_index=1, lifecycle=lifecycle)
+    assert result.state == "cancelled_after_fill"
+    assert gateway.calls == [{"market": market(), "side_index": 1, "order_id": "buy-1"}]
     assert store.recover(wallet="w", outcome_id=1356, coin="#13561") is None

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from decimal import Decimal, ROUND_UP
 from pathlib import Path
+import time
 from typing import Any
 
 from bot.lifecycle.outcome_lifecycle import OutcomeMarketSpec
@@ -34,6 +35,18 @@ class OutcomeExecutionGateway:
 
     def __init__(self, sidecar: OutcomeSdkSidecarClient | None = None) -> None:
         self.sidecar = sidecar or OutcomeSdkSidecarClient(Path(__file__).resolve().parent.parent / "outcome_sdk_sidecar")
+        self.last_sidecar_timing: dict[str, Any] | None = None
+
+    def _request(self, command: str, **kwargs: Any) -> Any:
+        started_at = time.monotonic()
+        result = self.sidecar.request(command, **kwargs)
+        timing = getattr(self.sidecar, "last_request_timing", None)
+        self.last_sidecar_timing = {
+            **(dict(timing) if isinstance(timing, dict) else {}),
+            "gateway_command": command,
+            "gateway_total_ms": round((time.monotonic() - started_at) * 1000, 3),
+        }
+        return result
 
     @staticmethod
     def outcome_coin(market: OutcomeMarketSpec, side_index: int) -> str:
@@ -77,7 +90,7 @@ class OutcomeExecutionGateway:
             # Official SDK documented close-flow escape hatch.  It is
             # intentionally never sent for opening orders or generic sells.
             payload["skipMinNotionalCheck"] = True
-        result = self.sidecar.request(
+        result = self._request(
             "place_limit_order",
             payload=payload,
             allow_execution=True,
@@ -87,7 +100,7 @@ class OutcomeExecutionGateway:
         return {**result, "shares": shares, "coin": self.outcome_coin(market, side_index)}
 
     def fetch_order_book(self, *, market: OutcomeMarketSpec, side_index: int) -> dict[str, Any]:
-        return self.sidecar.request(
+        return self._request(
             "fetch_order_book",
             payload={"marketId": str(market.outcome_id), "outcome": self.outcome_coin(market, side_index)},
         )
@@ -106,7 +119,7 @@ class OutcomeExecutionGateway:
         shares = whole_share_size(limit_price, requested_shares, enforce_minimum=False)
         if shares <= 0:
             raise ValueError("Outcome emergency IOC exit requires positive whole inventory")
-        result = self.sidecar.request(
+        result = self._request(
             "place_emergency_ioc_exit",
             payload={
                 "marketId": str(market.outcome_id),
@@ -122,7 +135,7 @@ class OutcomeExecutionGateway:
         return {**result, "shares": shares, "coin": self.outcome_coin(market, side_index)}
 
     def cancel_owned_order(self, *, market: OutcomeMarketSpec, side_index: int, order_id: str) -> dict[str, Any]:
-        return self.sidecar.request(
+        return self._request(
             "cancel_order",
             payload={"marketId": str(market.outcome_id), "outcome": self.outcome_coin(market, side_index), "orderId": str(order_id)},
             allow_execution=True,

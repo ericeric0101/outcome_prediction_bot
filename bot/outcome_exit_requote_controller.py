@@ -44,8 +44,13 @@ class OutcomeExitRequoteController:
         self.tick_size = tick_size
         self._in_flight: set[tuple[int, str]] = set()
 
+    def _invalidate_account_reads(self) -> None:
+        invalidate = getattr(self.account, "invalidate", None)
+        if callable(invalidate):
+            invalidate()
+
     def execute(self, *, market: OutcomeMarketSpec, side_index: int, lifecycle: OutcomeExitLifecycle,
-                plan: ExitQuotePlan) -> ExitRequoteResult:
+                plan: ExitQuotePlan, replacement_context: dict[str, Any] | None = None) -> ExitRequoteResult:
         key = (market.outcome_id, lifecycle.coin)
         if plan.action is not ExitQuoteAction.CANCEL_REPLACE or plan.target_price is None:
             return ExitRequoteResult("blocked", "plan_does_not_authorize_replacement", lifecycle.order_id)
@@ -53,6 +58,7 @@ class OutcomeExitRequoteController:
             return ExitRequoteResult("blocked", "replacement_already_in_flight", lifecycle.order_id)
         self._in_flight.add(key)
         try:
+            timing: dict[str, Any] = {}
             before_orders = self.account.get_open_orders_sync(self.wallet)
             before_inventory = _inventory(self.account.get_spot_clearinghouse_state_sync(self.wallet), lifecycle.coin)
             owned = self.store.reconcile_owned_sell(wallet=self.wallet, outcome_id=market.outcome_id, coin=lifecycle.coin,
@@ -62,9 +68,14 @@ class OutcomeExitRequoteController:
             self.store.record(lifecycle, reason=plan.reason, extra={"state": "CANCEL_SUBMITTED", "planned_price": str(plan.target_price)})
             try:
                 self.gateway.cancel_owned_order(market=market, side_index=side_index, order_id=lifecycle.order_id)
+                cancel_timing = getattr(self.gateway, "last_sidecar_timing", None)
+                if isinstance(cancel_timing, dict):
+                    timing["cancel"] = dict(cancel_timing)
             except Exception as exc:
                 self.store.record(lifecycle, reason=f"cancel_exception:{type(exc).__name__}", extra={"state": "RECONCILE_REQUIRED"})
                 return ExitRequoteResult("reconcile_required", "cancel_request_failed", lifecycle.order_id)
+
+            self._invalidate_account_reads()
 
             orders_after_cancel = self.account.get_open_orders_sync(self.wallet)
             if any(str(row.get("oid")) == lifecycle.order_id for row in orders_after_cancel):
@@ -79,6 +90,9 @@ class OutcomeExitRequoteController:
                 return ExitRequoteResult("reconcile_required", "inventory_changed_during_cancel", lifecycle.order_id)
 
             book = self.gateway.fetch_order_book(market=market, side_index=side_index)
+            book_timing = getattr(self.gateway, "last_sidecar_timing", None)
+            if isinstance(book_timing, dict):
+                timing["book_request"] = dict(book_timing)
             try:
                 bid = Decimal(str(book["bids"][0]["price"]))
                 ask = Decimal(str(book["asks"][0]["price"]))
@@ -93,9 +107,13 @@ class OutcomeExitRequoteController:
             try:
                 result = self.gateway.place_alo(market=market, side_index=side_index, is_buy=False, price=price,
                                                 requested_shares=inventory_after_cancel, reduce_only=True)
+                submit_timing = getattr(self.gateway, "last_sidecar_timing", None)
+                if isinstance(submit_timing, dict):
+                    timing["submit"] = dict(submit_timing)
             except Exception as exc:
                 self.store.record(lifecycle, reason=f"replacement_exception:{type(exc).__name__}", extra={"state": "RECONCILE_REQUIRED"})
                 return ExitRequoteResult("reconcile_required", "replacement_submission_failed", lifecycle.order_id)
+            self._invalidate_account_reads()
             new_id = str(result.get("orderId") or "")
             if not new_id:
                 self.store.record(lifecycle, reason="replacement_missing_order_id", extra={"state": "RECONCILE_REQUIRED"})
@@ -103,6 +121,18 @@ class OutcomeExitRequoteController:
             state = "LOSS_BAND_RESTING" if plan.exit_mode == "loss_band" else "SELL_RESTING"
             new_lifecycle = OutcomeExitLifecycle(self.wallet, market.outcome_id, lifecycle.coin, new_id,
                                                   inventory_after_cancel, price, lifecycle.replacement_count + 1, state)
+            context = replacement_context or {}
+            trigger_bbo = context.get("trigger_bbo")
+            if not isinstance(trigger_bbo, dict):
+                trigger_bbo = {"best_bid": None, "best_ask": None}
+            current_signal = context.get("current_signal")
+            if not isinstance(current_signal, dict):
+                current_signal = {}
+            self.store.record_replacement_submit(
+                new_lifecycle, old_order_id=lifecycle.order_id, trigger_bbo=trigger_bbo,
+                loss_threshold=plan.floor_price, current_signal=current_signal,
+                plan_reason=plan.reason, execution_timing=timing,
+            )
             self.store.record(new_lifecycle, reason=plan.reason, extra={"old_order_id": lifecycle.order_id,
                               "best_bid": str(bid), "best_ask": str(ask), "exit_mode": plan.exit_mode or "unknown"})
             return ExitRequoteResult("sell_resting", "cancel_confirmed_rebooked_alo_replacement", lifecycle.order_id, new_id)

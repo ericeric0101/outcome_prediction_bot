@@ -1,4 +1,5 @@
 from decimal import Decimal
+import sqlite3
 
 from bot.outcome_live_strategy import OutcomeLiveStrategyConfig, OutcomeOiEntryGate
 from monitoring.trade_journal_db import TradeJournalDB
@@ -81,3 +82,21 @@ def test_tier_b_remains_off_by_default(tmp_path):
 def test_live_strategy_config_has_no_daily_entry_count_parameter(monkeypatch):
     monkeypatch.setenv("OUTCOME_LIVE_STRATEGY_MAX_DAILY_ENTRIES", "0")
     assert not hasattr(OutcomeLiveStrategyConfig.from_env(), "max_daily_entries")
+
+
+def test_live_oi_query_has_local_time_index_without_temp_sort(tmp_path):
+    db = TradeJournalDB(tmp_path / "strategy.db")
+    _oi(db, timestamp=1_000_000, oi="100", mark="100", tag="old")
+    _oi(db, timestamp=1_300_000, oi="101", mark="101", tag="new")
+    with sqlite3.connect(db.db_path) as conn:
+        plan = conn.execute(
+            """EXPLAIN QUERY PLAN
+               SELECT id, local_received_at_ms, open_interest, mark_price
+               FROM binance_oi_observations
+               WHERE symbol='BTCUSDT' AND backfilled=0 AND local_received_at_ms <= ?
+               ORDER BY local_received_at_ms DESC LIMIT 250""",
+            (2_000_000,),
+        ).fetchall()
+    detail = " ".join(str(row[-1]) for row in plan)
+    assert "idx_binance_oi_symbol_backfilled_local_time" in detail
+    assert "TEMP B-TREE" not in detail

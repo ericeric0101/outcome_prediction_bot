@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import math
 import sqlite3
+import time
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -68,6 +69,7 @@ class TradeJournalDB:
 
     def __init__(self, db_path: str = "./logs/trade_journal.db") -> None:
         self.db_path = str(Path(db_path))
+        self.last_write_timing_ms: dict[str, float] = {}
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
         self._init_schema()
 
@@ -161,6 +163,12 @@ class TradeJournalDB:
         );
 
         CREATE INDEX IF NOT EXISTS idx_strategy_events_run_ts ON strategy_events(run_id, ts);
+        -- Live paths select a bounded recent event type.  Without this,
+        -- queries against a multi-GB raw WS journal scan unrelated telemetry.
+        CREATE INDEX IF NOT EXISTS idx_strategy_events_type_id
+            ON strategy_events(event_type, id DESC);
+        CREATE INDEX IF NOT EXISTS idx_order_events_type_id
+            ON order_events(event_type, id DESC);
 
         -- Compact, short-lived P3 index.  The raw P2 event remains the
         -- authority; this table prevents the 5-second research worker from
@@ -233,6 +241,11 @@ class TradeJournalDB:
             ON binance_oi_observations(symbol, exchange_timestamp_ms);
         CREATE INDEX IF NOT EXISTS idx_binance_oi_run_time
             ON binance_oi_observations(run_id, exchange_timestamp_ms);
+        -- S0 reads the latest *locally observable* non-backfilled OI rows;
+        -- exchange time cannot serve this ORDER BY and previously required a
+        -- temp B-tree sort on every live decision.
+        CREATE INDEX IF NOT EXISTS idx_binance_oi_symbol_backfilled_local_time
+            ON binance_oi_observations(symbol, backfilled, local_received_at_ms DESC);
 
         -- X3 research rows.  Snapshot rows are recomputable derived data, but
         -- retain the exact source ids/timestamps used for each as-of join.
@@ -795,6 +808,7 @@ class TradeJournalDB:
 
     def log_strategy_event(self, run_id: str, event_type: str, payload: Optional[Dict[str, Any]] = None) -> Optional[int]:
         sql = "INSERT INTO strategy_events (ts, run_id, event_type, payload_json) VALUES (?, ?, ?, ?)"
+        started_at = time.monotonic()
         try:
             with self._connect() as conn:
                 cursor = conn.execute(
@@ -807,6 +821,7 @@ class TradeJournalDB:
                     ),
                 )
                 conn.commit()
+                self.last_write_timing_ms["strategy_event"] = round((time.monotonic() - started_at) * 1000, 3)
                 return int(cursor.lastrowid)
         except Exception as e:
             logger.debug(f"TradeJournalDB log_strategy_event failed: {e}")
@@ -1134,6 +1149,7 @@ class TradeJournalDB:
             instrument_id, token_id, fee_rate_bps, expected_net_usdc, commission_usdc, payload_json
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """
+        started_at = time.monotonic()
         try:
             with self._connect() as conn:
                 conn.execute(
@@ -1158,6 +1174,7 @@ class TradeJournalDB:
                     ),
                 )
                 conn.commit()
+                self.last_write_timing_ms["order_event"] = round((time.monotonic() - started_at) * 1000, 3)
         except Exception as e:
             logger.debug(f"TradeJournalDB log_order_event failed: {e}")
 

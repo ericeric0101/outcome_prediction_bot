@@ -1,4 +1,6 @@
 from decimal import Decimal
+import json
+import sqlite3
 
 from bot.lifecycle.outcome_lifecycle import OutcomeMarketSpec
 from bot.outcome_exit_lifecycle import OutcomeExitLifecycle, OutcomeExitLifecycleStore
@@ -50,6 +52,32 @@ def test_controller_cancels_confirms_rebooks_then_posts_alo(tmp_path):
     assert [name for name, _ in gateway.calls] == ["cancel", "book", "place"]
     assert gateway.calls[-1][1]["price"] > Decimal("0.70")
     assert store.recover(wallet="w", outcome_id=1153, coin="#11530").order_id == "new-9"
+    with sqlite3.connect(store.journal.db_path) as conn:
+        row = conn.execute(
+            "SELECT venue_order_id, payload_json FROM order_events WHERE event_type='ORDER_SUBMIT'"
+        ).fetchone()
+    assert row[0] == "new-9"
+    payload = json.loads(row[1])
+    assert payload["old_order_id"] == "old-7"
+    assert payload["replacement_price"] == "0.76031"
+    assert payload["trigger_bbo"] == {"best_bid": None, "best_ask": None}
+
+
+def test_controller_records_decision_bbo_loss_threshold_and_signal_for_replacement(tmp_path):
+    controller, lifecycle, _, store, _ = _setup(tmp_path)
+    controller.execute(
+        market=market(), side_index=0, lifecycle=lifecycle, plan=_plan(),
+        replacement_context={
+            "trigger_bbo": {"best_bid": "0.69", "best_ask": "0.70", "timestamp_ms": 123},
+            "current_signal": {"signal": "DOWN", "score": "-0.8"},
+        },
+    )
+    with sqlite3.connect(store.journal.db_path) as conn:
+        raw = conn.execute("SELECT payload_json FROM order_events WHERE event_type='ORDER_SUBMIT'").fetchone()[0]
+    payload = json.loads(raw)
+    assert payload["trigger_bbo"]["best_bid"] == "0.69"
+    assert payload["loss_threshold"] == "0.76031"
+    assert payload["current_signal"]["signal"] == "DOWN"
 
 
 def test_controller_never_places_before_cancel_confirmation(tmp_path):

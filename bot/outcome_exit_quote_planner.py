@@ -44,6 +44,9 @@ class ExitQuoteInput:
     now_ts: float
     last_requote_ts: float | None = None
     replacement_count: int = 0
+    # A price breach alone is not a thesis invalidation.  The runtime sets
+    # this only after a fresh, persistent opposite signal and healthy book.
+    loss_band_authorized: bool = False
 
 
 @dataclass(frozen=True)
@@ -91,7 +94,8 @@ class OutcomeExitQuotePlanner:
         midpoint = (item.best_bid + item.best_ask) / Decimal("2")
         if item.loss_reprice_pct is not None and Decimal("0") <= item.loss_reprice_pct < Decimal("1"):
             floor = item.fill_vwap * (Decimal("1") - item.loss_reprice_pct) / fee_denominator
-        loss_mode = floor is not None and midpoint <= item.fill_vwap * (Decimal("1") - item.loss_reprice_pct)
+        loss_threshold_breached = floor is not None and midpoint <= item.fill_vwap * (Decimal("1") - item.loss_reprice_pct)
+        loss_mode = bool(loss_threshold_breached and item.loss_band_authorized)
         desired = floor if loss_mode else profit_target
         # ALO sell must be strictly above the latest bid.  Best ask is the
         # least aggressive passive anchor; the policy floor may be higher.

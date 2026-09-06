@@ -112,10 +112,25 @@ def test_calibration_loss_band_cancels_old_profit_sell_without_taking():
     result = OutcomeMakerStateMachine(account=account, gateway=gateway, wallet="w").tick(
         market=market(), side_index=0, entry_permitted=False,
         minimum_return_pct=Decimal("0.05"), maker_close_fee_rate=Decimal("0.0004"), loss_reprice_pct=Decimal("0.05"),
+        loss_band_authorized=True,
     )
     assert result.state == "blocked"
     assert gateway.calls[0][0] == "cancel"
     assert gateway.calls[0][1]["order_id"] == "9"
+
+
+def test_tier_b_submit_drift_guard_refuses_late_higher_bid_without_placing():
+    class ChasingGateway(Gateway):
+        def fetch_order_book(self, **_): return {"bids": [{"price": "0.805"}], "asks": [{"price": "0.806"}]}
+    gateway = ChasingGateway()
+    result = OutcomeMakerStateMachine(account=Account(), gateway=gateway, wallet="w").tick(
+        market=market(), side_index=0, entry_permitted=True,
+        entry_audit={"entry_bid_at_decision": "0.800"}, entry_max_submit_price=Decimal("0.802"),
+    )
+    assert result.state == "flat"
+    assert "drift exceeds" in result.detail
+    assert gateway.calls == []
+    assert result.audit["entry_submit_bid"] == "0.805"
 
 
 def test_tick_cancels_partial_buy_before_sale():

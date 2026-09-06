@@ -16,9 +16,20 @@ def test_sidecar_client_requires_a_built_sidecar_for_read_only_calls():
 
 
 def test_sidecar_client_reads_health_protocol_from_a_built_sidecar():
-    client = OutcomeSdkSidecarClient()
-    result = client.request("health")
-    assert result["execution"] == "disabled_by_default"
+    with OutcomeSdkSidecarClient() as client:
+        result = client.request("health")
+        assert result["execution"] == "disabled_by_default"
+
+
+def test_sidecar_reuses_one_long_lived_node_process_for_multiple_requests():
+    with OutcomeSdkSidecarClient() as client:
+        client.request("health")
+        first = dict(client.last_request_timing or {})
+        client.request("health")
+        second = dict(client.last_request_timing or {})
+    assert first["persistent"] is True
+    assert first["pid"] == second["pid"]
+    assert second["command"] == "health"
 
 
 def test_sidecar_client_does_not_allow_execution_without_the_sidecar_gate():

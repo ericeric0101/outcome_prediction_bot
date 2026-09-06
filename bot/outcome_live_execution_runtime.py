@@ -17,6 +17,7 @@ from decimal import Decimal
 from bot.adapters.outcome_client import OutcomeClient
 from bot.lifecycle.outcome_lifecycle import OutcomeMarketSpec
 from bot.outcome_account_recovery import OutcomeAccountRecovery
+from bot.outcome_account_read_cache import OutcomeAccountReadCache
 from bot.outcome_execution_gateway import OutcomeExecutionGateway, whole_share_size
 from bot.outcome_maker_state_machine import MakerTickResult, OutcomeMakerStateMachine
 from bot.outcome_risk_gate import OutcomePreTradeRiskGate, OutcomeRiskLimits
@@ -38,8 +39,9 @@ from bot.outcome_entry_requote import (
     OutcomeEntryRequoteController,
 )
 from bot.outcome_holding_path import OutcomeHoldingPathObservation, OutcomeHoldingPathRecorder
-from bot.outcome_reversal import OutcomeReversalClassifier, OutcomeReversalInput
+from bot.outcome_reversal import OutcomeReversalClassifier, OutcomeReversalInput, OutcomeReversalState
 from bot.outcome_loss_reentry import OutcomeLossReentryGate
+from bot.outcome_tier_b_execution_gate import OutcomeTierBExecutionGate
 from bot.outcome_emergency_exit import (
     EmergencyExitAction,
     OutcomeEmergencyExitController,
@@ -59,9 +61,10 @@ class LiveExecutionResult:
 
 class OutcomeLiveExecutionRuntime:
     def __init__(self, *, account: OutcomeClient, wallet: str, gateway: OutcomeExecutionGateway | None = None, risk_gate: OutcomePreTradeRiskGate | None = None, stream_health: OutcomeStreamHealth | None = None, ledger: OutcomeExecutionLedger | None = None, research_gate: OutcomeResearchGate | None = None, exit_planner: OutcomeExitQuotePlanner | None = None, exit_lifecycle_store: OutcomeExitLifecycleStore | None = None, exit_requote_controller: OutcomeExitRequoteController | None = None, entry_planner: OutcomeEntryQuotePlanner | None = None, entry_lifecycle_store: OutcomeEntryLifecycleStore | None = None, entry_requote_controller: OutcomeEntryRequoteController | None = None) -> None:
-        self.recovery = OutcomeAccountRecovery(account=account, wallet=wallet)
+        self._account_reads = OutcomeAccountReadCache(account)
+        self.recovery = OutcomeAccountRecovery(account=self._account_reads, wallet=wallet)
         self.machine = OutcomeMakerStateMachine(
-            account=account, gateway=gateway or OutcomeExecutionGateway(), wallet=wallet,
+            account=self._account_reads, gateway=gateway or OutcomeExecutionGateway(), wallet=wallet,
             journal=ledger.journal if ledger else None,
         )
         self.risk_gate = risk_gate or OutcomePreTradeRiskGate(OutcomeRiskLimits(
@@ -77,22 +80,23 @@ class OutcomeLiveExecutionRuntime:
         self.exit_planner = exit_planner
         self.exit_lifecycle_store = exit_lifecycle_store or (OutcomeExitLifecycleStore(ledger.journal, ledger.run_id) if ledger else None)
         self.exit_requote_controller = exit_requote_controller or (
-            OutcomeExitRequoteController(account=account, gateway=self.machine.gateway, store=self.exit_lifecycle_store, wallet=wallet)
+            OutcomeExitRequoteController(account=self._account_reads, gateway=self.machine.gateway, store=self.exit_lifecycle_store, wallet=wallet)
             if self.exit_lifecycle_store else None
         )
         self.entry_planner = entry_planner or OutcomeEntryQuotePlanner(OutcomeEntryQuotePlannerConfig())
         self.entry_lifecycle_store = entry_lifecycle_store or (OutcomeEntryLifecycleStore(ledger.journal, ledger.run_id) if ledger else None)
         self.entry_requote_controller = entry_requote_controller or (
-            OutcomeEntryRequoteController(account=account, gateway=self.machine.gateway, store=self.entry_lifecycle_store, wallet=wallet)
+            OutcomeEntryRequoteController(account=self._account_reads, gateway=self.machine.gateway, store=self.entry_lifecycle_store, wallet=wallet)
             if self.entry_lifecycle_store else None
         )
         self.holding_path_recorder = OutcomeHoldingPathRecorder(ledger.journal, ledger.run_id) if ledger else None
         self.reversal_classifier = OutcomeReversalClassifier()
         self.loss_reentry_gate = OutcomeLossReentryGate(ledger.journal, ledger.run_id) if ledger else None
+        self.tier_b_execution_gate = OutcomeTierBExecutionGate(ledger.journal.db_path) if ledger else None
         self.emergency_exit_policy = OutcomeEmergencyExitPolicy()
         self.emergency_exit_controller = (
             OutcomeEmergencyExitController(
-                account=account, gateway=self.machine.gateway, store=self.exit_lifecycle_store,
+                account=self._account_reads, gateway=self.machine.gateway, store=self.exit_lifecycle_store,
                 wallet=wallet, policy=self.emergency_exit_policy,
             ) if self.exit_lifecycle_store else None
         )
@@ -411,6 +415,17 @@ class OutcomeLiveExecutionRuntime:
         )
         if lifecycle is None or lifecycle.order_id != str(buy_order_ids[0]):
             return LiveExecutionResult("blocked", "entry requote refuses unrecorded buy ownership", str(buy_order_ids[0]))
+        age = None if lifecycle.updated_at_ts is None else max(0.0, time.time() - lifecycle.updated_at_ts)
+        # The five-minute ownership interval is an unconditional KEEP.  Do
+        # not spend a fresh REST L2 request merely to discover a quote that
+        # cannot be cancelled or replaced in this invocation.
+        interval_plan = self.entry_planner.plan(EntryQuoteInput(
+            current_side_index=side_index, existing_price=lifecycle.price,
+            desired_side_index=None, desired_bid=None, decision_reason=entry_reason,
+            order_age_sec=age,
+        ))
+        if interval_plan.action is EntryQuoteAction.KEEP and interval_plan.reason == "entry_requote_interval_not_elapsed":
+            return LiveExecutionResult("buy_resting", f"entry requote keep: {interval_plan.reason}", lifecycle.order_id)
         desired_side, desired_bid, decision_reason = entry_side_index, None, entry_reason
         if desired_side in (0, 1):
             try:
@@ -420,7 +435,6 @@ class OutcomeLiveExecutionRuntime:
                     desired_side, desired_bid, decision_reason = None, None, "selected_bid_in_no_trade_band"
             except (IndexError, KeyError, TypeError, ValueError):
                 desired_bid = None
-        age = None if lifecycle.updated_at_ts is None else max(0.0, time.time() - lifecycle.updated_at_ts)
         plan = self.entry_planner.plan(EntryQuoteInput(
             current_side_index=side_index, existing_price=lifecycle.price,
             desired_side_index=desired_side, desired_bid=desired_bid,
@@ -443,6 +457,61 @@ class OutcomeLiveExecutionRuntime:
                          "execution_submitted": result.state == "cancelled"},
             )
         return LiveExecutionResult(result.state, result.detail, result.old_order_id)
+
+    def _cancel_filled_entry_and_place_protection(self, *, market: OutcomeMarketSpec,
+                                                   finding: object) -> LiveExecutionResult | None:
+        """Close an owned buy remainder and create its first sell in this call.
+
+        This is intentionally outside the WebSocket new-entry gate.  The
+        position is already real account inventory, and the state machine uses
+        a fresh REST L2 book for the protective ALO sell after cancellation is
+        confirmed.  Waiting for a later global strategy tick left a measured
+        multi-minute unprotected window when synchronous account/settlement
+        work delayed that loop.
+        """
+        if not self.entry_lifecycle_store or not self.entry_requote_controller:
+            return None
+        inventory = Decimal(str(getattr(finding, "inventory", "0")))
+        buy_order_ids = tuple(getattr(finding, "buy_order_ids", ()))
+        sell_order_ids = tuple(getattr(finding, "sell_order_ids", ()))
+        coin = str(getattr(finding, "coin", ""))
+        if inventory <= 0 or len(buy_order_ids) != 1 or sell_order_ids or coin not in {market.yes_coin, market.no_coin}:
+            return None
+        side_index = 0 if coin == market.yes_coin else 1
+        lifecycle = self.entry_lifecycle_store.recover_or_adopt_audited_submit(
+            wallet=self.recovery.wallet, outcome_id=market.outcome_id, coin=coin,
+            open_orders=self.recovery.account.get_open_orders_sync(self.recovery.wallet),
+        )
+        if lifecycle is None or lifecycle.order_id != str(buy_order_ids[0]):
+            return LiveExecutionResult("blocked", "filled entry refuses unrecorded buy ownership", str(buy_order_ids[0]))
+        cancel = self.entry_requote_controller.execute_cancel_after_fill(
+            market=market, side_index=side_index, lifecycle=lifecycle,
+        )
+        if self.ledger:
+            self.ledger.journal.log_order_event(
+                self.ledger.run_id, "ORDER_CANCEL", venue_order_id=lifecycle.order_id, side="BUY",
+                status="CANCELLED" if cancel.state in {"cancelled_after_fill", "flat"} else "RECONCILE_REQUIRED",
+                instrument_id=coin, reason=cancel.detail,
+                payload={
+                    "venue": "hyperliquid_outcome", "outcome_id": market.outcome_id, "coin": coin,
+                    "filled_entry_cleanup": True, "execution_submitted": cancel.state in {"cancelled_after_fill", "flat"},
+                },
+            )
+        if cancel.state != "cancelled_after_fill":
+            return LiveExecutionResult(cancel.state, cancel.detail, cancel.old_order_id)
+        # Reconcile once more after confirmed cancellation.  A cancel/fill
+        # race may alter the inventory; only the refreshed account truth is
+        # permitted to size the sell.
+        refreshed = self.recovery.reconcile([market])
+        current = next((item for item in refreshed.findings if item.coin == coin), None)
+        if current is None or Decimal(str(current.inventory)) <= 0:
+            return LiveExecutionResult("flat", "filled entry cancel confirmed and inventory is now flat", cancel.old_order_id)
+        if tuple(current.buy_order_ids) or tuple(current.sell_order_ids):
+            return LiveExecutionResult("blocked", "filled entry cancel reconciliation found remaining conflicting order", cancel.old_order_id)
+        protective = self._advance_persisted_p3_exit(market=market, finding=current)
+        if protective is None:
+            return LiveExecutionResult("blocked", "filled entry has no persisted verified exit policy", cancel.old_order_id)
+        return protective
 
     def _maybe_requote_p3_exit(self, *, market: OutcomeMarketSpec, finding: object) -> LiveExecutionResult | None:
         """E4 integration, disabled unless all execution gates include reprice.
@@ -478,6 +547,52 @@ class OutcomeLiveExecutionRuntime:
             bid = Decimal(str(book["bids"][0]["price"])); ask = Decimal(str(book["asks"][0]["price"]))
         except (IndexError, KeyError, TypeError, ValueError):
             return LiveExecutionResult("blocked", "exit reprice book unavailable", lifecycle.order_id)
+
+        def _as_decimal(name: str) -> Decimal | None:
+            try:
+                value = self._holding_context.get(market.outcome_id, {}).get(name)
+                return Decimal(str(value)) if value is not None else None
+            except (ValueError, ArithmeticError):
+                return None
+
+        raw_context = self._holding_context.get(market.outcome_id, {})
+        try:
+            oi_age_ms = int(raw_context.get("oi_age_ms"))
+        except (TypeError, ValueError):
+            oi_age_ms = -1
+        context_fresh = 0 <= oi_age_ms <= 90_000
+        reversal = self.reversal_classifier.classify(OutcomeReversalInput(
+            side_index, vwap, bid, ask,
+            _as_decimal("spot_strike_bps"), _as_decimal("mark_return_bps"), _as_decimal("oi_return_bps"),
+            context_fresh, self._opposite_observation_counts.get((market.outcome_id, coin), 0),
+        ))
+        # S2/S3's same classifier is now also the authoritative loss-band
+        # thesis gate.  It requires a fresh book, a -5% price breach (in the
+        # planner), and three current, independent opposing observations.
+        # If current spot/mark confirmation returns to the held side, its
+        # observation count is reset by _capture_holding_path and this stays
+        # false, which restores the normal elapsed-time +2% passive target.
+        loss_band_authorized = reversal.state is OutcomeReversalState.REVERSAL_CONFIRMED
+        # Persist a deliberately small decision-time signal snapshot with a
+        # replacement.  The full market context is already represented by
+        # compact entry/holding research rows; copying arbitrary raw payloads
+        # here would recreate the DB-growth problem this runtime avoids.
+        current_signal = {
+            key: raw_context.get(key)
+            for key in (
+                "signal", "score", "spot_strike_bps", "mark_return_bps",
+                "oi_return_bps", "oi_age_ms", "entry_tier", "reason",
+            )
+            if key in raw_context
+        }
+        replacement_context = {
+            "trigger_bbo": {"best_bid": str(bid), "best_ask": str(ask), "timestamp_ms": int(time.time() * 1000)},
+            "current_signal": {
+                **current_signal, "reversal_state": str(reversal.state), "reversal_reason": reversal.reason,
+                "opposite_observation_count": self._opposite_observation_counts.get((market.outcome_id, coin), 0),
+                "loss_band_authorized": loss_band_authorized,
+            },
+        }
         if (
             self.exit_requote_canary_enabled()
             and lifecycle.order_id in self._e5_canary_eligible_order_ids
@@ -493,7 +608,10 @@ class OutcomeLiveExecutionRuntime:
                     lifecycle.target_price + self.exit_planner.config.tick_size,
                     lifecycle.target_price, inventory, "e5_canary",
                 )
-                result = self.exit_requote_controller.execute(market=market, side_index=side_index, lifecycle=lifecycle, plan=canary_plan)
+                result = self.exit_requote_controller.execute(
+                    market=market, side_index=side_index, lifecycle=lifecycle, plan=canary_plan,
+                    replacement_context=replacement_context,
+                )
                 self._e5_canary_eligible_order_ids.discard(lifecycle.order_id)
                 return LiveExecutionResult(result.state, result.detail, result.new_order_id or result.old_order_id)
         strategy_tier = self._strategy_exit_tier(market=market, coin=coin)
@@ -504,6 +622,7 @@ class OutcomeLiveExecutionRuntime:
             existing_order_id=lifecycle.order_id, existing_price=lifecycle.target_price,
             best_bid=bid, best_ask=ask, book_age_sec=0.0, now_ts=time.time(),
             last_requote_ts=lifecycle.updated_at_ts, replacement_count=lifecycle.replacement_count,
+            loss_band_authorized=loss_band_authorized,
         ))
         if plan.action.value == "KEEP":
             if plan.exit_mode == "loss_band" and lifecycle.state == "LOSS_BAND_RESTING":
@@ -513,7 +632,10 @@ class OutcomeLiveExecutionRuntime:
             return LiveExecutionResult("sell_resting", f"exit reprice keep: {plan.reason}", lifecycle.order_id)
         if plan.action.value == "BLOCK":
             return LiveExecutionResult("blocked", f"exit reprice blocked: {plan.reason}", lifecycle.order_id)
-        result = self.exit_requote_controller.execute(market=market, side_index=side_index, lifecycle=lifecycle, plan=plan)
+        result = self.exit_requote_controller.execute(
+            market=market, side_index=side_index, lifecycle=lifecycle, plan=plan,
+            replacement_context=replacement_context,
+        )
         return LiveExecutionResult(result.state, result.detail, result.new_order_id or result.old_order_id)
 
     def _advance_persisted_p3_exit(self, *, market: OutcomeMarketSpec, finding: object) -> LiveExecutionResult | None:
@@ -543,6 +665,7 @@ class OutcomeLiveExecutionRuntime:
         return self._record(market, side_index, result)
 
     def tick(self, *, market: OutcomeMarketSpec, side_index: int, entry_permitted: bool) -> LiveExecutionResult:
+        self._account_reads.begin_tick()
         if not self.enabled():
             return LiveExecutionResult("disabled", "automated execution requires OUTCOME_AUTOMATED_EXECUTION_ENABLED=1 and OUTCOME_SDK_EXECUTION_ENABLED=1")
         if entry_permitted:
@@ -789,6 +912,7 @@ class OutcomeLiveExecutionRuntime:
 
     def tick_market(self, *, market: OutcomeMarketSpec, entry_side_index: int | None) -> LiveExecutionResult:
         """Advance existing exposure first; only a flat market accepts a signal."""
+        self._account_reads.begin_tick()
         if not self.enabled():
             return LiveExecutionResult("disabled", "automated execution requires OUTCOME_AUTOMATED_EXECUTION_ENABLED=1 and OUTCOME_SDK_EXECUTION_ENABLED=1")
         report = self.recovery.reconcile([market])
@@ -830,6 +954,7 @@ class OutcomeLiveExecutionRuntime:
         readiness because it is collecting the missing P3 evidence, not using
         it for strategy trading.
         """
+        self._account_reads.begin_tick()
         if not self.calibration_enabled():
             return LiveExecutionResult("disabled", "P3 calibration requires automated, SDK, and OUTCOME_P3_CALIBRATION_ENABLED=1 gates")
         if self.ledger is None:
@@ -912,16 +1037,32 @@ class OutcomeLiveExecutionRuntime:
                            retiring_markets: tuple[OutcomeMarketSpec, ...] = (),
                            market_context: dict[str, object] | None = None) -> LiveExecutionResult:
         """Run S0 and durably record its final admission or rejection reason."""
+        self._account_reads.begin_tick()
+        started_at = time.monotonic()
         admission: dict[str, object] = {}
         result = self._tick_live_strategy(
             market=market, entry_side_index=entry_side_index, entry_reason=entry_reason,
             entry_evidence=entry_evidence, retiring_markets=retiring_markets,
             market_context=market_context, admission=admission,
         )
+        admission["timing_runtime_before_journal_ms"] = round((time.monotonic() - started_at) * 1000, 3)
+        journal_started_at = time.monotonic()
         self._record_entry_admission_decision(
             market=market, entry_side_index=entry_side_index, entry_reason=entry_reason,
             entry_evidence=entry_evidence, admission=admission, result=result,
         )
+        journal_write_ms = round((time.monotonic() - journal_started_at) * 1000, 3)
+        total_ms = round((time.monotonic() - started_at) * 1000, 3)
+        if self.ledger is not None and (total_ms >= 1000 or result.state in {"buy_placed", "sell_placed", "sell_resting"}):
+            self.ledger.journal.log_strategy_event(self.ledger.run_id, "OUTCOME_RUNTIME_TIMING", {
+                "venue": "hyperliquid_outcome", "outcome_id": market.outcome_id,
+                "runtime_state": result.state, "total_ms": total_ms,
+                "account_recovery_ms": admission.get("timing_account_recovery_ms"),
+                "book_request_ms": admission.get("timing_entry_book_request_ms"),
+                "journal_write_ms": journal_write_ms,
+                "journal_writer_last_ms": dict(getattr(self.ledger.journal, "last_write_timing_ms", {})),
+                "last_sdk_request": dict(getattr(self.machine.gateway, "last_sidecar_timing", {}) or {}),
+            })
         return result
 
     def _tick_live_strategy(self, *, market: OutcomeMarketSpec, entry_side_index: int | None,
@@ -943,7 +1084,9 @@ class OutcomeLiveExecutionRuntime:
         self._holding_context[market.outcome_id] = dict(market_context or entry_evidence)
         config = OutcomeLiveStrategyConfig.from_env()
         tracked_markets = (market, *retiring_markets)
+        recovery_started_at = time.monotonic()
         report = self.recovery.reconcile(tracked_markets)
+        admission["timing_account_recovery_ms"] = round((time.monotonic() - recovery_started_at) * 1000, 3)
         admission["account_recovery"] = {
             "safe_for_new_entry": bool(getattr(report, "safe_for_new_entry", False)),
             "reason": str(getattr(report, "reason", "unknown")),
@@ -979,6 +1122,15 @@ class OutcomeLiveExecutionRuntime:
             entry_evidence=entry_evidence, active=active,
         )
         if len(active) == 1:
+            # A filled buy plus an open owned remainder is the only state
+            # where cancellation is more urgent than every observational
+            # read.  Do it first so a slow holding-path REST capture cannot
+            # extend the interval before the first protective sell.
+            filled_entry_cleanup = self._cancel_filled_entry_and_place_protection(
+                market=market, finding=active[0],
+            )
+            if filled_entry_cleanup is not None:
+                return filled_entry_cleanup
             self._capture_holding_path(market=market, finding=active[0])
             # S3 deliberately uses a freshly fetched REST L2 depth walk, not
             # the WebSocket cache.  It may therefore assess an already-held
@@ -1021,9 +1173,12 @@ class OutcomeLiveExecutionRuntime:
                 return LiveExecutionResult("flat", f"live strategy no entry: {reentry.reason}")
         fees = self.recovery.account.get_user_fees_sync(self.recovery.wallet)
         maker_close_fee = Decimal(str(fees["userSpotAddRate"]))
+        book_started_at = time.monotonic()
         book = self.machine.gateway.fetch_order_book(market=market, side_index=entry_side_index)
+        admission["timing_entry_book_request_ms"] = round((time.monotonic() - book_started_at) * 1000, 3)
         try:
             price = Decimal(str(book["bids"][0]["price"]))
+            entry_ask = Decimal(str(book["asks"][0]["price"]))
         except (IndexError, KeyError, TypeError, ValueError):
             admission["book_gate"] = "selected_entry_book_unavailable"
             return LiveExecutionResult("blocked", "live strategy entry book unavailable")
@@ -1077,6 +1232,28 @@ class OutcomeLiveExecutionRuntime:
         tier_b = entry_tier == "tier_b_spot_mark"
         entry_policy_kind = "s0_spot_mark_tier_b" if tier_b else "s0_oi_spot_mark_confirmation"
         sampling_policy = "spot_mark_tier_b" if tier_b else "oi_spot_mark_confirmation"
+        entry_max_submit_price: Decimal | None = None
+        tier_b_execution_audit: dict[str, object] | None = None
+        if tier_b:
+            gate = self.tier_b_execution_gate
+            tier_b_decision = gate.evaluate(
+                bid=price, ask=entry_ask, bid_levels=book.get("bids", ()), requested_shares=Decimal(shares),
+            ) if gate is not None else None
+            if tier_b_decision is None:
+                admission["tier_b_execution_gate"] = {"allowed": False, "reason": "tier_b_execution_gate_unavailable"}
+                return LiveExecutionResult("blocked", "Tier-B entry execution-quality gate unavailable")
+            tier_b_execution_audit = {
+                "tier_b_spread_bps": str(tier_b_decision.spread_bps) if tier_b_decision.spread_bps is not None else None,
+                "tier_b_top_depth_shares": str(tier_b_decision.top_depth_shares) if tier_b_decision.top_depth_shares is not None else None,
+                "tier_b_max_submit_drift_bps": str(tier_b_decision.policy.max_submit_drift_bps),
+                "tier_b_policy_sample_count": tier_b_decision.policy.sample_count,
+                "tier_b_policy_source": tier_b_decision.policy.source,
+                "tier_b_decision_bid": str(tier_b_decision.decision_bid) if tier_b_decision.decision_bid is not None else None,
+            }
+            admission["tier_b_execution_gate"] = {"allowed": tier_b_decision.allowed, "reason": tier_b_decision.reason, **tier_b_execution_audit}
+            if not tier_b_decision.allowed or tier_b_decision.max_submit_bid is None:
+                return LiveExecutionResult("flat", f"live strategy no entry: {tier_b_decision.reason}")
+            entry_max_submit_price = tier_b_decision.max_submit_bid
         entry_audit = {
             "entry_policy_schema_version": 1,
             "entry_policy_kind": entry_policy_kind,
@@ -1100,10 +1277,11 @@ class OutcomeLiveExecutionRuntime:
             # as a decision-time preview rather than an asserted exit price.
             "target_price_preview_from_decision_bid": str(target_price_preview),
             "target_decision_at_ms": int(time.time() * 1000),
+            **(tier_b_execution_audit or {}),
         }
         result = self.machine.tick(
             market=market, side_index=entry_side_index, entry_permitted=True,
-            entry_audit=entry_audit,
+            entry_audit=entry_audit, entry_max_submit_price=entry_max_submit_price,
         )
         if result.state == "buy_placed":
             self.ledger.journal.log_strategy_event(self.ledger.run_id, "OUTCOME_LIVE_STRATEGY_ENTRY_PLACED", {
@@ -1144,5 +1322,6 @@ class OutcomeLiveExecutionRuntime:
             finding = next(item for item in report.findings if item.market_id == market.outcome_id and item.coin == coin)
             for order_id in finding.buy_order_ids:
                 self.machine.gateway.cancel_owned_order(market=market, side_index=side_index, order_id=order_id)
+                self._account_reads.invalidate()
                 cancelled.append(order_id)
         return LiveExecutionResult("cancelled" if cancelled else "flat", "cancelled owned entry buys" if cancelled else "no owned entry buy", cancelled[0] if cancelled else None)

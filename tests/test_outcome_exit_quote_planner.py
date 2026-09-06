@@ -19,7 +19,10 @@ def test_planner_keeps_matching_fee_adjusted_target():
 
 
 def test_planner_proposes_passive_loss_band_replacement():
-    plan = OutcomeExitQuotePlanner().plan(_input(best_bid=Decimal("0.70"), best_ask=Decimal("0.71"), existing_price=Decimal("0.85")))
+    plan = OutcomeExitQuotePlanner().plan(_input(
+        best_bid=Decimal("0.70"), best_ask=Decimal("0.71"), existing_price=Decimal("0.85"),
+        loss_band_authorized=True,
+    ))
     assert plan.action is ExitQuoteAction.CANCEL_REPLACE
     assert plan.exit_mode == "loss_band"
     assert plan.target_price > Decimal("0.70")
@@ -29,11 +32,22 @@ def test_planner_proposes_passive_loss_band_replacement():
 def test_zero_loss_policy_only_reprices_to_fee_inclusive_break_even():
     plan = OutcomeExitQuotePlanner().plan(_input(
         loss_reprice_pct=Decimal("0"), best_bid=Decimal("0.70"), best_ask=Decimal("0.71"), existing_price=Decimal("0.85"),
+        loss_band_authorized=True,
     ))
     break_even = Decimal("0.80") / Decimal("0.9996")
     assert plan.action is ExitQuoteAction.CANCEL_REPLACE
     assert plan.exit_mode == "loss_band"
     assert plan.target_price >= break_even
+
+
+def test_price_breach_without_current_invalidated_thesis_restores_passive_profit_target():
+    plan = OutcomeExitQuotePlanner().plan(_input(
+        minimum_return_pct=Decimal("0.02"), best_bid=Decimal("0.70"), best_ask=Decimal("0.71"),
+        existing_price=Decimal("0.76031"), loss_band_authorized=False,
+    ))
+    assert plan.exit_mode == "take_profit"
+    assert plan.reason == "target_reprice"
+    assert plan.target_price > Decimal("0.816")
 
 
 def test_planner_blocks_missing_policy_and_stale_book():

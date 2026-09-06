@@ -78,7 +78,37 @@ class OutcomeWebSocketRecorder:
         self._record("OUTCOME_WS_L2_BOOK", payload)
 
     def _on_mids(self, payload: Mapping[str, Any]) -> None:
-        self._record("OUTCOME_WS_ALL_MIDS", payload)
+        data = payload.get("data")
+        mids = data.get("mids") if isinstance(data, Mapping) else None
+        if self.pricing_state is not None and isinstance(mids, Mapping):
+            # BTC mark is public observation only.  It may drive signal/UI
+            # when fresh, but no account/order truth is ever derived from it.
+            try:
+                btc = mids.get("BTC")
+                if btc is not None:
+                    self.pricing_state.update_btc_mark_price(str(btc))
+            except Exception:
+                pass
+        # allMids contains every Hyperliquid asset and was previously copied
+        # verbatim for each WS update.  This bot only needs BTC plus the two
+        # active Outcome coins; persisting the global map made a compact
+        # execution journal grow into multi-GB storage without adding a
+        # decision or reconciliation fact.
+        selected: dict[str, str] = {}
+        if isinstance(mids, Mapping):
+            for coin in ("BTC", *self._coins):
+                value = mids.get(coin)
+                if value is not None:
+                    selected[coin] = str(value)
+        compact_payload = {
+            "channel": payload.get("channel", "allMids"),
+            "recording_scope": "btc_and_active_outcome_only_v2",
+            "data": {
+                "time": data.get("time") if isinstance(data, Mapping) else None,
+                "mids": selected,
+            },
+        }
+        self._record("OUTCOME_WS_ALL_MIDS", compact_payload)
 
     def _on_trades(self, payload: Mapping[str, Any]) -> None:
         self._record("OUTCOME_WS_TRADES", payload)

@@ -105,7 +105,9 @@ class OutcomeEntryLifecycleStore:
             audit = payload.get("audit") if isinstance(payload, dict) else None
             if not isinstance(audit, dict) or audit.get("entry_policy_schema_version") != 1:
                 return None
-            if audit.get("entry_policy_kind") != "s0_oi_spot_mark_confirmation":
+            if audit.get("entry_policy_kind") not in {
+                "s0_oi_spot_mark_confirmation", "s0_spot_mark_tier_b",
+            }:
                 return None
             if int(payload.get("outcome_id")) != outcome_id or str(payload.get("coin")) != coin:
                 return None

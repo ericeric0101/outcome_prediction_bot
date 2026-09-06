@@ -82,12 +82,17 @@ def replay_exit_quotes(*, db_path: str | Path, period: str = "1d", run_id: str |
                 minimum_return_pct=target_return_pct, loss_reprice_pct=loss_reprice_pct,
                 existing_order_id=f"replay-{coin}-{fill_ts}", existing_price=existing,
                 best_bid=top[0], best_ask=top[1], book_age_sec=0.0, now_ts=timestamp / 1000.0,
+                # Historical P2 rows do not contain three independent
+                # current reversal observations.  A replay must not pretend a
+                # price breach alone was authorized to become a loss band.
+                loss_band_authorized=False,
             ))
             journal.log_strategy_event(run_id, "OUTCOME_EXIT_REQUOTE_REPLAY", {
                 "venue": "hyperliquid_outcome", "read_only": True, "counterfactual": True,
                 "source_snapshot_event_id": event_id, "outcome_id": outcome_id, "period": period, "coin": coin,
                 "snapshot_timestamp_ms": timestamp, "entry_fill_timestamp_ms": fill_ts,
                 "entry_vwap": str(entry), "inventory": str(inventory), "best_bid": str(top[0]), "best_ask": str(top[1]),
+                "loss_band_authorized": False,
                 "plan": {key: str(value) if isinstance(value, Decimal) else value for key, value in asdict(plan).items()},
                 "execution_submitted": False,
             })
