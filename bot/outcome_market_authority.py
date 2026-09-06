@@ -9,7 +9,9 @@ from pathlib import Path
 from typing import Any
 
 
-DEFAULT_AUTHORITY_PATH = "/Users/cheng-kaihuang/hyperliquid_prediction_bot/logs/outcome_market_authority.json"
+# Resolve relative to the process working directory so a fresh checkout on CI
+# or another machine never inherits this developer's local filesystem path.
+DEFAULT_AUTHORITY_PATH = "logs/outcome_market_authority.json"
 
 
 def publish_outcome_market_authority(market: Any, *, path: str | None = None) -> None:
