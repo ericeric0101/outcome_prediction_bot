@@ -1,24 +1,18 @@
 """Read-only Hyperliquid Outcome account synchronization.
 
-This is intentionally an adapter, not an execution component.  It translates
-the three account read endpoints into the established position/exit inputs and
-does not sign or submit an exchange action.
+This is intentionally a read-only Outcome adapter.  It normalizes the three
+official account endpoints and does not sign or submit an exchange action.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Any, Mapping, Optional, Sequence
-
-from bot.lifecycle.outcome_lifecycle import OutcomeMarketSpec
+from typing import Any, Mapping, Optional
 from bot.outcome_event_bridge import (
     OutcomeFillEvent,
     parse_outcome_balance_coin,
     parse_outcome_coin,
 )
-from bot.outcome_snapshot_bridge import build_outcome_position_state
-from bot.models import PositionState
-from bot.position_manager import PositionManager, PositionRuntimeState
 
 
 def _decimal(payload: Mapping[str, Any], key: str, default: Decimal = Decimal("0")) -> Decimal:
@@ -122,51 +116,6 @@ class OutcomeAccountSnapshot:
             (b for b in self.balances if b.outcome_id == outcome_id and b.side_index == side_index),
             None,
         )
-
-    def position_state_for(
-        self,
-        market: OutcomeMarketSpec,
-        side_index: int,
-        *,
-        hold_sec: float = 0.0,
-        entry_fee_remaining: Decimal = Decimal("0"),
-        stop_loss_confirm_hits: int = 0,
-        peak_bid: Optional[Decimal] = None,
-        peak_fair: Optional[Decimal] = None,
-    ) -> PositionState:
-        balance = self.balance_for(market.outcome_id, side_index)
-        return build_outcome_position_state(
-            market=market,
-            side_index=side_index,
-            total_qty=balance.total_qty if balance else Decimal("0"),
-            available_qty=balance.available_qty if balance else Decimal("0"),
-            avg_entry_price=balance.avg_entry_price if balance else Decimal("0"),
-            entry_fee_remaining=entry_fee_remaining,
-            hold_sec=hold_sec,
-            stop_loss_confirm_hits=stop_loss_confirm_hits,
-            peak_bid=peak_bid,
-            peak_fair=peak_fair,
-        )
-
-    def sync_position_manager(
-        self,
-        manager: PositionManager,
-        market: OutcomeMarketSpec,
-        side_index: int,
-        *,
-        opened_ts: float,
-        now_ts: Optional[float] = None,
-    ) -> PositionRuntimeState:
-        """Feed confirmed balance quantity into the unchanged PositionManager."""
-        position = self.position_state_for(market, side_index)
-        return manager.sync_position(
-            inst_key=position.instrument_id,
-            qty=position.qty,
-            opened_ts=opened_ts,
-            thesis_side=position.held_side,
-            now_ts=now_ts,
-        )
-
 
 class OutcomeAccountSynchronizer:
     """Fetch and translate HIP-4 account endpoints without exchange access."""

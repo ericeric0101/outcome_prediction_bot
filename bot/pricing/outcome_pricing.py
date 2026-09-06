@@ -18,9 +18,6 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from loguru import logger
 
-from execution.rebate_model import QuoteEconomics
-
-
 DEFAULT_MIN_NOTIONAL_USDC = Decimal("10.0")
 # Outcome documents state that HIP-4 trading fees are currently zero during
 # testing.  Post-testing fees follow Hyperliquid's changing protocol schedule,
@@ -29,6 +26,18 @@ DEFAULT_MIN_NOTIONAL_USDC = Decimal("10.0")
 DEFAULT_HL_MAKER_FEE_RATE = Decimal("0")
 DEFAULT_HL_TAKER_FEE_RATE = Decimal("0")
 DEFAULT_REFERRAL_DISCOUNT = Decimal("0")
+
+
+@dataclass(frozen=True)
+class OutcomeQuoteEconomics:
+    """Outcome-only quote economics with no external venue fee dependency."""
+
+    shares: Decimal
+    probability: Decimal
+    fee_equivalent_usdc: Decimal
+    expected_rebate_usdc: Decimal
+    expected_spread_capture_usdc: Decimal
+    expected_net_usdc: Decimal
 
 
 @dataclass(frozen=True)
@@ -167,7 +176,7 @@ def estimate_outcome_economics(
     maker_fee_rate: Decimal = DEFAULT_HL_MAKER_FEE_RATE,
     referral_discount: Decimal = DEFAULT_REFERRAL_DISCOUNT,
     adverse_selection_buffer: Decimal = Decimal("0"),
-) -> QuoteEconomics:
+) -> OutcomeQuoteEconomics:
     """
     Calculate Outcome quote economics.  Defaults model the current testing
     schedule (zero trading fee); callers must inject verified live fee inputs.
@@ -188,7 +197,7 @@ def estimate_outcome_economics(
     # Expected net
     expected_net = spread_capture - fee_equivalent - adverse_selection_buffer
 
-    return QuoteEconomics(
+    return OutcomeQuoteEconomics(
         shares=shares,
         probability=p,
         fee_equivalent_usdc=fee_equivalent,

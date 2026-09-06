@@ -45,7 +45,6 @@ from bot.outcome_research_worker import OutcomeResearchWorker
 from bot.outcome_rollover import OutcomeRolloverCoordinator
 from monitoring.trade_journal_db import TradeJournalDB
 from bot.enums import MarketPhase
-from bot.app_config import AppConfig
 from bot.runtime_env import load_runtime_env
 from bot.process_lock import ProcessLock
 from telegram_bot import start_telegram_bot_thread
@@ -59,14 +58,11 @@ def resolve_hyperliquid_auth() -> Optional[OutcomeAuth]:
     wallet_address = (
         os.getenv("HL_WALLET_ADDRESS")
         or os.getenv("HYPERLIQUID_WALLET_ADDRESS")
-        or os.getenv("POLYMARKET_WALLET_ADDRESS")
-        or os.getenv("POLYMARKET_FUNDER")
         or ""
     )
     private_key = (
         os.getenv("HL_PRIVATE_KEY")
         or os.getenv("HYPERLIQUID_PRIVATE_KEY")
-        or os.getenv("POLYMARKET_PK")
         or ""
     )
     agent_private_key = (
@@ -633,12 +629,6 @@ def main():
     load_runtime_env()
     parser = argparse.ArgumentParser(description="Integrated Hyperliquid BTC Prediction Trading Bot")
     parser.add_argument(
-        "--venue",
-        choices=["hyperliquid", "polymarket"],
-        default=os.getenv("VENUE", "hyperliquid").lower(),
-        help="Target prediction market venue (default: hyperliquid)"
-    )
-    parser.add_argument(
         "--live",
         action="store_true",
         help="Run in LIVE mode (real money at risk!). Default is simulation."
@@ -664,7 +654,6 @@ def main():
     simulation = not args.live
     test_mode = bool(args.test_mode or not args.live)
     enable_terminal_dashboard = args.terminal_dashboard
-    app_config = AppConfig.from_env(enable_terminal_dashboard=enable_terminal_dashboard)
 
     if enable_terminal_dashboard:
         logger.remove()

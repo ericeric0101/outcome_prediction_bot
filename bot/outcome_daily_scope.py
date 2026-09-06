@@ -1,9 +1,8 @@
 """Hard scope boundary for the Outcome BTC daily research runtime.
 
-This repository may retain 15m-era Polymarket modules as behaviour
-specifications, but the active Outcome research universe is deliberately one
-daily BTC contract.  Keeping this validation in one place prevents a stale
-environment variable from silently switching the collector to another period.
+The active research and trading universe is deliberately one daily BTC
+contract. Keeping this validation in one place prevents a stale environment
+variable from silently switching the runtime to another period.
 """
 from __future__ import annotations
 

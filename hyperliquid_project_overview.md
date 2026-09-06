@@ -1,17 +1,19 @@
-# Hyperliquid Outcome (HIP-4) BTC 15-Minute Prediction Market Trading Bot — Current Authority
+# Hyperliquid Outcome (HIP-4) BTC Daily Prediction Market Trading Bot — Current Authority
 
-> **權威架構版本 (Authority Version)**：2.1.2 (Hyperliquid Outcome HIP-4 Liquidity-Aware Scaling Baseline)
-> **建立與審計日期**：2026-08-23；最近修訂：2026-08-31
+> **權威架構版本 (Authority Version)**：2.2.0 (Outcome-only, capacity-aware scaling baseline)
+> **建立與審計日期**：2026-08-23；最近修訂：2026-09-06
 > **目標系統**：Hyperliquid HyperCore L1 原生預測市場 — Outcome (HIP-4 協議標準)  
 > **單一權威聲明**：本文件取代原 `project_overview.md`，為系統唯一的設計、架構、量化模型與執行權威規範。
 
-> **遷移保護原則（2026-08-23 補充）**：原 Polymarket 程式中的訊號、波動度、公允價格、進出場、風控、日誌、報表與測試，均是本專案的量化知識資產與回歸基準，必須保留並逐項移植。只有已被 Outcome 等價機制取代、且有對照測試證明不再需要的 *venue adapter 邊界*，才可停止使用；不得以檔名含 Polymarket、Nautilus、Polygon 或 Redeem 作為刪除理由。
+> **Outcome-only decommission（2026-09-06）**：操作者已決定永久停止維護舊 Polymarket/Nautilus strategy、CLOB adapter、shadow runner、profiles 與相關 tests/scripts。它們已從工作樹刪除，僅可從 Git 歷史檢索，不能作為 runtime fallback、live signal、風控或設定來源。現行 codebase 的唯一交易路徑是 `bot.launcher → OutcomeLiveExecutionRuntime → official SDK sidecar`。
 
 > **實盤狀態（2026-08-31）**：已在主網驗證 official TypeScript SDK 的 ALO 下單、wallet-owned cancel、official open-order／inventory／`userFills` 回讀、maker buy→ALO sell lifecycle、E2 cancel-confirm-rebook 與 daily-market rollover；`launcher --live` 在 typed `yes` 後可啟動受限 S0 live runtime。這**不**等於策略或經濟驗收完成：P0 官方 settlement/payout、P2 conversion/settlement 成本、P3 bucket-level markout 與 X4 跨 daily-instance OOS alpha 仍未通過，notional 與 ALO-only 風控限制維持有效。
 
 ---
 
-## 零、遷移執行追蹤（Migration Execution Tracker）
+## 零、歷史遷移記錄（僅供 Git 歷史研究；不是現行架構）
+
+**閱讀限制。** 本節 2026-09-06 之前的 Polymarket→Outcome 對照、檔案路徑、shadow 命令、測試數量與未移植 blocker 都是歷史資料，部分已不再存在於工作樹；不得據此修改現行程式或啟動任何命令。現行架構、風控與 F5 擴量規格以後續 Outcome-only 段落為準。
 
 | 能力 | 可重用的既有知識資產 | Outcome 替換邊界 | 狀態 |
 | :--- | :--- | :--- | :--- |
@@ -543,15 +545,19 @@ X3 是離線建構，沒有網路或交易呼叫；collector 持續寫入後可�
 | **F5-1 — capacity-aware partial sizing** | desired shares 由 $20 notional 推出後，直接對**本輪既已取得的 fresh L2**做 cumulative depth / spread / recent deduplicated trade-flow 計算，產生 `safe_max_shares`；下單量為 `min(desired_shares, safe_max_shares)` 的整數 shares。例：欲掛 50 shares、當下安全容量 30，則只掛 30；該倉成交並完成 exit 後才重新以新 book 計算下一筆，絕不補剩餘 20。opening minimum-notional/min-shares 仍不滿足時 flat。 | 不為湊滿原目標拆成多筆、stagger、隱藏或 spoof order；不拿 stale depth 假裝可交易容量。 |
 | **F5-2 — latency / atomicity** | sizing 是本機對已快取 JSON L2 的有限層數加總，運算成本遠低於既有 account/SDK round trip，**不新增 REST call**。同一 fresh-book invocation 完成 size + target + submit；submit 前仍以 current bid/drift gate 驗證。book 已變、drift 超限或 capacity 不足即放棄該輪，下一 fresh tick 重算，不能用舊 quantity 追價。每個 submit audit 保存 requested/safe/submitted shares、depth horizon、spread、flow window、book age、decision→submit drift 與拒絕原因。 | 不因怕錯過而關閉 drift、freshness 或 ALO gate。 |
 | **F5-3 — all-tier execution quality** | 將現有僅 Tier-B 的 depth/spread/drift gate 擴展到 Tier-A 與 Tier-B；book capacity 由多次 L2 observation 與去重 WS trades 計算，避免單一可撤銷大單主導 sizing。按 size bucket、spread/depth bucket、order age、partial fill、5/10/30s markout 與 realized result 做 audit。 | 不把目前 9 筆 v2 fill context 或平均深度當成可證明 $250/$550 可安全交易的樣本。 |
-| **F5-4 — portfolio circuit breakers（$20 phase hard limits）** | 保持 concurrent inventory/exposure **$20**、one order。新增 daily gross entry turnover ceiling **$200**、daily realized-net loss stop **-$8**；連續兩個 confirmed loss exit 暫停新 entry **30 分鐘**，同一 daily market 出現第三個 confirmed loss exit 才停至 rollover。這些 clock / PnL / loss events 必須以 immutable fills、canonical lots 與 durable journal 重啟恢復；pending settlement、unknown/manual order 或 journal unavailable 一律不新增 entry。 | 不用 UI PnL、未結算 mark、或單一 websocket tick 觸發 daily stop；不把一次 loss 又封鎖整日。 |
+| **F5-4 — portfolio circuit breakers（規模比例化）** | 保持 one order。daily gross entry turnover ceiling 固定為目前 `OUTCOME_MAX_ENTRY_NOTIONAL_USDC` 的 **10×**，daily realized-net loss stop 為該 cap 的 **-40%**；因此 $20 canary 是 $200／-$8，未來經獨立授權的 $50 是 $500／-$20，不需要另記一組硬編碼 dollar limit。連續兩個 confirmed loss exit 暫停新 entry **30 分鐘**，同一 daily market 出現第三個 confirmed loss exit 才停至 rollover。這些 clock / PnL / loss events 必須以 immutable fills、canonical lots 與 durable journal 重啟恢復；pending settlement、unknown/manual order 或 journal unavailable 一律不新增 entry。 | 不用 UI PnL、未結算 mark、或單一 websocket tick 觸發 daily stop；不把一次 loss 又封鎖整日。 |
 | **F5-5 — scaled exit capacity** | 在 $20 真實持倉驗證中測量 first protective sell delay、partial fills、loss-band rest time、S3 depth/cap rejection 與 emergency lifecycle。任何 future $50+ size 必須將 S3 的 full-position IOC depth/slippage feasibility 與 passive exit fill rate 分 size bucket 檢驗。 | 不因 entry 可掛出就假設 $50/$100/$500 position 都能在 S3 cap 內退出。 |
 | **F5-6 — graduation** | 僅在 $20 canary 的 execution audit 無 ownership、unprotected inventory、duplicate fill、capacity sizing 或 circuit-breaker breach 後，再提出下一個 size tier（$30–$50）的獨立計劃。$275/$550 不是已授權 tier。 | 不把未來 $50–$100 daily PnL 目標轉換成一次性 jump 到 $275/$550 entry。 |
 
 **F5 implementation（2026-09-06；等待操作者明確開始 $20 測試）。** `OutcomeLiveExecutionRuntime` 現在在既有的 `OUTCOME_MAX_ENTRY_NOTIONAL_USDC` 與 `OUTCOME_MAX_OUTCOME_EXPOSURE_USDC` **兩者皆至少為 $20** 時，才進入 F5 canary lane；目前 $11 設定沿用原有行為，沒有因部署本身改變任何 live order。canary lane 在 already-fetched entry REST L2 中計算 desired whole shares（永不因整數化超過 notional cap）、前三檔 1.25× 保守 cumulative capacity、與最新 5 分鐘去重 public WS trade flow 的 25% ceiling，實際 submitted shares 取所有 ceiling 的較小值；若低於官方 $10 opening minimum，該輪 flat，不補單、不拆單。book 缺失、submit-time drift 超限一律不提交；trade-flow 缺失則明確記為未知，絕不虛構為零流量或額外容量，並只保留 fresh L2 capacity ceiling。Tier-A 與 Tier-B 都受此 lane 的 spread/depth/drift/capacity gate 約束；每個 accepted submit audit 保存 requested/safe/submitted shares、top-3 depth、5m trade shares、spread、policy source/sample、decision/submit bid 與 drift。
 
-`OutcomePortfolioGuard` 同樣只在此 $20 lane 生效，從 immutable official BUY fills 與 canonical FIFO lots 以台北日期讀回：daily gross entry ≤$200、realized net 尚未低於 -$8、兩個連續 confirmed loss 的 30 分鐘 pause、及同一 outcome 已有三個 confirmed losses 時直到 rollover 的 stop。journal 不可讀即 fail-closed；這不使用 UI PnL 或未結算 mark。S3 的既有 full-inventory depth/cap revalidation 沒有被放寬，$20 測試只會把每次實際 S3 depth/cap rejection 或 submit 保存為 audit，並非宣稱大額 exit 已被市場證實。
+`OutcomePortfolioGuard` 同樣只在此 $20 lane 生效，從 immutable official BUY fills 與 canonical FIFO lots 以台北日期讀回。它的 daily gross limit 是 configured entry cap 的 10×，daily realized-loss limit 是 configured entry cap 的 -40%（$20 時即 $200／-$8），因此後續調整經授權的 entry cap 時會同步調整，並在 admission audit 寫入實際兩個 limit；兩個連續 confirmed loss 的 30 分鐘 pause、及同一 outcome 已有三個 confirmed losses 時直到 rollover 的 stop 保持不變。journal 不可讀即 fail-closed；這不使用 UI PnL 或未結算 mark。S3 的既有 full-inventory depth/cap revalidation 沒有被放寬，$20 測試只會把每次實際 S3 depth/cap rejection 或 submit 保存為 audit，並非宣稱大額 exit 已被市場證實。
 
-**F5 verification。** 新增 partial capacity（$20 at 60c: 33 desired / 38 visible → 30 submitted）、低於 official opening minimum 的安全容量拒絕、同一 WS trade id 去重且 flow 只能收緊 book capacity、$11 時 portfolio guard dormant、$20 時 $200 gross cap 與單 market 三個 confirmed loss stop 的 unit regression。F5 focused regression **52 passed**；完整 Python suite **516 passed**、`py_compile` 與 `git diff --check` 均通過。明天前不得將兩個既有 notional limits 改為 $20、不得用此程式提交 $20 order，也不需要新增任何 `.env` flag。
+**F5 verification。** 新增 partial capacity（$20 at 60c: 33 desired / 38 visible → 30 submitted）、低於 official opening minimum 的安全容量拒絕、同一 WS trade id 去重且 flow 只能收緊 book capacity、$11 時 portfolio guard dormant、$20 時 $200／-$8、$50 時 $500／-$20 的比例化 guard regression，以及單 market 三個 confirmed loss stop。F5 focused regression **55 passed**；Outcome-only Python suite **240 passed**、`compileall`、launcher `--help` 與 `git diff --check` 均通過。明天前不得將兩個既有 notional limits 改為 $20、不得用此程式提交 $20 order，也不需要新增任何 `.env` flag。
+
+**G8 — legacy venue decommission（2026-09-06）。** 舊 Polymarket/Nautilus root、`run_bot.py`、CLOB shim、legacy execution/exit/forecast/shadow modules、相依 scripts/tests、profiles 和 migration-only documents 已刪除；`OutcomePricingState` 改為使用本地 `OutcomeQuoteEconomics`，`OutcomeAccountSynchronizer` 保持 official read-only account normalization，不再映射到舊 PositionManager／ExitPolicy。launcher 已移除 Polymarket credential fallback 和 `--venue polymarket`。`runtime_env` 不再讀 profile 或 alias，僅從 `.env` 載入 Outcome allowlist；因此現有私密 `.env` 裡遺留的 `POLYMARKET_*`／`VENUE` 等 key 不會進入 process environment。新 `.env.example` 是唯一受支援的本機參數清單。
+
+**G8 verification。** 移除後以 repository-wide import scan 確認沒有 production/test import 指向已刪除 legacy module，`rg` 僅保留 README 的歷史移除敘述；Outcome-only suite **240 passed**，本機 `.env` allowlist smoke 確認 entry/exposure 仍為 **$11/$11** 且 `legacy_loaded=False`。本次不改 `.env` 的 live notional/exposure，也沒有呼叫任何 live order path。
 
 **F5 sizing 與 re-entry 的關係。** 同一 daily market的首次 loss 後，S2-3 仍只給一張 cooldown/reclaim-qualified re-entry token；F5 的 dynamic size 只決定該合格 entry 的安全 shares，不能繞過 S2-3、增加 re-entry 次數或以小單規避 portfolio circuit breaker。所有上限是程式內固定 product policy，目的是降低 `.env` 人工輸入與因操作錯誤改變 live risk 的機會。
 
@@ -794,7 +800,9 @@ flowchart TD
 
 ---
 
-## 伍、 模組目錄架構與檔案權責 (Codebase Directory Map)
+## 伍、歷史模組目錄（2026-09-06 前；不是現行工作樹）
+
+> 下列樹狀圖保留為 migration history，不得作為檔案、命令或設定依據。現行目錄以 `bot/launcher.py`、`bot/outcome_*.py`、`bot/adapters/`、`bot/lifecycle/`、`bot/pricing/outcome_pricing.py`、`monitoring/trade_journal_db.py`、`scripts/binance_oi_collector.py`、`scripts/outcome_*.py` 及 `.env.example` 為準。
 
 ```text
 /Users/cheng-kaihuang/Hyperliquid_prediction_bot/
@@ -842,7 +850,9 @@ flowchart TD
 
 ---
 
-## 陸、 環境變數與維運配置指引 (Environment & Operator Configuration)
+## 陸、歷史環境與維運配置（2026-09-06 前；不是現行設定）
+
+> 現行 supported local configuration 僅以 `.env.example` 為準。`VENUE`、`POLYMARKET_*`、profiles、legacy entry/exit knobs 均不會由 `runtime_env` 載入。
 
 ### 關鍵環境變數清單
 
@@ -864,7 +874,9 @@ flowchart TD
 
 ---
 
-## 柒、 快速啟動與日常維運命令 (Operational Runbook)
+## 柒、歷史 Runbook（2026-09-06 前；不是現行命令）
+
+> 現行命令只有 `./.venv/bin/python -m bot.launcher --preflight-only` 與（經 typed confirmation 的）`./.venv/bin/python -u -m bot.launcher --live`；不得使用本節舊 shadow、profile 或 `--venue` 命令。
 
 ### 1. 執行安全性預檢 (Preflight Check)
 ```bash

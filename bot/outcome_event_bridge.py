@@ -1,6 +1,6 @@
 """Translate Hyperliquid Outcome payloads into the existing strategy journal.
 
-This module is deliberately independent of Nautilus and Polymarket. It is the
+This module is deliberately independent of legacy venue adapters. It is the
 first migration seam: strategy/risk code continues to consume the established
 order and settlement event schema while venue-specific JSON remains here.
 """

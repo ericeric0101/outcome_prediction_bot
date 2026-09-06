@@ -323,7 +323,7 @@ def start_telegram_bot_thread(state: DashboardState) -> Optional[threading.Threa
     if _telegram_polling_lock is None:
         lock_path = os.getenv(
             "TELEGRAM_POLLING_LOCK_PATH",
-            "/tmp/polymarket-btc-15m-telegram-polling.lock",
+            "/tmp/hyperliquid-outcome-telegram-polling.lock",
         )
         lock = ProcessLock(lock_path)
         if not lock.acquire():

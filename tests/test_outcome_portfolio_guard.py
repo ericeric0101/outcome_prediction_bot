@@ -23,6 +23,19 @@ def test_20_canary_guard_blocks_daily_gross_cap(tmp_path):
     )
     assert decision.enabled and not decision.allowed
     assert decision.reason == "portfolio_daily_gross_entry_cap"
+    assert decision.daily_gross_entry_limit_usdc == Decimal("200")
+    assert decision.daily_realized_loss_limit_usdc == Decimal("-8")
+
+
+def test_guard_limits_scale_with_the_existing_entry_notional_cap(tmp_path):
+    journal = TradeJournalDB(tmp_path / "journal.db")
+    decision = OutcomePortfolioGuard(journal.db_path).evaluate(
+        outcome_id=1, prospective_notional=Decimal("50"),
+        phase_entry_cap=Decimal("50"), phase_exposure_cap=Decimal("50"),
+    )
+    assert decision.allowed and decision.enabled
+    assert decision.daily_gross_entry_limit_usdc == Decimal("500")
+    assert decision.daily_realized_loss_limit_usdc == Decimal("-20")
 
 
 def test_20_canary_guard_stops_market_only_after_third_confirmed_loss(tmp_path):
