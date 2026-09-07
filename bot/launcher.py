@@ -426,6 +426,11 @@ def run_integrated_hyperliquid_bot(
                                 market_context={
                                     **decision.evidence, "spot_price": str(spot_px),
                                     "strike_price": str(strike_px),
+                                    # Compact BBO only: the continuation-path
+                                    # recorder samples this at 30-second
+                                    # cadence and never copies raw L2 payloads.
+                                    "yes_best_bid": best_bid_yes, "yes_best_ask": best_ask_yes,
+                                    "no_best_bid": best_bid_no, "no_best_ask": best_ask_no,
                                 },
                             )
                         elif live_execution.calibration_enabled():

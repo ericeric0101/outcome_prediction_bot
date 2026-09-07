@@ -39,6 +39,7 @@ from bot.outcome_entry_requote import (
     OutcomeEntryRequoteController,
 )
 from bot.outcome_holding_path import OutcomeHoldingPathObservation, OutcomeHoldingPathRecorder
+from bot.outcome_trend_continuation import OutcomeTrendContinuationRecorder
 from bot.outcome_reversal import OutcomeReversalClassifier, OutcomeReversalInput, OutcomeReversalState
 from bot.outcome_loss_reentry import OutcomeLossReentryGate
 from bot.outcome_tier_b_execution_gate import OutcomeTierBExecutionGate
@@ -96,6 +97,7 @@ class OutcomeLiveExecutionRuntime:
             if self.entry_lifecycle_store else None
         )
         self.holding_path_recorder = OutcomeHoldingPathRecorder(ledger.journal, ledger.run_id) if ledger else None
+        self.trend_continuation_recorder = OutcomeTrendContinuationRecorder(ledger.journal, ledger.run_id) if ledger else None
         self.reversal_classifier = OutcomeReversalClassifier()
         self.loss_reentry_gate = OutcomeLossReentryGate(ledger.journal, ledger.run_id) if ledger else None
         self.tier_b_execution_gate = OutcomeTierBExecutionGate(ledger.journal.db_path) if ledger else None
@@ -118,6 +120,51 @@ class OutcomeLiveExecutionRuntime:
         self._e5_canary_eligible_order_ids: set[str] = set()
         self._tick_books: dict[tuple[int, int], dict[str, object]] = {}
         self._last_holding_path_capture_at: dict[tuple[int, str], float] = {}
+        # Cache only immutable, exact-fill provenance.  A missing/ambiguous
+        # lookup is intentionally retried on a later observation rather than
+        # cached as a fabricated lifecycle identity.
+        self._holding_entry_provenance: dict[tuple[int, str, str, str], dict[str, object]] = {}
+
+    def _continuation_entry_already_submitted(self, *, outcome_id: int) -> bool:
+        """One continuation canary submit per daily market, including restarts."""
+        if self.ledger is None:
+            return True
+        try:
+            with sqlite3.connect(f"file:{self.ledger.journal.db_path}?mode=ro", uri=True) as conn:
+                rows = conn.execute(
+                    "SELECT payload_json FROM strategy_events "
+                    "WHERE event_type='OUTCOME_LIVE_STRATEGY_ENTRY_PLACED' ORDER BY id DESC LIMIT 500"
+                ).fetchall()
+        except sqlite3.Error:
+            return True
+        for (raw,) in rows:
+            try:
+                payload = json.loads(raw or "{}")
+                if int(payload.get("outcome_id")) == outcome_id and payload.get("entry_tier") == "tier_c_trend_continuation":
+                    return True
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+        return False
+
+    def _capture_trend_continuation_path(
+        self, *, market: OutcomeMarketSpec, entry_evidence: dict[str, object], market_context: dict[str, object] | None,
+    ) -> None:
+        if self.trend_continuation_recorder is None:
+            return
+        candidate = entry_evidence.get("trend_continuation")
+        context = market_context or {}
+        try:
+            bbo = {
+                0: (context.get("yes_best_bid"), context.get("yes_best_ask")),
+                1: (context.get("no_best_bid"), context.get("no_best_ask")),
+            }
+        except AttributeError:
+            return
+        self.trend_continuation_recorder.observe(
+            outcome_id=market.outcome_id, period=market.period,
+            candidate=candidate if isinstance(candidate, dict) else None,
+            bbo_by_side=bbo,
+        )
 
     def _begin_tick(self) -> None:
         self._account_reads.begin_tick()
@@ -850,6 +897,72 @@ class OutcomeLiveExecutionRuntime:
             return LiveExecutionResult("blocked", "owned entry absent without terminal reconciliation evidence", lifecycle.order_id)
         return None
 
+    def _resolve_holding_entry_provenance(
+        self, *, market: OutcomeMarketSpec, coin: str, inventory: Decimal, fill_vwap: Decimal,
+    ) -> dict[str, object] | None:
+        """Bind an open holding only to its exact official BUY fill.
+
+        The report must never accidentally combine two same-coin round trips.
+        Current live safety permits one inventory, but partial/multi-fill
+        history can still be ambiguous after a restart; such a path remains
+        unlabelled rather than being assigned to the latest strategy event.
+        """
+        if self.ledger is None:
+            return None
+        key = (market.outcome_id, coin, str(inventory), str(fill_vwap))
+        cached = self._holding_entry_provenance.get(key)
+        if cached is not None:
+            return cached
+        try:
+            with sqlite3.connect(self.ledger.journal.db_path) as conn:
+                row = conn.execute(
+                    """SELECT id, ts, venue_order_id, price, qty, payload_json
+                       FROM order_events
+                       WHERE event_type='ORDER_FILLED' AND side='BUY' AND instrument_id=?
+                         AND CAST(json_extract(payload_json, '$.outcome_id') AS INTEGER)=?
+                         AND json_extract(payload_json, '$.coin')=?
+                         AND json_extract(payload_json, '$.actual_fill')=1
+                       ORDER BY id DESC LIMIT 1""",
+                    (coin, market.outcome_id, coin),
+                ).fetchone()
+                if row is None:
+                    return None
+                _, filled_at, order_id, price, quantity, fill_raw = row
+                if Decimal(str(quantity)) != inventory or Decimal(str(price)) != fill_vwap:
+                    return None
+                entry_row = conn.execute(
+                    """SELECT payload_json FROM strategy_events
+                       WHERE event_type='OUTCOME_LIVE_STRATEGY_ENTRY_PLACED'
+                         AND CAST(json_extract(payload_json, '$.outcome_id') AS INTEGER)=?
+                         AND json_extract(payload_json, '$.coin')=?
+                         AND json_extract(payload_json, '$.order_id')=?
+                       ORDER BY id DESC LIMIT 1""",
+                    (market.outcome_id, coin, str(order_id)),
+                ).fetchone()
+            fill_payload = json.loads(fill_raw or "{}")
+            entry_payload = json.loads(entry_row[0] or "{}") if entry_row else {}
+            if not isinstance(fill_payload, dict) or not isinstance(entry_payload, dict):
+                return None
+            trade_id = str(fill_payload.get("trade_id") or "")
+            if not trade_id:
+                return None
+            entry_side_index = int(entry_payload.get("side_index"))
+            entry_tier = str(entry_payload.get("entry_tier") or "unknown")
+            target_return = entry_payload.get("target_return_pct")
+            filled_epoch = datetime.fromisoformat(str(filled_at)).timestamp()
+            provenance = {
+                "entry_lifecycle_id": f"official_buy:{order_id}:{trade_id}",
+                "entry_order_id": str(order_id), "entry_trade_id": trade_id,
+                "entry_filled_at": str(filled_at), "entry_side_index": entry_side_index,
+                "entry_tier": entry_tier,
+                "entry_target_return_pct": str(target_return) if target_return is not None else None,
+                "entry_time_left_sec": max(0.0, float(market.expiry_timestamp) - filled_epoch),
+            }
+            self._holding_entry_provenance[key] = provenance
+            return provenance
+        except (TypeError, ValueError, ArithmeticError, sqlite3.Error, json.JSONDecodeError):
+            return None
+
     def _capture_holding_path(self, *, market: OutcomeMarketSpec, finding: object) -> None:
         """Persist as-of open-inventory facts; never changes an order decision."""
         if self.holding_path_recorder is None or self.ledger is None:
@@ -883,9 +996,13 @@ class OutcomeLiveExecutionRuntime:
                 payload = json.loads(row[1])
                 if not evidence:
                     evidence = payload.get("entry_evidence") if isinstance(payload.get("entry_evidence"), dict) else {}
+            provenance = self._resolve_holding_entry_provenance(
+                market=market, coin=coin, inventory=inventory, fill_vwap=vwap,
+            ) or {}
             self.holding_path_recorder.record(OutcomeHoldingPathObservation(
                 market.outcome_id, market.period, coin, inventory, vwap, bid, ask, fee, age,
                 market.time_to_expiry_sec(), "fresh_rest_book", evidence,
+                **provenance,
             ))
             def _decimal(name: str) -> Decimal | None:
                 try:
@@ -1211,6 +1328,11 @@ class OutcomeLiveExecutionRuntime:
         if self.ledger is None:
             return LiveExecutionResult("blocked", "live strategy requires an execution ledger")
         self._holding_context[market.outcome_id] = dict(market_context or entry_evidence)
+        # C1/C2 research capture is strictly public-data, bounded to one row
+        # per 30 seconds and independent of whether the canary is enabled.
+        self._capture_trend_continuation_path(
+            market=market, entry_evidence=entry_evidence, market_context=market_context,
+        )
         config = OutcomeLiveStrategyConfig.from_env()
         tracked_markets = (market, *retiring_markets)
         recovery_started_at = time.monotonic()
@@ -1360,8 +1482,23 @@ class OutcomeLiveExecutionRuntime:
         # live entry order.
         entry_tier = str(entry_evidence.get("entry_tier") or "tier_a_spot_mark_oi")
         tier_b = entry_tier == "tier_b_spot_mark"
-        entry_policy_kind = "s0_spot_mark_tier_b" if tier_b else "s0_oi_spot_mark_confirmation"
-        sampling_policy = "spot_mark_tier_b" if tier_b else "oi_spot_mark_confirmation"
+        continuation = entry_tier == "tier_c_trend_continuation"
+        entry_policy_kind = (
+            "s0_trend_continuation" if continuation
+            else "s0_spot_mark_tier_b" if tier_b else "s0_oi_spot_mark_confirmation"
+        )
+        sampling_policy = (
+            "trend_continuation" if continuation
+            else "spot_mark_tier_b" if tier_b else "oi_spot_mark_confirmation"
+        )
+        if continuation:
+            # C4 deliberately spends the one canary opportunity when the
+            # official SDK accepts a resting BUY, not when a signal merely
+            # appears.  The DB check makes restart behavior equally bounded.
+            if self._continuation_entry_already_submitted(outcome_id=market.outcome_id):
+                admission["continuation_gate"] = "one_submit_per_market_exhausted"
+                return LiveExecutionResult("flat", "live strategy no entry: continuation_one_submit_per_market_exhausted")
+            admission["continuation_gate"] = "one_submit_per_market_available"
         capacity_canary = (
             self.risk_gate.limits.max_entry_notional_usdc >= Decimal("20")
             and self.risk_gate.limits.max_total_outcome_exposure_usdc >= Decimal("20")

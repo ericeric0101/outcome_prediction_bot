@@ -178,6 +178,35 @@ def test_s0_live_strategy_logs_explicit_oi_policy_entry(monkeypatch, tmp_path):
     assert runtime._persisted_p3_exit_policy(market=market(), coin="#11531").target_return_pct == Decimal("0.03")
 
 
+def test_trend_continuation_canary_allows_only_one_sdk_accepted_submit_per_market(monkeypatch, tmp_path):
+    monkeypatch.setenv("OUTCOME_AUTOMATED_EXECUTION_ENABLED", "1")
+    monkeypatch.setenv("OUTCOME_SDK_EXECUTION_ENABLED", "1")
+    monkeypatch.setenv("OUTCOME_LIVE_STRATEGY_ENABLED", "1")
+    journal = TradeJournalDB(tmp_path / "continuation.db")
+
+    class TrackingGateway(Gateway):
+        def __init__(self): self.calls = []
+        def place_alo(self, **kwargs): self.calls.append(kwargs); return {"orderId": f"continuation-{len(self.calls)}"}
+
+    gateway = TrackingGateway()
+    runtime = OutcomeLiveExecutionRuntime(
+        account=CalibrationAccount(), wallet="w", gateway=gateway, stream_health=healthy_stream(),
+        ledger=OutcomeExecutionLedger(journal, "run"),
+    )
+    evidence = {"entry_tier": "tier_c_trend_continuation", "oi_age_ms": 10,
+                "trend_continuation": {"eligible": True, "side_index": 1, "episode_id": "1:100"}}
+    first = runtime.tick_live_strategy(
+        market=market(), entry_side_index=1, entry_reason="down_trend_continuation_confirmed", entry_evidence=evidence,
+    )
+    second = runtime.tick_live_strategy(
+        market=market(), entry_side_index=1, entry_reason="down_trend_continuation_confirmed", entry_evidence=evidence,
+    )
+    assert first.state == "buy_placed"
+    assert second.state == "flat"
+    assert "continuation_one_submit_per_market_exhausted" in second.detail
+    assert len(gateway.calls) == 1
+
+
 def test_s0_blocks_second_buy_when_official_fill_precedes_account_inventory(monkeypatch, tmp_path):
     """A user fill is real exposure even during the balance visibility lag."""
     monkeypatch.setenv("OUTCOME_AUTOMATED_EXECUTION_ENABLED", "1")

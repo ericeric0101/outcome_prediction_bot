@@ -27,6 +27,17 @@ class OutcomeHoldingPathObservation:
     time_left_sec: float
     book_health: str
     oi_evidence: dict[str, Any]
+    # Version-2 fields bind research observations to one immutable official
+    # entry fill.  They are optional only to preserve legacy telemetry; new
+    # outcome reports deliberately exclude unbound observations.
+    entry_lifecycle_id: str | None = None
+    entry_order_id: str | None = None
+    entry_trade_id: str | None = None
+    entry_filled_at: str | None = None
+    entry_side_index: int | None = None
+    entry_tier: str | None = None
+    entry_target_return_pct: str | None = None
+    entry_time_left_sec: float | None = None
 
     def payload(self) -> dict[str, Any]:
         executable_exit = self.best_bid * (Decimal("1") - self.maker_close_fee_rate)
@@ -40,6 +51,14 @@ class OutcomeHoldingPathObservation:
             "net_exit_vs_entry_pct": str(executable_exit / self.fill_vwap - Decimal("1")),
             "holding_age_sec": self.holding_age_sec, "time_left_sec": self.time_left_sec,
             "book_health": self.book_health, "oi_evidence": self.oi_evidence,
+            "entry_lifecycle_id": self.entry_lifecycle_id,
+            "entry_order_id": self.entry_order_id,
+            "entry_trade_id": self.entry_trade_id,
+            "entry_filled_at": self.entry_filled_at,
+            "entry_side_index": self.entry_side_index,
+            "entry_tier": self.entry_tier,
+            "entry_target_return_pct": self.entry_target_return_pct,
+            "entry_time_left_sec": self.entry_time_left_sec,
         }
 
 

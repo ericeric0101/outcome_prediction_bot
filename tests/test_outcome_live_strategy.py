@@ -100,3 +100,46 @@ def test_live_oi_query_has_local_time_index_without_temp_sort(tmp_path):
     detail = " ".join(str(row[-1]) for row in plan)
     assert "idx_binance_oi_symbol_backfilled_local_time" in detail
     assert "TEMP B-TREE" not in detail
+
+
+def _trend_rows(db) -> None:
+    # 66 minutes of real-cadence observations: a long UP move, followed by a
+    # 5m pullback that remains smaller than the normal 5m movement scale.
+    for second in range(0, 66 * 60 + 1, 30):
+        if second <= 60 * 60:
+            mark = Decimal("100") + Decimal(second) / Decimal("360")
+        else:
+            mark = Decimal("110") - Decimal(second - 60 * 60) / Decimal("1000")
+        _oi(
+            db, timestamp=10_000_000 + second * 1000,
+            oi=str(Decimal("100") + Decimal(second) / Decimal("100000")), mark=str(mark), tag=f"trend-{second}",
+        )
+
+
+def test_trend_continuation_is_journalled_but_disabled_by_default(tmp_path):
+    db = TradeJournalDB(tmp_path / "strategy.db")
+    _trend_rows(db)
+    config = OutcomeLiveStrategyConfig(oi_max_age_sec=90, trend_continuation_enabled=False)
+    gate = OutcomeOiEntryGate(db.db_path, config)
+    # Establish the required 15-minute persistent spot state first.
+    gate.evaluate(spot_price=Decimal("101"), strike_price=Decimal("100"), now_ms=10_000_000 + 50 * 60 * 1000)
+    decision = gate.evaluate(spot_price=Decimal("101"), strike_price=Decimal("100"), now_ms=10_000_000 + 65 * 60 * 1000)
+    candidate = decision.evidence["trend_continuation"]
+    assert decision.side_index is None
+    assert candidate["eligible"] is True
+    assert candidate["side_index"] == 0
+    assert candidate["mark_15m_bps"] is not None
+    assert candidate["mark_60m_bps"] is not None
+
+
+def test_trend_continuation_canary_selects_only_a_persistent_small_pullback(tmp_path):
+    db = TradeJournalDB(tmp_path / "strategy.db")
+    _trend_rows(db)
+    gate = OutcomeOiEntryGate(
+        db.db_path, OutcomeLiveStrategyConfig(oi_max_age_sec=90, trend_continuation_enabled=True),
+    )
+    gate.evaluate(spot_price=Decimal("101"), strike_price=Decimal("100"), now_ms=10_000_000 + 50 * 60 * 1000)
+    decision = gate.evaluate(spot_price=Decimal("101"), strike_price=Decimal("100"), now_ms=10_000_000 + 65 * 60 * 1000)
+    assert decision.side_index == 0
+    assert decision.reason == "up_trend_continuation_confirmed"
+    assert decision.evidence["entry_tier"] == "tier_c_trend_continuation"
