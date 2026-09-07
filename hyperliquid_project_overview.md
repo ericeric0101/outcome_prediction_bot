@@ -557,6 +557,8 @@ X3 是離線建構，沒有網路或交易呼叫；collector 持續寫入後可�
 
 **F5 verification。** 新增 partial capacity（$20 at 60c: 33 desired / 38 visible → 30 submitted）、低於 official opening minimum 的安全容量拒絕、同一 WS trade id 去重且 flow 只能收緊 book capacity、$11 時 portfolio guard dormant、$20 時 $200／-$8、$50 時 $500／-$20 的比例化 guard regression，以及單 market 三個 confirmed loss stop。F5 implementation 當時的 focused regression 為 **55 passed**；後續 Outcome-only suite 已持續擴充，最新驗證應以本文件相應更新段落記錄為準。$20 activation 已在下段正式記錄；不得將兩個 notional limits 提高到 $20 以上、不得以拆單繞過 capacity 或新增任何額外人工 sizing flag。
 
+**F5-5 execution-quality report（完成 2026-09-08；read-only）。** `python -m bot.outcome_execution_quality_report --db logs/outcome_shadow.db --period 1d` 只納入有 durable `entry_capacity_canary_enabled=true` submit audit 的 F5 entries。每個 entry 以 official order id、immutable official fill trade id、single-inventory lifecycle interval 與 canonical FIFO lot 關聯，輸出 requested/safe/submitted shares、整數化後的 submitted-notional estimate、size bucket、spread／5m flow、fill count／shares、submit→last fill、first protective SELL delay、target reprice count、exit fill、holding duration 與 canonical realized net。whole-share alignment 使 $20 cap 常落在 $19.x，報表將 `<= $20` 正確歸入 `up_to_20` phase bucket。未成交 cancel、open inventory、PnL 尚未可由 FIFO lot 對應者均明列，絕不以 UI PnL、未實現 mark 或 book replay 補值。此報表是 F5-5 / F5-6 的實盤 audit，不是 scale-up approval、queue model 或 future fill-probability claim。
+
 **G8 — legacy venue decommission（2026-09-06）。** 舊 Polymarket/Nautilus root、`run_bot.py`、CLOB shim、legacy execution/exit/forecast/shadow modules、相依 scripts/tests、profiles 和 migration-only documents 已刪除；`OutcomePricingState` 改為使用本地 `OutcomeQuoteEconomics`，`OutcomeAccountSynchronizer` 保持 official read-only account normalization，不再映射到舊 PositionManager／ExitPolicy。launcher 已移除 Polymarket credential fallback 和 `--venue polymarket`。`runtime_env` 不再讀 profile 或 alias，僅從 `.env` 載入 Outcome allowlist；實際私密 `.env` 與 `.env.example` 都已移除 `POLYMARKET_*`／`VENUE` 等舊 key，唯一保留的是 Outcome 所需參數。
 
 **G8 verification。** 移除後以 repository-wide import scan 確認沒有 production/test import 指向已刪除 legacy module，`rg` 僅保留 README 的歷史移除敘述與 runtime-env regression assertion；Outcome-only suite **241 passed**，本機 `.env` allowlist smoke 確認 entry/exposure 仍為 **$11/$11** 且 `legacy_loaded=False`。GitHub Actions 現在固定先以 Node 22 執行 `outcome_sdk_sidecar/npm ci` 和 `npm run build`，再從 `requirements.txt` 安裝明確宣告的 `pytest` 後執行 suite；這使乾淨 runner 與本機驗證使用同一完整流程。另已將 market-authority export 的單機絕對 macOS path 改為 process-CWD 下的相對 `logs/` path，並以 temporary working directory regression 防止再次把開發機路徑帶進 CI。本次不改 `.env` 的 live notional/exposure，也沒有呼叫任何 live order path。
@@ -571,7 +573,7 @@ X3 是離線建構，沒有網路或交易呼叫；collector 持續寫入後可�
 
 **G12 — C1–C5 trend-continuation evidence lane（完成程式與測試；未授權 live canary，2026-09-07）。** 現行 strict S0 的 Tier-A（spot + 5m Binance mark + OI activity）與 Tier-B（spot + 5m mark）保持最高優先權，沒有被放寬。新 `OutcomeOiEntryGate` 在每次 fresh OI decision 額外產生 compact `trend_continuation` state：spot 必須在 strike 同側至少 15 分鐘、15m 與 1h Binance mark 必須和該側同向並各至少達既有 5 bps 門檻、當前 5m mark 必須是**反向**但不超過本機 live OI stream 所估 5m absolute-return p75。缺少 60m history、restart 後尚未重新累積 15m spot persistence、資料 stale、long-horizon 不同向、或 pullback 大於自身波動尺度，全部 fail-closed。這不是「Down 機率高就買 Down」，也不因 5m mark 只是微弱同向而放寬 strict S0；它只標記已持續 trend 中的小反向 pullback。
 
-**C2/C3 audit 與報表。** 每個 candidate 有 process-local episode id；runtime 以當前 WS BBO 每 30 秒保存一筆 `OUTCOME_TREND_CONTINUATION_PATH`，最多兩小時，僅有 entry bid、後續 bid/ask、gross bid path 與 age，絕不複製 raw L2／allMids payload。`python -m bot.outcome_trend_continuation_report --db logs/outcome_shadow.db --period 1d` 以 episode 報告 gross BBO MAE/MFE、是否曾達 +1%/+2%/+5%、或 -5%/-10%，並明列它**不是** maker fill simulation、realized PnL 或策略 alpha；restart 前後、未滿兩小時、及舊資料均不可假裝連續樣本。這使「strict 拒絕但 continuation candidate」可被獨立量測，不必對完整 raw L2 journal 回放或製造假成交。
+**C2/C3 audit 與報表（terminal completeness 修正 2026-09-08）。** 每個 candidate 有 process-local episode id；runtime 以當前 WS BBO 每 30 秒保存一筆 `OUTCOME_TREND_CONTINUATION_PATH`，最多兩小時，僅有 entry bid、後續 bid/ask、gross bid path 與 age，絕不複製 raw L2／allMids payload。到達／跨過兩小時的第一個**有效 BBO** tick 必須強制寫入 `terminal_observation=true` 後關閉該 episode；同一持續 candidate 不得以相同 episode id 再開第二段。若 terminal BBO 缺失或 crossed，episode 保持 partial，絕不偽造最終價格。`python -m bot.outcome_trend_continuation_report --db logs/outcome_shadow.db --period 1d` 僅以這個 explicit terminal marker 計為 `observed_2h`，不再把 7,19x 秒的普通 cadence row 誤視為完整或讓其永遠無法完成。它以 episode 報告 gross BBO MAE/MFE、是否曾達 +1%/+2%/+5%、或 -5%/-10%，並明列它**不是** maker fill simulation、realized PnL 或策略 alpha；restart 前後、未滿兩小時、及舊 schema-v1 rows 均不可假裝連續樣本。這使「strict 拒絕但 continuation candidate」可被獨立量測，不必對完整 raw L2 journal 回放或製造假成交。
 
 **C4 bounded implementation。** 唯一暫時新增的 operator kill switch 為 `OUTCOME_TREND_CONTINUATION_ENABLED=0`，已同時列在 `.env` 與 `.env.example`；預設為 0，重啟後仍只做 C1–C3 research。若日後操作者明確設為 1，continuation 必須先通過完全相同的 fresh WS、account recovery、single-inventory/order、$20 capacity sizing、spread/depth/drift、fee-after target headroom、portfolio guard、ALO/post-only、S2/S3 和 official-fill visibility fence。每個 daily market 最多允許 **一張 official-SDK accepted resting BUY** 使用 continuation tier；restart 也從 durable journal 查回，不能以重啟重置 token。strict Tier-A/B 不消耗此 token。continuation 使用既有 volatility-derived target，不新增人工 target／loss／spread 參數，也不新增 taker 權限。
 
@@ -695,18 +697,20 @@ Outcome 支援多週期 BTC 預測市場規格格式：
   - 開盤前 10–30 秒與 30–60 秒分桶結算期望值（Resolution EV）校準。
   - **單一市場一次性進場保證**：首筆成交即鎖定該市場預算，嚴格禁止追價加倉（Hard limited to 1 BUY per market cycle）。
 
-### 3. 下單規模與 10 USDC 最小名義價值校準 (`QuoteEconomics`)
+### 3. 歷史：下單規模與 10 USDC 最小名義價值校準（2026-08-28 snapshot；已由 F5 覆蓋）
+
+> **歷史閱讀限制。** 本節記錄 2026-08-28 當時的最小名義規格與尚未有 F5 capacity lane 的行為，不是現行 live runtime 規格。現行 $20 canary、whole-share sizing、capacity-aware partial sizing 與 portfolio limits 一律以 F5 段落為準；不得由本節的 10–11 USDC 敘述修改 `.env` 或推論當前下單行為。
 - **Min Notional 限制**：Hyperliquid 協議要求開倉名義價值 $\text{price} \times \text{shares} \ge 10\text{ USDC}$。
 - **動態股數計算**：
   $$\text{shares} = \max\left(\text{target\_shares}, \left\lceil \frac{10.0}{\text{price}} \right\rceil\right)$$
-- **目前正式實作限制（2026-08-28）**：`OutcomeMakerStateMachine` 的 BUY 呼叫未傳入 `requested_shares`，`OutcomeExecutionGateway.whole_share_size()` 因而只建立滿足最小 10 USDC 的整數股數。`OUTCOME_MAX_ENTRY_NOTIONAL_USDC` 與 `OUTCOME_MAX_OUTCOME_EXPOSURE_USDC` 現在是**拒單上限**，不是目標下單額；單純把兩者從 `11` 改成 `20` 或 `100`，不會讓正式 runtime 自動擴量，也不得被當作已完成擴量。
+- **當時正式實作限制（2026-08-28）**：當時的 `OutcomeMakerStateMachine` BUY 呼叫未傳入 `requested_shares`，`OutcomeExecutionGateway.whole_share_size()` 因而只建立滿足最小 10 USDC 的整數股數。此限制已由後續 F5 capacity-aware sizing 取代；`OUTCOME_MAX_ENTRY_NOTIONAL_USDC` 與 `OUTCOME_MAX_OUTCOME_EXPOSURE_USDC` 現在在 $20 phase 同時構成 target cap、exposure cap 與 portfolio guard 的比例化基礎，而不是本段描述的舊行為。
 - **費率模型**：
   - 交易、builder 與 settlement fee 必須以每期官方 evidence 讀取／記錄；testing 階段的零交易費不可視為永久假設。
   - 在 P0 尚無可驗證 settlement fee 前，任何 `robust_net` 都只能作研究指標，不得作 live entry gate。
 
 ### 4. $20／$100 擴量、流動性與 Toxic-Flow 權威規格（2026-08-28）
 
-**結論與狀態。** 目前約 10–11 USDC 的單筆 maker canary 上限維持不變。20 USDC 只能作下一階段、受控的尺寸實驗；100 USDC 必須定義為單一市場的**總目標曝險／entry campaign budget**，不可直接成為一張固定 best-bid ALO。下列規格是未來擴量的必要 gate，不是目前的 live 授權；在程式、測試與 P3 真實 fill evidence 完成前，禁止只修改環境變數提高名義金額。
+**歷史結論（2026-08-28；已由 F5 activation 覆蓋）。** 當時約 10–11 USDC 的單筆 maker canary 上限維持不變，20 USDC 僅是下一階段規格。自 2026-09-07 F5 activation 起，正式 live canary 已是單一 inventory／單一 order 的 $20 cap；100 USDC 仍只可作未授權的單一市場**總目標曝險／entry campaign budget**，不可直接成為一張固定 best-bid ALO。下列流動性／toxic-flow 規格仍是未來 $30+ 擴量的必要 gate，不構成超過 $20 的 live 授權。
 
 #### 本地 L2 實證基線
 
@@ -755,8 +759,8 @@ child_order_notional <= min(
 
 #### 分階段擴量與執行方式
 
-1. **10–11 USDC（目前）**：維持單一最小名義 ALO canary；完成現有 P3 bucket markout 與 settlement evidence，作為擴量基線。
-2. **20 USDC（下一階段）**：只在上述 liquidity/toxicity gates 實作並通過測試後，對合格 bucket 啟用。即使目標為 20 USDC，薄盤時仍須縮回最小可下單額或直接 `flat`；不得硬湊 20 USDC。
+1. **10–11 USDC（2026-08-28 基線；已完成／歷史）**：原始單一最小名義 ALO canary，作為後續 $20 F5 的比較基線。
+2. **20 USDC（現行受限 phase）**：上述 liquidity/toxicity gates 已以 F5 實作並通過程式回歸；現行 target cap 為 $20。薄盤時仍可按 safe capacity 縮至官方 $10 opening minimum，或直接 `flat`；不得硬湊 20 USDC。
 3. **40–50 USDC（中間階段）**：20 USDC out-of-sample 樣本的 fee-adjusted EV、1/5/10/30/60s markout、fill probability、退出 VWAP 與最大不利偏移通過後才可進入；不得從 20 直接跳 100。
 4. **100 USDC（總 campaign budget）**：拆成多個約 10–25 USDC 的 child clips；每一 clip 送出前重新計算 book、edge、inventory 與 remaining budget。前一 clip 成交不代表必須補滿 100；任何 gate 惡化即停止。不得一次暴露完整 100 USDC，也不得用同價多單偽裝成拆單。
 

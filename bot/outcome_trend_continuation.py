@@ -38,6 +38,12 @@ class OutcomeTrendContinuationRecorder:
         self.run_id = run_id
         self._paths: dict[tuple[int, str], _CandidatePath] = {}
         self._last_recorded_at: dict[tuple[int, str], float] = {}
+        # A candidate episode is a bounded two-hour counterfactual.  Retain
+        # its terminal identity for the life of this recorder so an eligible
+        # signal that persists past the horizon cannot silently start a
+        # second path with the same episode id and merge two samples in the
+        # report.
+        self._closed_episode_keys: set[tuple[int, str]] = set()
 
     @staticmethod
     def _decimal(value: object) -> Decimal | None:
@@ -66,7 +72,7 @@ class OutcomeTrendContinuationRecorder:
             bid = self._decimal(bid_ask[0]) if bid_ask else None
             if side_index in (0, 1) and episode_id and bid is not None:
                 key = (outcome_id, episode_id)
-                if key not in self._paths:
+                if key not in self._paths and key not in self._closed_episode_keys:
                     self._paths[key] = _CandidatePath(
                         outcome_id=outcome_id, period=period, episode_id=episode_id,
                         side_index=side_index, started_at=now, entry_bid=bid,
@@ -76,16 +82,21 @@ class OutcomeTrendContinuationRecorder:
             if path.outcome_id != outcome_id:
                 continue
             age = now - path.started_at
-            if age > self.HORIZON_SEC:
-                self._paths.pop(key, None)
-                self._last_recorded_at.pop(key, None)
-                continue
-            if now - self._last_recorded_at.get(key, float("-inf")) < self.MIN_INTERVAL_SEC:
+            terminal = age >= self.HORIZON_SEC
+            if not terminal and now - self._last_recorded_at.get(key, float("-inf")) < self.MIN_INTERVAL_SEC:
                 continue
             bid_ask = bbo_by_side.get(path.side_index)
             bid = self._decimal(bid_ask[0]) if bid_ask else None
             ask = self._decimal(bid_ask[1]) if bid_ask else None
             if bid is None or ask is None or ask <= bid:
+                if terminal:
+                    # A terminal BBO must be executable-quality evidence;
+                    # do not manufacture a final price from stale/missing
+                    # data.  The report will correctly retain this episode
+                    # as incomplete rather than treat it as a two-hour path.
+                    self._paths.pop(key, None)
+                    self._last_recorded_at.pop(key, None)
+                    self._closed_episode_keys.add(key)
                 continue
             self.journal.log_strategy_event(self.run_id, "OUTCOME_TREND_CONTINUATION_PATH", {
                 "venue": "hyperliquid_outcome", "read_only": True,
@@ -94,6 +105,11 @@ class OutcomeTrendContinuationRecorder:
                 "entry_bid": str(path.entry_bid), "best_bid": str(bid), "best_ask": str(ask),
                 "age_sec": round(age, 3),
                 "gross_bid_return_pct": str(bid / path.entry_bid - Decimal("1")),
+                "terminal_observation": terminal,
                 "counterfactual_limit": "public_bbo_path_only_no_maker_fill_or_pnl_inference",
             })
             self._last_recorded_at[key] = now
+            if terminal:
+                self._paths.pop(key, None)
+                self._last_recorded_at.pop(key, None)
+                self._closed_episode_keys.add(key)

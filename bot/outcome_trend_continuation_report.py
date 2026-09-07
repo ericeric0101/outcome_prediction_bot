@@ -43,19 +43,24 @@ def report(db_path: str | Path, *, period: str = "1d") -> dict[str, Any]:
         first = observations[0][1]
         returns = [Decimal(str(payload["gross_bid_return_pct"])) for _, payload in observations]
         age = max(float(payload.get("age_sec", 0)) for _, payload in observations)
+        terminal_observed = any(bool(payload.get("terminal_observation")) for _, payload in observations)
         row: dict[str, Any] = {
             "episode_id": episode_id, "outcome_id": first.get("outcome_id"),
             "side_index": first.get("side_index"), "observations": len(observations),
-            "observed_horizon_sec": age, "mae_gross_bid_pct": str(min(returns)),
+            "observed_horizon_sec": age, "terminal_observation": terminal_observed,
+            "mae_gross_bid_pct": str(min(returns)),
             "mfe_gross_bid_pct": str(max(returns)),
             "hit_upside": {f"{int(value * 100)}%": any(item >= value for item in returns) for value in _UPSIDE},
             "hit_downside": {f"{int(abs(value) * 100)}%": any(item <= value for item in returns) for value in _DOWNSIDE},
         }
         episodes.append(row)
-        buckets["observed_2h" if age >= 2 * 60 * 60 else "partial_under_2h"] += 1
+        # Do not infer a completed horizon merely because an old row happened
+        # to be close to 7200 seconds.  Schema-v2 terminal rows are explicit
+        # evidence that a valid BBO was captured after the horizon.
+        buckets["observed_2h" if terminal_observed else "partial_under_2h"] += 1
     return {
         "report": "outcome_trend_continuation_counterfactual_bbo_path",
-        "schema_version": 1,
+        "schema_version": 2,
         "period": period,
         "episodes": episodes,
         "episode_count": len(episodes),
