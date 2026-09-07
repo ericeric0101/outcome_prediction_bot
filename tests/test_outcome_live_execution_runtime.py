@@ -178,6 +178,80 @@ def test_s0_live_strategy_logs_explicit_oi_policy_entry(monkeypatch, tmp_path):
     assert runtime._persisted_p3_exit_policy(market=market(), coin="#11531").target_return_pct == Decimal("0.03")
 
 
+def test_s0_blocks_second_buy_when_official_fill_precedes_account_inventory(monkeypatch, tmp_path):
+    """A user fill is real exposure even during the balance visibility lag."""
+    monkeypatch.setenv("OUTCOME_AUTOMATED_EXECUTION_ENABLED", "1")
+    monkeypatch.setenv("OUTCOME_SDK_EXECUTION_ENABLED", "1")
+    monkeypatch.setenv("OUTCOME_LIVE_STRATEGY_ENABLED", "1")
+    journal = TradeJournalDB(tmp_path / "fill_visibility_lag.db")
+
+    class FillLagAccount(CalibrationAccount):
+        def __init__(self):
+            super().__init__(balances=[{"coin": "USDH", "total": "100", "hold": "0"}])
+            self.fills = []
+
+        def get_user_fills_sync(self, _):
+            return list(self.fills)
+
+    class TrackingGateway(Gateway):
+        def __init__(self):
+            self.calls = []
+
+        def place_alo(self, **kwargs):
+            self.calls.append(kwargs)
+            if kwargs["is_buy"]:
+                return {"orderId": "first-buy"}
+            return {"orderId": "protective-sell"}
+
+    account, gateway = FillLagAccount(), TrackingGateway()
+    runtime = OutcomeLiveExecutionRuntime(
+        account=account, wallet="w", gateway=gateway, stream_health=healthy_stream(),
+        ledger=OutcomeExecutionLedger(journal, "run"),
+    )
+    first = runtime.tick_live_strategy(
+        market=market(), entry_side_index=1, entry_reason="down_spot_mark_oi_confirmed", entry_evidence={"oi_age_ms": 10},
+    )
+    assert first.state == "buy_placed"
+
+    # The official fill arrives before either balances or open orders reports
+    # the new inventory.  This reproduces the 2026-09-07 double-entry race.
+    account.fills = [{
+        "coin": "#11531", "oid": "first-buy", "tid": "fill-before-balance", "side": "B",
+        "px": "0.70", "sz": "15", "fee": "0", "time": 1, "crossed": False,
+    }]
+    blocked = runtime.tick_live_strategy(
+        market=market(), entry_side_index=1, entry_reason="down_spot_mark_oi_confirmed", entry_evidence={"oi_age_ms": 10},
+    )
+    assert blocked.state == "blocked"
+    assert "official buy fill pending account reconciliation" in blocked.detail
+    assert len(gateway.calls) == 1
+
+    import sqlite3
+    with sqlite3.connect(journal.db_path) as conn:
+        lifecycle = conn.execute(
+            "SELECT payload_json FROM strategy_events WHERE event_type='OUTCOME_ENTRY_LIFECYCLE' ORDER BY id DESC LIMIT 1"
+        ).fetchone()[0]
+        audit = conn.execute(
+            "SELECT payload_json FROM strategy_events WHERE event_type='OUTCOME_ENTRY_FILL_VISIBILITY_LAG_BLOCK'"
+        ).fetchone()[0]
+    assert '"state": "FILL_PENDING_RECONCILIATION"' in lifecycle
+    assert '"order_id": "first-buy"' in audit
+
+    # Once the authoritative account state catches up, the fence must release
+    # the entry into the existing protective-exit path, rather than leave the
+    # position blocked or submit another BUY.
+    account.balances = [
+        {"coin": "USDH", "total": "89.5", "hold": "0"},
+        {"coin": "#11531", "total": "15", "entryNtl": "10.5", "hold": "0"},
+    ]
+    reconciled = runtime.tick_live_strategy(
+        market=market(), entry_side_index=None, entry_reason="", entry_evidence={},
+    )
+    assert reconciled.state == "sell_placed", reconciled.detail
+    assert len(gateway.calls) == 2
+    assert gateway.calls[-1]["is_buy"] is False
+
+
 def test_20_canary_submits_only_capacity_safe_partial_size(monkeypatch, tmp_path):
     monkeypatch.setenv("OUTCOME_AUTOMATED_EXECUTION_ENABLED", "1")
     monkeypatch.setenv("OUTCOME_SDK_EXECUTION_ENABLED", "1")

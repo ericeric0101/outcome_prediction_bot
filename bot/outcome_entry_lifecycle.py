@@ -62,7 +62,9 @@ class OutcomeEntryLifecycleStore:
             if not row:
                 return None
             payload = json.loads(row[1] or "{}")
-            if not isinstance(payload, dict) or payload.get("state") not in {"BUY_RESTING", "CANCEL_SUBMITTED", "RECONCILE_REQUIRED"}:
+            if not isinstance(payload, dict) or payload.get("state") not in {
+                "BUY_RESTING", "CANCEL_SUBMITTED", "FILL_PENDING_RECONCILIATION", "RECONCILE_REQUIRED",
+            }:
                 return None
             return OutcomeEntryLifecycle(
                 wallet=str(payload["wallet"]), outcome_id=int(payload["outcome_id"]), coin=str(payload["coin"]),
@@ -71,6 +73,42 @@ class OutcomeEntryLifecycleStore:
                 updated_at_ts=datetime.fromisoformat(str(row[0])).timestamp(),
             )
         except (KeyError, TypeError, ValueError, sqlite3.Error, json.JSONDecodeError):
+            return None
+
+    def official_buy_fill(
+        self, *, outcome_id: int, coin: str, order_id: str,
+    ) -> dict[str, Any] | None:
+        """Return one immutable official fill for this owned entry, if recorded.
+
+        A user-fill can arrive before `spotClearinghouseState` exposes its
+        resulting token balance.  The durable fill is therefore a safety
+        fence, not a substitute for account truth when sizing a protective
+        sell.
+        """
+        try:
+            with sqlite3.connect(self.journal.db_path) as conn:
+                row = conn.execute(
+                    """
+                    SELECT id, ts, price, qty, payload_json FROM order_events
+                    WHERE event_type='ORDER_FILLED' AND side='BUY'
+                      AND venue_order_id=? AND instrument_id=?
+                      AND CAST(json_extract(payload_json, '$.outcome_id') AS INTEGER)=?
+                      AND json_extract(payload_json, '$.coin')=?
+                    ORDER BY id DESC LIMIT 1
+                    """,
+                    (str(order_id), coin, int(outcome_id), coin),
+                ).fetchone()
+            if row is None:
+                return None
+            payload = json.loads(row[4] or "{}")
+            if not isinstance(payload, dict) or payload.get("actual_fill") is not True:
+                return None
+            return {
+                "event_id": int(row[0]), "recorded_at": str(row[1]),
+                "price": str(row[2]), "quantity": str(row[3]),
+                "trade_id": str(payload.get("trade_id") or ""),
+            }
+        except (TypeError, ValueError, sqlite3.Error, json.JSONDecodeError):
             return None
 
     def recover_or_adopt_audited_submit(

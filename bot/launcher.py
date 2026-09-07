@@ -16,7 +16,6 @@ if str(REPO_ROOT) not in sys.path:
 
 from loguru import logger
 
-from alert_watcher import AlertWatcher
 from dashboard_state import DashboardState
 from bot.adapters.outcome_auth import OutcomeAuth
 from bot.adapters.outcome_client import OutcomeClient
@@ -47,8 +46,6 @@ from monitoring.trade_journal_db import TradeJournalDB
 from bot.enums import MarketPhase
 from bot.runtime_env import load_runtime_env
 from bot.process_lock import ProcessLock
-from telegram_bot import start_telegram_bot_thread
-from telegram_notifier import TelegramNotifier
 
 
 def resolve_hyperliquid_auth() -> Optional[OutcomeAuth]:
@@ -251,12 +248,6 @@ def run_integrated_hyperliquid_bot(
         pol_balance=0.0,
         account_last_updated=datetime.now(timezone.utc),
     )
-    telegram_notifier = TelegramNotifier()
-    alert_watcher = AlertWatcher()
-    telegram_thread = start_telegram_bot_thread(dashboard_state)
-    if telegram_thread is not None:
-        logger.info("Telegram bot controller started in background thread.")
-
     terminal_dash = None
     if enable_terminal_dashboard:
         from monitoring.terminal_dashboard import TerminalDashboard

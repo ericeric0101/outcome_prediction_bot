@@ -776,6 +776,80 @@ class OutcomeLiveExecutionRuntime:
             # infer a close from a failed read.
             return
 
+    def _entry_fill_visibility_barrier(
+        self, *, market: OutcomeMarketSpec, report: object, admission: dict[str, object],
+    ) -> LiveExecutionResult | None:
+        """Fail closed when an official entry fill precedes account visibility.
+
+        Hyperliquid's user-fill feed can report a maker fill seconds before
+        balances or open orders reflect its new inventory.  Treating that
+        transient empty snapshot as flat used to permit a second BUY.  A
+        durable official fill now blocks admission until account truth shows
+        the inventory (or its protective sell); it is never used to infer a
+        sell size.
+        """
+        if self.entry_lifecycle_store is None:
+            return None
+        findings = tuple(getattr(report, "findings", ()))
+        for coin in (market.yes_coin, market.no_coin):
+            lifecycle = self.entry_lifecycle_store.recover(
+                wallet=self.recovery.wallet, outcome_id=market.outcome_id, coin=coin,
+            )
+            if lifecycle is None:
+                continue
+            finding = next((item for item in findings if getattr(item, "market_id", None) == market.outcome_id
+                            and str(getattr(item, "coin", "")) == coin), None)
+            if finding is None:
+                continue
+            inventory = Decimal(str(getattr(finding, "inventory", "0")))
+            buy_ids = {str(value) for value in getattr(finding, "buy_order_ids", ())}
+            sell_ids = tuple(getattr(finding, "sell_order_ids", ()))
+            # Once the account confirms either the inventory or a covering
+            # sell, the fill is reconciled and cannot block a later, flat
+            # round trip.
+            if inventory > 0 or sell_ids:
+                if lifecycle.state in {"BUY_RESTING", "CANCEL_SUBMITTED", "FILL_PENDING_RECONCILIATION", "RECONCILE_REQUIRED"}:
+                    self.entry_lifecycle_store.record(
+                        lifecycle, reason="entry_account_visibility_reconciled",
+                        extra={"state": "FILL_RECONCILED", "account_inventory": str(inventory),
+                               "sell_order_ids": list(sell_ids)},
+                    )
+                continue
+            if lifecycle.order_id in buy_ids:
+                continue
+            fill = self.entry_lifecycle_store.official_buy_fill(
+                outcome_id=market.outcome_id, coin=coin, order_id=lifecycle.order_id,
+            )
+            if fill is not None:
+                if lifecycle.state != "FILL_PENDING_RECONCILIATION":
+                    self.entry_lifecycle_store.record(
+                        lifecycle, reason="official_buy_fill_before_account_visibility",
+                        extra={"state": "FILL_PENDING_RECONCILIATION", "official_fill": fill},
+                    )
+                admission["entry_fill_visibility_gate"] = {
+                    "allowed": False, "reason": "official_buy_fill_pending_account_reconciliation",
+                    "coin": coin, "order_id": lifecycle.order_id, "official_fill": fill,
+                }
+                self.ledger.journal.log_strategy_event(self.ledger.run_id, "OUTCOME_ENTRY_FILL_VISIBILITY_LAG_BLOCK", {
+                    "venue": "hyperliquid_outcome", "outcome_id": market.outcome_id, "period": market.period,
+                    "coin": coin, "order_id": lifecycle.order_id, "official_fill": fill,
+                    "action": "new_buy_refused_until_account_inventory_or_protective_sell_visible",
+                })
+                return LiveExecutionResult("blocked", "official buy fill pending account reconciliation", lifecycle.order_id)
+            # A durably owned entry disappearing without cancellation or fill
+            # evidence is likewise unsafe to overwrite with another BUY.
+            if lifecycle.state != "RECONCILE_REQUIRED":
+                self.entry_lifecycle_store.record(
+                    lifecycle, reason="owned_entry_absent_without_terminal_evidence",
+                    extra={"state": "RECONCILE_REQUIRED"},
+                )
+            admission["entry_fill_visibility_gate"] = {
+                "allowed": False, "reason": "owned_entry_absent_without_terminal_evidence",
+                "coin": coin, "order_id": lifecycle.order_id,
+            }
+            return LiveExecutionResult("blocked", "owned entry absent without terminal reconciliation evidence", lifecycle.order_id)
+        return None
+
     def _capture_holding_path(self, *, market: OutcomeMarketSpec, finding: object) -> None:
         """Persist as-of open-inventory facts; never changes an order decision."""
         if self.holding_path_recorder is None or self.ledger is None:
@@ -1176,6 +1250,11 @@ class OutcomeLiveExecutionRuntime:
             market=market, entry_side_index=entry_side_index, entry_reason=entry_reason,
             entry_evidence=entry_evidence, active=active,
         )
+        fill_visibility_barrier = self._entry_fill_visibility_barrier(
+            market=market, report=report, admission=admission,
+        )
+        if fill_visibility_barrier is not None:
+            return fill_visibility_barrier
         if len(active) == 1:
             # A filled buy plus an open owned remainder is the only state
             # where cancellation is more urgent than every observational
