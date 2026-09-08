@@ -8,6 +8,7 @@ from bot.outcome_entry_requote import (
     EntryQuotePlan,
     OutcomeEntryQuotePlanner,
     OutcomeEntryQuotePlannerConfig,
+    OutcomeEntryFastRiskTracker,
     OutcomeEntryRequoteController,
 )
 from bot.outcome_account_read_cache import OutcomeAccountReadCache
@@ -26,6 +27,32 @@ def test_entry_planner_only_cancels_after_age_and_fresh_contradiction():
     assert planner.plan(stale_feed).action is EntryQuoteAction.KEEP
     contradicted = EntryQuoteInput(1, Decimal("0.60"), None, None, "directional_confirmation_not_met", 301)
     assert planner.plan(contradicted) == EntryQuotePlan(EntryQuoteAction.CANCEL, "entry_signal_no_longer_confirmed")
+
+
+def test_confirmed_fast_risk_cancels_without_lowering_normal_five_minute_lane():
+    planner = OutcomeEntryQuotePlanner(OutcomeEntryQuotePlannerConfig(min_requote_interval_sec=300))
+    pending = EntryQuoteInput(
+        1, Decimal("0.60"), None, None, "directional_confirmation_not_met", 20,
+        fast_risk_confirmed=False, fast_risk_reason="confirmed_signal_invalidation",
+    )
+    assert planner.plan(pending).reason == "entry_requote_interval_not_elapsed"
+    confirmed = EntryQuoteInput(
+        1, Decimal("0.60"), None, None, "directional_confirmation_not_met", 20,
+        fast_risk_confirmed=True, fast_risk_reason="confirmed_signal_invalidation",
+    )
+    assert planner.plan(confirmed) == EntryQuotePlan(
+        EntryQuoteAction.CANCEL, "entry_fast_risk_cancel:confirmed_signal_invalidation",
+    )
+
+
+def test_fast_risk_tracker_requires_three_samples_and_five_seconds_and_resets():
+    tracker = OutcomeEntryFastRiskTracker()
+    key = (1356, "#13561")
+    assert not tracker.observe(key=key, reason="confirmed_side_flip", now=10).confirmed
+    assert not tracker.observe(key=key, reason="confirmed_side_flip", now=12.5).confirmed
+    assert tracker.observe(key=key, reason="confirmed_side_flip", now=15).confirmed
+    assert tracker.observe(key=key, reason=None, now=16).observation_count == 0
+    assert not tracker.observe(key=key, reason="confirmed_side_flip", now=17).confirmed
 
 
 def test_entry_planner_cancels_side_or_first_level_change_with_hysteresis():
@@ -59,6 +86,16 @@ def test_entry_store_adopts_only_exact_audited_s0_buy(tmp_path):
     assert manual_store.recover_or_adopt_audited_submit(wallet="w", outcome_id=1356, coin="#13561", open_orders=[
         {"coin": "#13561", "side": "B", "oid": "manual", "limitPx": "0.60"},
     ]) is None
+
+
+def test_fast_cancel_cooldown_is_durable(tmp_path):
+    journal = TradeJournalDB(tmp_path / "cooldown.db")
+    store = OutcomeEntryLifecycleStore(journal, "run")
+    lifecycle = OutcomeEntryLifecycle("w", 1356, "#13561", "buy-1", Decimal("0.60"), 0, "BUY_RESTING")
+    store.record(lifecycle, reason="entry_fast_risk_cancel:confirmed_side_flip", extra={"state": "CANCELLED"})
+    assert store.fast_rebook_cooldown_remaining(
+        wallet="w", outcome_id=1356, coin="#13561", cooldown_sec=30,
+    ) > 0
 
 
 class Account:

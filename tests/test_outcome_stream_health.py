@@ -38,11 +38,12 @@ def test_stream_health_exposes_only_a_healthy_ws_bbo_keep_hint():
     health.on_lifecycle("connected")
     health.mark_rest_resynced()
     health.on_l2_book("#11530", payload={
-        "levels": [[{"px": "0.60"}], [{"px": "0.61"}]],
+        "levels": [[{"px": "0.60", "sz": "10"}, {"px": "0.59", "sz": "20"}], [{"px": "0.61", "sz": "5"}]],
     })
     health.on_l2_book("#11531", payload={
-        "levels": [[{"px": "0.39"}], [{"px": "0.40"}]],
+        "levels": [[{"px": "0.39", "sz": "11"}], [{"px": "0.40", "sz": "5"}]],
     })
     assert health.fresh_bbo(market(), "#11530") == (Decimal("0.60"), Decimal("0.61"))
+    assert health.fresh_book_top(market(), "#11530")["top3_bid_depth"] == Decimal("30")
     health.on_lifecycle("disconnected")
     assert health.fresh_bbo(market(), "#11530") is None

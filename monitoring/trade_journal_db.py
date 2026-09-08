@@ -980,6 +980,93 @@ class TradeJournalDB:
             logger.debug(f"TradeJournalDB record_outcome_realized_pnl_lot failed: {e}")
             return False
 
+    def synchronize_outcome_realized_sell_lots(
+        self, *, run_id: str, lots: list[Dict[str, Any]], ordering_rule: str,
+        authoritative_trade_ids: set[str],
+    ) -> Dict[str, int]:
+        """Synchronize the rebuildable sell-lot projection to fill facts.
+
+        Immutable ``ORDER_FILLED`` evidence and settlement lots are never
+        modified.  Conservative synchronization is necessary because an older
+        FIFO projection may have been built from a newest-first ``userFills``
+        batch; stale rows are removed only when both source fills still exist.
+        """
+        expected_keys = {
+            (str(lot["close_trade_id"]), str(lot["open_trade_id"])) for lot in lots
+        }
+        changed = deleted = 0
+        try:
+            with self._connect() as conn:
+                existing = {
+                    (str(row[0]), str(row[1]))
+                    for row in conn.execute(
+                        """SELECT close_trade_id,open_trade_id
+                           FROM outcome_realized_pnl_lots WHERE close_kind='sell'"""
+                    ).fetchall()
+                }
+                for lot in lots:
+                    quantity = Decimal(str(lot["quantity"]))
+                    cost = Decimal(str(lot["cost_usdc"]))
+                    proceeds = Decimal(str(lot["proceeds_usdc"]))
+                    recorded_at = str(lot.get("recorded_at") or _utc_now_iso())
+                    cursor = conn.execute(
+                        """INSERT INTO outcome_realized_pnl_lots (
+                             close_trade_id,open_trade_id,outcome_id,side_index,close_kind,
+                             quantity,cost_usdc,proceeds_usdc,realized_net_usdc,source_json,recorded_at
+                           ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                           ON CONFLICT(close_trade_id,open_trade_id) DO UPDATE SET
+                             outcome_id=excluded.outcome_id,
+                             side_index=excluded.side_index,
+                             close_kind=excluded.close_kind,
+                             quantity=excluded.quantity,
+                             cost_usdc=excluded.cost_usdc,
+                             proceeds_usdc=excluded.proceeds_usdc,
+                             realized_net_usdc=excluded.realized_net_usdc,
+                             source_json=excluded.source_json
+                           WHERE outcome_realized_pnl_lots.outcome_id<>excluded.outcome_id
+                              OR outcome_realized_pnl_lots.side_index<>excluded.side_index
+                              OR outcome_realized_pnl_lots.close_kind<>excluded.close_kind
+                              OR outcome_realized_pnl_lots.quantity<>excluded.quantity
+                              OR outcome_realized_pnl_lots.cost_usdc<>excluded.cost_usdc
+                              OR outcome_realized_pnl_lots.proceeds_usdc<>excluded.proceeds_usdc
+                              OR outcome_realized_pnl_lots.realized_net_usdc<>excluded.realized_net_usdc""",
+                        (
+                            str(lot["close_trade_id"]), str(lot["open_trade_id"]),
+                            int(lot["outcome_id"]), int(lot["side_index"]), "sell",
+                            str(quantity), str(cost), str(proceeds), str(proceeds - cost),
+                            _json_dumps(lot["source"]), recorded_at,
+                        ),
+                    )
+                    changed += max(0, int(cursor.rowcount))
+                # Delete a stale projection only when both referenced trades
+                # still exist in the immutable source set.  A partial journal
+                # must never erase a canonical lot it cannot independently
+                # reconstruct.
+                stale = {
+                    key for key in existing - expected_keys
+                    if key[0] in authoritative_trade_ids and key[1] in authoritative_trade_ids
+                }
+                for close_trade_id, open_trade_id in stale:
+                    deleted += conn.execute(
+                        """DELETE FROM outcome_realized_pnl_lots
+                           WHERE close_kind='sell' AND close_trade_id=? AND open_trade_id=?""",
+                        (close_trade_id, open_trade_id),
+                    ).rowcount
+                conn.commit()
+            if changed or deleted:
+                self.log_strategy_event(run_id, "OUTCOME_REALIZED_PNL_RECONCILED", {
+                    "venue": "hyperliquid_outcome",
+                    "ordering_rule": ordering_rule,
+                    "expected_sell_lots": len(lots),
+                    "inserted_or_updated": changed,
+                    "removed_stale_sell_lots": deleted,
+                    "immutable_fill_rows_modified": False,
+                })
+            return {"inserted_or_updated": changed, "removed_stale": deleted}
+        except Exception as e:
+            logger.warning(f"TradeJournalDB synchronize_outcome_realized_sell_lots failed: {e}")
+            return {"inserted_or_updated": 0, "removed_stale": 0}
+
     def record_outcome_market_settlement_once(
         self, *, run_id: str, outcome_id: int, winning_side_index: int, settlement_source: str,
         settle_fraction: Decimal, payout_evidence: Dict[str, Any], payload: Dict[str, Any],

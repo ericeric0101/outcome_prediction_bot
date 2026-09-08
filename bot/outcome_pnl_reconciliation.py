@@ -11,6 +11,7 @@ import json
 import sqlite3
 from collections import defaultdict, deque
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Iterable, Mapping
 
@@ -30,6 +31,7 @@ class _Lot:
 @dataclass(frozen=True)
 class _Fill:
     event_id: int
+    timestamp_ms: int | None
     trade_id: str
     outcome_id: int
     side_index: int
@@ -66,15 +68,28 @@ class OutcomePnLReconciler:
                 trade_id = str(payload["trade_id"])
                 if side not in {"BUY", "SELL"} or not trade_id or price is None or qty is None:
                     continue
-                output.append(_Fill(event_id, trade_id, outcome_id, side_index, str(side), _d(qty), _d(price), _d(fee or 0)))
+                timestamp_raw = payload.get("timestamp_ms")
+                timestamp_ms = int(timestamp_raw) if timestamp_raw is not None else None
+                output.append(_Fill(
+                    event_id, timestamp_ms, trade_id, outcome_id, side_index,
+                    str(side), _d(qty), _d(price), _d(fee or 0),
+                ))
             except (KeyError, TypeError, ValueError, ArithmeticError, json.JSONDecodeError):
                 continue
-        return output
+        # ``userFills`` can be returned newest-first during restart recovery.
+        # A local row id is ingestion order, not exchange chronology.
+        return sorted(output, key=lambda fill: (
+            fill.timestamp_ms is None,
+            fill.timestamp_ms if fill.timestamp_ms is not None else fill.event_id,
+            fill.event_id,
+        ))
 
-    def _open_lots(self) -> tuple[dict[tuple[int, int], deque[_Lot]], int]:
+    def _open_lots(
+        self, fills: list[_Fill] | None = None,
+    ) -> tuple[dict[tuple[int, int], deque[_Lot]], list[dict[str, Any]]]:
         books: dict[tuple[int, int], deque[_Lot]] = defaultdict(deque)
-        written = 0
-        for fill in self._fills():
+        allocations: list[dict[str, Any]] = []
+        for fill in self._fills() if fills is None else fills:
             book = books[(fill.outcome_id, fill.side_index)]
             if fill.side == "BUY":
                 book.append(_Lot(fill.trade_id, fill.qty, fill.price, fill.fee))
@@ -87,13 +102,25 @@ class OutcomePnLReconciler:
                 close_fee = sell_fee * matched / remaining
                 cost = opening.price * matched + opening_fee
                 proceeds = fill.price * matched - close_fee
-                if self.journal.record_outcome_realized_pnl_lot(
-                    close_trade_id=fill.trade_id, open_trade_id=opening.trade_id,
-                    outcome_id=fill.outcome_id, side_index=fill.side_index, close_kind="sell",
-                    quantity=matched, cost_usdc=cost, proceeds_usdc=proceeds,
-                    source={"fill_provenance": "hyperliquid_userFills", "close_order_event_id": fill.event_id},
-                ):
-                    written += 1
+                allocations.append({
+                    "close_trade_id": fill.trade_id,
+                    "open_trade_id": opening.trade_id,
+                    "outcome_id": fill.outcome_id,
+                    "side_index": fill.side_index,
+                    "quantity": matched,
+                    "cost_usdc": cost,
+                    "proceeds_usdc": proceeds,
+                    "recorded_at": (
+                        datetime.fromtimestamp(fill.timestamp_ms / 1000, tz=timezone.utc).isoformat()
+                        if fill.timestamp_ms is not None else None
+                    ),
+                    "source": {
+                        "fill_provenance": "hyperliquid_userFills",
+                        "fifo_ordering": "official_timestamp_ms_then_local_event_id",
+                        "close_order_event_id": fill.event_id,
+                        "close_fill_timestamp_ms": fill.timestamp_ms,
+                    },
+                })
                 opening.qty -= matched
                 opening.fee_remaining -= opening_fee
                 remaining -= matched
@@ -102,11 +129,18 @@ class OutcomePnLReconciler:
                     book.popleft()
             # A sell with no local matching buy remains intentionally unmatched:
             # it may be a position opened before this journal started.
-        return books, written
+        return books, allocations
 
     def reconcile_sells(self) -> int:
-        _, written = self._open_lots()
-        return written
+        fills = self._fills()
+        _, allocations = self._open_lots(fills)
+        result = self.journal.synchronize_outcome_realized_sell_lots(
+            run_id=self.run_id,
+            lots=allocations,
+            ordering_rule="official_timestamp_ms_then_local_event_id",
+            authoritative_trade_ids={fill.trade_id for fill in fills},
+        )
+        return result["inserted_or_updated"] + result["removed_stale"]
 
     def unresolved_outcome_ids(self) -> set[int]:
         books, _ = self._open_lots()

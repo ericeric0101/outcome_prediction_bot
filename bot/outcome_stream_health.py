@@ -31,12 +31,14 @@ class OutcomeStreamHealth:
         # This is deliberately only a cheap *keep* hint.  Execution still
         # obtains REST L2 after a plan authorizes cancel/rebook/IOC.
         self.book_top: dict[str, tuple[Decimal, Decimal, float]] = {}
+        self.book_top3_bid_depth: dict[str, tuple[Decimal, float]] = {}
 
     def configure_market(self, market: OutcomeMarketSpec) -> None:
         if self.market_id != market.outcome_id:
             self.market_id, self.coins = market.outcome_id, (market.yes_coin, market.no_coin)
             self.book_received_at = {}
             self.book_top = {}
+            self.book_top3_bid_depth = {}
             self.resync_required = True
 
     def on_lifecycle(self, event: str) -> None:
@@ -60,10 +62,22 @@ class OutcomeStreamHealth:
                     ask = Decimal(str(levels[1][0]["px"]))
                     if Decimal("0") < bid < ask < Decimal("1"):
                         self.book_top[coin] = (bid, ask, observed_at)
+                        try:
+                            depth = Decimal("0")
+                            for level in levels[0][:3]:
+                                raw_size = level.get("sz", level.get("size"))
+                                size = Decimal(str(raw_size))
+                                if size < 0:
+                                    raise ValueError("negative L2 size")
+                                depth += size
+                            self.book_top3_bid_depth[coin] = (depth, observed_at)
+                        except (KeyError, TypeError, ValueError, ArithmeticError):
+                            self.book_top3_bid_depth.pop(coin, None)
                 except (KeyError, IndexError, TypeError, ValueError, ArithmeticError):
                     # Freshness may still be useful even when a malformed
                     # payload cannot provide a BBO keep hint.
                     self.book_top.pop(coin, None)
+                    self.book_top3_bid_depth.pop(coin, None)
 
     def fresh_bbo(self, market: OutcomeMarketSpec, coin: str) -> tuple[Decimal, Decimal] | None:
         """Return a healthy WS BBO only for a no-mutation keep decision."""
@@ -76,6 +90,17 @@ class OutcomeStreamHealth:
         if time.monotonic() - observed_at > self.max_book_age_sec:
             return None
         return bid, ask
+
+    def fresh_book_top(self, market: OutcomeMarketSpec, coin: str) -> dict[str, Decimal | float] | None:
+        """Return a compact, healthy WS top-of-book snapshot for cancel-only risk checks."""
+        bbo = self.fresh_bbo(market, coin)
+        depth_row = self.book_top3_bid_depth.get(coin)
+        if bbo is None or depth_row is None:
+            return None
+        depth, observed_at = depth_row
+        if time.monotonic() - observed_at > self.max_book_age_sec:
+            return None
+        return {"bid": bbo[0], "ask": bbo[1], "top3_bid_depth": depth, "observed_at": observed_at}
 
     def check(self, market: OutcomeMarketSpec, *, now: float | None = None) -> OutcomeStreamHealthStatus:
         self.configure_market(market)

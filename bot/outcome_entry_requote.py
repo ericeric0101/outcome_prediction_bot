@@ -21,6 +21,8 @@ class OutcomeEntryQuotePlannerConfig:
     min_requote_interval_sec: float = 300.0
     min_price_delta_ticks: int = 2
     tick_size: Decimal = Decimal("0.00001")
+    fast_cancel_min_order_age_sec: float = 5.0
+    fast_rebook_cooldown_sec: float = 30.0
 
 
 @dataclass(frozen=True)
@@ -31,6 +33,8 @@ class EntryQuoteInput:
     desired_bid: Decimal | None
     decision_reason: str
     order_age_sec: float | None
+    fast_risk_confirmed: bool = False
+    fast_risk_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -48,6 +52,9 @@ class OutcomeEntryQuotePlanner:
     def plan(self, item: EntryQuoteInput) -> EntryQuotePlan:
         if item.order_age_sec is None or item.order_age_sec < 0:
             return EntryQuotePlan(EntryQuoteAction.BLOCK, "entry_order_age_unavailable")
+        if item.fast_risk_confirmed and item.order_age_sec >= self.config.fast_cancel_min_order_age_sec:
+            reason = item.fast_risk_reason or "unspecified"
+            return EntryQuotePlan(EntryQuoteAction.CANCEL, f"entry_fast_risk_cancel:{reason}")
         if item.order_age_sec < self.config.min_requote_interval_sec:
             return EntryQuotePlan(EntryQuoteAction.KEEP, "entry_requote_interval_not_elapsed")
         if item.desired_side_index not in (0, 1):
@@ -64,6 +71,41 @@ class OutcomeEntryQuotePlanner:
         if abs(item.desired_bid - item.existing_price) < minimum_delta:
             return EntryQuotePlan(EntryQuoteAction.KEEP, "entry_quote_hysteresis")
         return EntryQuotePlan(EntryQuoteAction.CANCEL, "entry_first_level_bid_changed")
+
+
+@dataclass(frozen=True)
+class EntryFastRiskDecision:
+    confirmed: bool
+    reason: str | None
+    observation_count: int
+    duration_sec: float
+
+
+class OutcomeEntryFastRiskTracker:
+    """Confirm a cancel-only risk condition without turning book noise into churn."""
+
+    def __init__(self, *, min_observations: int = 3, min_duration_sec: float = 5.0,
+                 min_sample_interval_sec: float = 2.0) -> None:
+        self.min_observations = max(1, min_observations)
+        self.min_duration_sec = max(0.0, min_duration_sec)
+        self.min_sample_interval_sec = max(0.0, min_sample_interval_sec)
+        self._windows: dict[tuple[int, str], tuple[str, float, float, int]] = {}
+
+    def observe(self, *, key: tuple[int, str], reason: str | None, now: float) -> EntryFastRiskDecision:
+        if reason is None:
+            self._windows.pop(key, None)
+            return EntryFastRiskDecision(False, None, 0, 0.0)
+        previous = self._windows.get(key)
+        if previous is None or previous[0] != reason:
+            first, last, count = now, now, 1
+        else:
+            _, first, last, count = previous
+            if now - last >= self.min_sample_interval_sec:
+                last, count = now, count + 1
+        self._windows[key] = (reason, first, last, count)
+        duration = max(0.0, now - first)
+        confirmed = count >= self.min_observations and duration >= self.min_duration_sec
+        return EntryFastRiskDecision(confirmed, reason, count, duration)
 
 
 class EntryAccountReader(Protocol):

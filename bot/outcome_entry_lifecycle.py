@@ -111,6 +111,45 @@ class OutcomeEntryLifecycleStore:
         except (TypeError, ValueError, sqlite3.Error, json.JSONDecodeError):
             return None
 
+    def submit_audit(self, *, order_id: str, coin: str) -> dict[str, Any] | None:
+        """Return the immutable audited entry context for one owned order."""
+        try:
+            with sqlite3.connect(f"file:{self.journal.db_path}?mode=ro", uri=True) as conn:
+                row = conn.execute(
+                    """SELECT payload_json FROM order_events
+                       WHERE event_type='ORDER_SUBMIT' AND side='BUY'
+                         AND venue_order_id=? AND instrument_id=?
+                       ORDER BY id DESC LIMIT 1""", (str(order_id), coin),
+                ).fetchone()
+            payload = json.loads(row[0] or "{}") if row else {}
+            audit = payload.get("audit") if isinstance(payload, dict) else None
+            return dict(audit) if isinstance(audit, dict) else None
+        except (sqlite3.Error, json.JSONDecodeError, TypeError, ValueError):
+            return None
+
+    def fast_rebook_cooldown_remaining(self, *, wallet: str, outcome_id: int, coin: str,
+                                       cooldown_sec: float, now: float | None = None) -> float:
+        """Persist fast-cancel cooldown semantics across a process restart."""
+        try:
+            with sqlite3.connect(f"file:{self.journal.db_path}?mode=ro", uri=True) as conn:
+                row = conn.execute(
+                    """SELECT ts, payload_json FROM strategy_events
+                       WHERE event_type=?
+                         AND json_extract(payload_json, '$.wallet')=?
+                         AND CAST(json_extract(payload_json, '$.outcome_id') AS INTEGER)=?
+                         AND json_extract(payload_json, '$.coin')=?
+                         AND json_extract(payload_json, '$.state')='CANCELLED'
+                         AND json_extract(payload_json, '$.reason') LIKE 'entry_fast_risk_cancel:%'
+                       ORDER BY id DESC LIMIT 1""",
+                    (self.EVENT, wallet, outcome_id, coin),
+                ).fetchone()
+            if row is None:
+                return 0.0
+            cancelled_at = datetime.fromisoformat(str(row[0])).timestamp()
+            return max(0.0, float(cooldown_sec) - ((now if now is not None else time.time()) - cancelled_at))
+        except (sqlite3.Error, TypeError, ValueError):
+            return 0.0
+
     def recover_or_adopt_audited_submit(
         self, *, wallet: str, outcome_id: int, coin: str, open_orders: list[dict[str, Any]],
     ) -> OutcomeEntryLifecycle | None:

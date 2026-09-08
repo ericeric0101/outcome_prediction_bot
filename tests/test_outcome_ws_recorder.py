@@ -65,6 +65,19 @@ def test_l2_callback_keeps_terminal_pricing_cache_fresh(tmp_path):
     assert pricing.get_best_bid_ask("#11450") == (Decimal("0.60"), Decimal("0.61"))
 
 
+def test_l2_callback_coalesces_an_execution_loop_wakeup(tmp_path):
+    recorder = OutcomeWebSocketRecorder(
+        CallbackClient(), TradeJournalDB(tmp_path / "stream.db"), "stream-run",
+    )
+    assert recorder.wait_for_l2_update(0) is False
+    recorder._on_l2({"channel": "l2Book", "data": {
+        "coin": "#11450", "time": 456,
+        "levels": [[{"px": "0.60", "sz": "10"}], [{"px": "0.61", "sz": "11"}]],
+    }})
+    assert recorder.wait_for_l2_update(0) is True
+    assert recorder.wait_for_l2_update(0) is False
+
+
 def test_all_mids_callback_keeps_btc_mark_cache_fresh(tmp_path):
     pricing = OutcomePricingState(stale_timeout_sec=5)
     recorder = OutcomeWebSocketRecorder(

@@ -25,6 +25,9 @@ class OutcomeWebSocketRecorder:
         self._coins: tuple[str, str] = ("", "")
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
+        # Coalesced execution wake-up.  The callback never trades; it only
+        # shortens the serial main loop's wait after a relevant L2 update.
+        self._l2_update = threading.Event()
         self.resync_required = threading.Event()
         self.health = OutcomeStreamHealth()
         self._registered = False
@@ -75,6 +78,7 @@ class OutcomeWebSocketRecorder:
                     # a malformed display update is rejected.
                     pass
             self.health.on_l2_book(data["coin"], payload=dict(data))
+            self._l2_update.set()
         self._record("OUTCOME_WS_L2_BOOK", payload)
 
     def _on_mids(self, payload: Mapping[str, Any]) -> None:
@@ -123,6 +127,7 @@ class OutcomeWebSocketRecorder:
         self.health.book_received_at = {}
         self.health.resync_required = True
         self._stop.clear()
+        self._l2_update.clear()
         self._register_callbacks()
         self._thread = threading.Thread(target=self._run, daemon=True, name="outcome-shadow-ws")
         self._thread.start()
@@ -176,3 +181,10 @@ class OutcomeWebSocketRecorder:
     def mark_rest_resynced(self) -> None:
         """Permit execution only after caller completed both REST book reads."""
         self.health.mark_rest_resynced()
+
+    def wait_for_l2_update(self, timeout_sec: float) -> bool:
+        """Wake the execution loop early while keeping mutations off the WS thread."""
+        triggered = self._l2_update.wait(max(0.0, timeout_sec))
+        if triggered:
+            self._l2_update.clear()
+        return triggered

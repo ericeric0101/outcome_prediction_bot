@@ -29,3 +29,19 @@ def test_classifier_holds_when_direction_and_book_are_healthy():
         mark_return_bps=Decimal("8"), oi_return_bps=Decimal("4"),
     ))
     assert result.state is OutcomeReversalState.HOLD
+
+
+def test_no_token_bid_decline_is_adverse_and_can_confirm_reversal():
+    result = OutcomeReversalClassifier().classify(_item(
+        side_index=1, fill_vwap=Decimal("0.70"), best_bid=Decimal("0.60"), best_ask=Decimal("0.61"),
+        spot_strike_bps=Decimal("20"), mark_return_bps=Decimal("8"), oi_return_bps=Decimal("4"),
+    ))
+    assert result.state is OutcomeReversalState.REVERSAL_CONFIRMED
+
+
+def test_no_token_bid_gain_is_not_misclassified_as_adverse():
+    result = OutcomeReversalClassifier().classify(_item(
+        side_index=1, fill_vwap=Decimal("0.70"), best_bid=Decimal("0.80"), best_ask=Decimal("0.81"),
+        spot_strike_bps=Decimal("-20"), mark_return_bps=Decimal("-8"), oi_return_bps=Decimal("4"),
+    ))
+    assert result.state is OutcomeReversalState.HOLD

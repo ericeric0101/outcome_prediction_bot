@@ -5,6 +5,7 @@ from bot.lifecycle.outcome_lifecycle import OutcomeMarketSpec
 from bot.outcome_live_execution_runtime import OutcomeLiveExecutionRuntime
 from bot.outcome_stream_health import OutcomeStreamHealth
 from bot.outcome_execution_ledger import OutcomeExecutionLedger
+from bot.outcome_entry_lifecycle import OutcomeEntryLifecycle
 from bot.outcome_exit_lifecycle import OutcomeExitLifecycle, OutcomeExitLifecycleStore
 from bot.outcome_exit_quote_planner import OutcomeExitQuotePlanner, OutcomeExitQuotePlannerConfig
 from bot.outcome_exit_requote_controller import ExitRequoteResult
@@ -101,6 +102,28 @@ def test_runtime_can_cancel_existing_entry_when_ws_is_stale(monkeypatch):
     monkeypatch.setenv("OUTCOME_SDK_EXECUTION_ENABLED", "1")
     runtime = OutcomeLiveExecutionRuntime(account=Account(orders=[{"coin": "#11530", "side": "B", "oid": 7, "sz": "13"}]), wallet="w", gateway=Gateway())
     assert runtime.cancel_resting_buys(market=market()).state == "cancelled"
+
+
+def test_live_entry_fast_risk_requires_persistent_signal_invalidation(monkeypatch, tmp_path):
+    journal = TradeJournalDB(tmp_path / "fast-risk.db")
+    health = healthy_stream()
+    runtime = OutcomeLiveExecutionRuntime(
+        account=CalibrationAccount(), wallet="w", gateway=Gateway(), stream_health=health,
+        ledger=OutcomeExecutionLedger(journal, "run"),
+    )
+    lifecycle = OutcomeEntryLifecycle(
+        "w", market().outcome_id, market().no_coin, "buy-fast", Decimal("0.60"), 0, "BUY_RESTING",
+    )
+    decisions = []
+    for now in (100.0, 102.5, 105.0):
+        monkeypatch.setattr("bot.outcome_live_execution_runtime.time.monotonic", lambda value=now: value)
+        decisions.append(runtime._entry_fast_risk_decision(
+            market=market(), lifecycle=lifecycle, current_side_index=1,
+            desired_side_index=None, decision_reason="directional_confirmation_not_met",
+        ))
+    assert [item[0] for item in decisions] == [False, False, True]
+    assert decisions[-1][1] == "confirmed_signal_invalidation"
+    assert decisions[-1][2]["observation_count"] == 3
 
 
 def test_p3_calibration_requires_its_own_explicit_gate(monkeypatch, tmp_path):

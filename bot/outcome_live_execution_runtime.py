@@ -34,6 +34,7 @@ from bot.outcome_entry_lifecycle import OutcomeEntryLifecycle, OutcomeEntryLifec
 from bot.outcome_entry_requote import (
     EntryQuoteAction,
     EntryQuoteInput,
+    OutcomeEntryFastRiskTracker,
     OutcomeEntryQuotePlanner,
     OutcomeEntryQuotePlannerConfig,
     OutcomeEntryRequoteController,
@@ -65,7 +66,8 @@ class OutcomeLiveExecutionRuntime:
     # Holding-path research is low-frequency evidence, not an execution
     # trigger.  Sampling it every 1.5-second strategy turn used a full REST
     # L2 request even while a managed sell was safely resting.
-    _HOLDING_PATH_MIN_INTERVAL_SEC = 5.0
+    _HOLDING_PATH_MIN_INTERVAL_SEC = 30.0
+    _REVERSAL_RISK_MIN_INTERVAL_SEC = 5.0
 
     def __init__(self, *, account: OutcomeClient, wallet: str, gateway: OutcomeExecutionGateway | None = None, risk_gate: OutcomePreTradeRiskGate | None = None, stream_health: OutcomeStreamHealth | None = None, ledger: OutcomeExecutionLedger | None = None, research_gate: OutcomeResearchGate | None = None, exit_planner: OutcomeExitQuotePlanner | None = None, exit_lifecycle_store: OutcomeExitLifecycleStore | None = None, exit_requote_controller: OutcomeExitRequoteController | None = None, entry_planner: OutcomeEntryQuotePlanner | None = None, entry_lifecycle_store: OutcomeEntryLifecycleStore | None = None, entry_requote_controller: OutcomeEntryRequoteController | None = None) -> None:
         self._account_reads = OutcomeAccountReadCache(account)
@@ -91,6 +93,7 @@ class OutcomeLiveExecutionRuntime:
             if self.exit_lifecycle_store else None
         )
         self.entry_planner = entry_planner or OutcomeEntryQuotePlanner(OutcomeEntryQuotePlannerConfig())
+        self.entry_fast_risk_tracker = OutcomeEntryFastRiskTracker()
         self.entry_lifecycle_store = entry_lifecycle_store or (OutcomeEntryLifecycleStore(ledger.journal, ledger.run_id) if ledger else None)
         self.entry_requote_controller = entry_requote_controller or (
             OutcomeEntryRequoteController(account=self._account_reads, gateway=self.machine.gateway, store=self.entry_lifecycle_store, wallet=wallet)
@@ -120,10 +123,73 @@ class OutcomeLiveExecutionRuntime:
         self._e5_canary_eligible_order_ids: set[str] = set()
         self._tick_books: dict[tuple[int, int], dict[str, object]] = {}
         self._last_holding_path_capture_at: dict[tuple[int, str], float] = {}
+        self._last_reversal_risk_observation_at: dict[tuple[int, str], float] = {}
         # Cache only immutable, exact-fill provenance.  A missing/ambiguous
         # lookup is intentionally retried on a later observation rather than
         # cached as a fabricated lifecycle identity.
         self._holding_entry_provenance: dict[tuple[int, str, str, str], dict[str, object]] = {}
+
+    @staticmethod
+    def _audit_decimal(audit: dict[str, object], name: str) -> Decimal | None:
+        try:
+            value = audit.get(name)
+            return Decimal(str(value)) if value is not None else None
+        except (ArithmeticError, ValueError):
+            return None
+
+    def _entry_fast_risk_decision(
+        self, *, market: OutcomeMarketSpec, lifecycle: OutcomeEntryLifecycle,
+        current_side_index: int, desired_side_index: int | None, decision_reason: str,
+    ) -> tuple[bool, str | None, dict[str, object]]:
+        """Observe strong cancel-only risks; ordinary quote movement stays on the 5m lane."""
+        key = (market.outcome_id, lifecycle.coin)
+        reason: str | None = None
+        evidence: dict[str, object] = {}
+        status = self.stream_health.check(market) if self.stream_health is not None else None
+        if status is None or not status.ready:
+            reason = f"market_data_unhealthy:{status.reason if status is not None else 'not_configured'}"
+        elif desired_side_index in (0, 1) and desired_side_index != current_side_index:
+            reason = "confirmed_side_flip"
+        elif desired_side_index not in (0, 1) and decision_reason in {
+            "directional_confirmation_not_met", "selected_bid_in_no_trade_band",
+        }:
+            reason = "confirmed_signal_invalidation"
+        else:
+            snapshot = self.stream_health.fresh_book_top(market, lifecycle.coin) if self.stream_health else None
+            audit = self.entry_lifecycle_store.submit_audit(
+                order_id=lifecycle.order_id, coin=lifecycle.coin,
+            ) if self.entry_lifecycle_store else None
+            if snapshot is not None:
+                bid = Decimal(str(snapshot["bid"]))
+                depth = Decimal(str(snapshot["top3_bid_depth"]))
+                evidence.update({"ws_bid": str(bid), "ws_ask": str(snapshot["ask"]),
+                                 "ws_top3_bid_depth": str(depth)})
+                drift_bps = max(Decimal("0"), (lifecycle.price - bid) / lifecycle.price * Decimal("10000"))
+                drift_limit = self._audit_decimal(audit or {}, "entry_max_submit_drift_bps") or Decimal("25")
+                evidence.update({"adverse_bid_drift_bps": str(drift_bps), "drift_limit_bps": str(drift_limit)})
+                baseline_depth = self._audit_decimal(audit or {}, "entry_top3_depth_shares")
+                submitted = self._audit_decimal(audit or {}, "entry_submitted_shares")
+                depth_collapsed = bool(
+                    baseline_depth is not None and baseline_depth > 0 and submitted is not None and submitted > 0
+                    and depth < baseline_depth
+                    and depth <= submitted * Decimal("1.25")
+                )
+                if drift_bps >= drift_limit:
+                    reason = "adverse_bid_drift"
+                elif depth_collapsed:
+                    reason = "supporting_bid_depth_collapsed"
+        observed = self.entry_fast_risk_tracker.observe(key=key, reason=reason, now=time.monotonic())
+        evidence.update({
+            "reason": observed.reason, "observation_count": observed.observation_count,
+            "duration_sec": round(observed.duration_sec, 3), "confirmed": observed.confirmed,
+        })
+        if self.ledger is not None and reason is not None:
+            self.ledger.journal.log_strategy_event(self.ledger.run_id, "OUTCOME_ENTRY_FAST_RISK", {
+                "venue": "hyperliquid_outcome", "outcome_id": market.outcome_id,
+                "coin": lifecycle.coin, "order_id": lifecycle.order_id,
+                "execution_submitted": False, **evidence,
+            })
+        return observed.confirmed, observed.reason, evidence
 
     def _continuation_entry_already_submitted(self, *, outcome_id: int) -> bool:
         """One continuation canary submit per daily market, including restarts."""
@@ -499,14 +565,34 @@ class OutcomeLiveExecutionRuntime:
         if lifecycle is None or lifecycle.order_id != str(buy_order_ids[0]):
             return LiveExecutionResult("blocked", "entry requote refuses unrecorded buy ownership", str(buy_order_ids[0]))
         age = None if lifecycle.updated_at_ts is None else max(0.0, time.time() - lifecycle.updated_at_ts)
-        # The five-minute ownership interval is an unconditional KEEP.  Do
-        # not spend a fresh REST L2 request merely to discover a quote that
-        # cannot be cancelled or replaced in this invocation.
+        fast_confirmed, fast_reason, fast_evidence = self._entry_fast_risk_decision(
+            market=market, lifecycle=lifecycle, current_side_index=side_index,
+            desired_side_index=entry_side_index, decision_reason=entry_reason,
+        )
+        # Ordinary quote maintenance retains the five-minute queue-preserving
+        # interval.  Do not spend a fresh REST L2 request for that path.  The
+        # separately confirmed risk path is the only early cancel authority.
         interval_plan = self.entry_planner.plan(EntryQuoteInput(
             current_side_index=side_index, existing_price=lifecycle.price,
             desired_side_index=None, desired_bid=None, decision_reason=entry_reason,
-            order_age_sec=age,
+            order_age_sec=age, fast_risk_confirmed=fast_confirmed,
+            fast_risk_reason=fast_reason,
         ))
+        if interval_plan.action is EntryQuoteAction.CANCEL:
+            result = self.entry_requote_controller.execute_cancel(
+                market=market, side_index=side_index, lifecycle=lifecycle, plan=interval_plan,
+            )
+            if self.ledger:
+                self.ledger.journal.log_order_event(
+                    self.ledger.run_id, "ORDER_CANCEL", venue_order_id=lifecycle.order_id, side="BUY",
+                    status="CANCELLED" if result.state == "cancelled" else "RECONCILE_REQUIRED",
+                    instrument_id=coin, reason=result.detail,
+                    payload={"venue": "hyperliquid_outcome", "outcome_id": market.outcome_id,
+                             "coin": coin, "entry_requote_reason": interval_plan.reason,
+                             "fast_risk": fast_evidence,
+                             "execution_submitted": result.state == "cancelled"},
+                )
+            return LiveExecutionResult(result.state, result.detail, result.old_order_id)
         if interval_plan.action is EntryQuoteAction.KEEP and interval_plan.reason == "entry_requote_interval_not_elapsed":
             return LiveExecutionResult("buy_resting", f"entry requote keep: {interval_plan.reason}", lifecycle.order_id)
         desired_side, desired_bid, decision_reason = entry_side_index, None, entry_reason
@@ -963,7 +1049,82 @@ class OutcomeLiveExecutionRuntime:
         except (TypeError, ValueError, ArithmeticError, sqlite3.Error, json.JSONDecodeError):
             return None
 
-    def _capture_holding_path(self, *, market: OutcomeMarketSpec, finding: object) -> None:
+    def _update_holding_reversal(
+        self, *, market: OutcomeMarketSpec, coin: str, side_index: int,
+        vwap: Decimal, bid: Decimal, ask: Decimal, evidence: dict[str, object], book_source: str,
+    ) -> None:
+        def _decimal(name: str) -> Decimal | None:
+            try:
+                value = evidence.get(name)
+                return Decimal(str(value)) if value is not None else None
+            except (ValueError, ArithmeticError):
+                return None
+
+        spot_bps = _decimal("spot_strike_bps")
+        mark_bps = _decimal("mark_return_bps")
+        oi_bps = _decimal("oi_return_bps")
+        opposite = False
+        if spot_bps is not None and mark_bps is not None and oi_bps is not None:
+            direction = Decimal("1") if side_index == 0 else Decimal("-1")
+            opposite = direction * spot_bps < 0 and direction * mark_bps < 0 and oi_bps > 0
+        key = (market.outcome_id, coin)
+        self._opposite_observation_counts[key] = self._opposite_observation_counts.get(key, 0) + 1 if opposite else 0
+        try:
+            oi_age_ms = int(evidence.get("oi_age_ms"))
+        except (TypeError, ValueError):
+            oi_age_ms = -1
+        context_fresh = 0 <= oi_age_ms <= 90_000
+        decision = self.reversal_classifier.classify(OutcomeReversalInput(
+            side_index, vwap, bid, ask, spot_bps, mark_bps, oi_bps, context_fresh,
+            self._opposite_observation_counts[key],
+        ))
+        now = time.time()
+        if decision.state.value == "REVERSAL_CONFIRMED":
+            first_ts, last_independent_ts, count = self._emergency_reversal_windows.get(key, (now, 0.0, 0))
+            if last_independent_ts <= 0 or now - last_independent_ts >= 60.0:
+                count += 1
+                last_independent_ts = now
+            self._emergency_reversal_windows[key] = (first_ts, last_independent_ts, count)
+        else:
+            self._emergency_reversal_windows.pop(key, None)
+        if self.ledger is not None:
+            self.ledger.journal.log_strategy_event(self.ledger.run_id, "OUTCOME_REVERSAL_SHADOW_DECISION", {
+                "venue": "hyperliquid_outcome", "outcome_id": market.outcome_id, "period": market.period,
+                "coin": coin, "state": decision.state, "reason": decision.reason,
+                "book_source": book_source, "oi_context_fresh": context_fresh,
+                "emergency_independent_observations": self._emergency_reversal_windows.get(key, (0.0, 0.0, 0))[2],
+                "execution_submitted": False,
+            })
+        if decision.state.value == "REVERSAL_CONFIRMED" and self.exit_lifecycle_store is not None:
+            lifecycle = self.exit_lifecycle_store.recover(
+                wallet=self.recovery.wallet, outcome_id=market.outcome_id, coin=coin,
+            )
+            if lifecycle is not None:
+                self.exit_lifecycle_store.record(
+                    lifecycle, reason="reversal_classifier_shadow_confirmed",
+                    extra={"state": "REVERSAL_CONFIRMED"},
+                )
+
+    def _observe_holding_reversal_ws(self, *, market: OutcomeMarketSpec, finding: object) -> bool:
+        """Update the risk classifier from healthy WS BBO without waiting for research REST capture."""
+        if self.stream_health is None:
+            return False
+        coin = str(getattr(finding, "coin", ""))
+        inventory = Decimal(str(getattr(finding, "inventory", "0")))
+        vwap = self.machine._fill_vwap_for_inventory(coin=coin, inventory=inventory)
+        bbo = self.stream_health.fresh_bbo(market, coin)
+        if inventory <= 0 or vwap is None or bbo is None:
+            return False
+        side_index = 0 if coin == market.yes_coin else 1
+        evidence = dict(self._holding_context.get(market.outcome_id, {}))
+        self._update_holding_reversal(
+            market=market, coin=coin, side_index=side_index, vwap=vwap,
+            bid=bbo[0], ask=bbo[1], evidence=evidence, book_source="fresh_ws_bbo",
+        )
+        return True
+
+    def _capture_holding_path(self, *, market: OutcomeMarketSpec, finding: object,
+                              update_reversal: bool = True) -> None:
         """Persist as-of open-inventory facts; never changes an order decision."""
         if self.holding_path_recorder is None or self.ledger is None:
             return
@@ -1004,53 +1165,11 @@ class OutcomeLiveExecutionRuntime:
                 market.time_to_expiry_sec(), "fresh_rest_book", evidence,
                 **provenance,
             ))
-            def _decimal(name: str) -> Decimal | None:
-                try:
-                    value = evidence.get(name)
-                    return Decimal(str(value)) if value is not None else None
-                except (ValueError, ArithmeticError):
-                    return None
-            spot_bps, mark_bps, oi_bps = _decimal("spot_strike_bps"), _decimal("mark_return_bps"), _decimal("oi_return_bps")
-            opposite = False
-            if spot_bps is not None and mark_bps is not None and oi_bps is not None:
-                direction = Decimal("1") if side_index == 0 else Decimal("-1")
-                opposite = direction * spot_bps < 0 and direction * mark_bps < 0 and oi_bps > 0
-            key = (market.outcome_id, coin)
-            self._opposite_observation_counts[key] = self._opposite_observation_counts.get(key, 0) + 1 if opposite else 0
-            try:
-                oi_age_ms = int(evidence.get("oi_age_ms"))
-            except (TypeError, ValueError):
-                oi_age_ms = -1
-            context_fresh = 0 <= oi_age_ms <= 90_000
-            decision = self.reversal_classifier.classify(OutcomeReversalInput(
-                side_index, vwap, bid, ask, spot_bps, mark_bps, oi_bps, context_fresh,
-                self._opposite_observation_counts[key],
-            ))
-            now = time.time()
-            if decision.state.value == "REVERSAL_CONFIRMED":
-                first_ts, last_independent_ts, count = self._emergency_reversal_windows.get(key, (now, 0.0, 0))
-                if last_independent_ts <= 0 or now - last_independent_ts >= 60.0:
-                    count += 1
-                    last_independent_ts = now
-                self._emergency_reversal_windows[key] = (first_ts, last_independent_ts, count)
-            else:
-                self._emergency_reversal_windows.pop(key, None)
-            self.ledger.journal.log_strategy_event(self.ledger.run_id, "OUTCOME_REVERSAL_SHADOW_DECISION", {
-                "venue": "hyperliquid_outcome", "outcome_id": market.outcome_id, "period": market.period,
-                "coin": coin, "state": decision.state, "reason": decision.reason,
-                "oi_context_fresh": context_fresh,
-                "emergency_independent_observations": self._emergency_reversal_windows.get(key, (0.0, 0.0, 0))[2],
-                "execution_submitted": False,
-            })
-            if decision.state.value == "REVERSAL_CONFIRMED" and self.exit_lifecycle_store is not None:
-                lifecycle = self.exit_lifecycle_store.recover(
-                    wallet=self.recovery.wallet, outcome_id=market.outcome_id, coin=coin,
+            if update_reversal:
+                self._update_holding_reversal(
+                    market=market, coin=coin, side_index=side_index, vwap=vwap,
+                    bid=bid, ask=ask, evidence=evidence, book_source="fresh_rest_book",
                 )
-                if lifecycle is not None:
-                    self.exit_lifecycle_store.record(
-                        lifecycle, reason="reversal_classifier_shadow_confirmed",
-                        extra={"state": "REVERSAL_CONFIRMED"},
-                    )
         except (sqlite3.Error, ValueError, TypeError, KeyError, IndexError, json.JSONDecodeError):
             return
 
@@ -1389,8 +1508,15 @@ class OutcomeLiveExecutionRuntime:
                 return filled_entry_cleanup
             holding_key = (market.outcome_id, str(getattr(active[0], "coin", "")))
             now = time.monotonic()
+            reversal_observed = False
+            if now - self._last_reversal_risk_observation_at.get(holding_key, float("-inf")) >= self._REVERSAL_RISK_MIN_INTERVAL_SEC:
+                reversal_observed = self._observe_holding_reversal_ws(market=market, finding=active[0])
+                if reversal_observed:
+                    self._last_reversal_risk_observation_at[holding_key] = now
             if now - self._last_holding_path_capture_at.get(holding_key, float("-inf")) >= self._HOLDING_PATH_MIN_INTERVAL_SEC:
-                self._capture_holding_path(market=market, finding=active[0])
+                self._capture_holding_path(
+                    market=market, finding=active[0], update_reversal=not reversal_observed,
+                )
                 self._last_holding_path_capture_at[holding_key] = now
             # S3 deliberately uses a freshly fetched REST L2 depth walk, not
             # the WebSocket cache.  It may therefore assess an already-held
@@ -1426,6 +1552,17 @@ class OutcomeLiveExecutionRuntime:
             return LiveExecutionResult("flat", f"live strategy no entry: {entry_reason}")
         admission["selected_side_index"] = entry_side_index
         admission["selected_coin"] = self.machine.gateway.outcome_coin(market, entry_side_index)
+        if self.entry_lifecycle_store is not None:
+            cooldown = self.entry_lifecycle_store.fast_rebook_cooldown_remaining(
+                wallet=self.recovery.wallet, outcome_id=market.outcome_id,
+                coin=str(admission["selected_coin"]),
+                cooldown_sec=self.entry_planner.config.fast_rebook_cooldown_sec,
+            )
+            admission["entry_fast_rebook_cooldown_remaining_sec"] = round(cooldown, 3)
+            if cooldown > 0:
+                return LiveExecutionResult(
+                    "flat", f"live strategy no entry: fast_risk_rebook_cooldown ({cooldown:.1f}s remaining)",
+                )
         fees = self.recovery.account.get_user_fees_sync(self.recovery.wallet)
         maker_close_fee = Decimal(str(fees["userSpotAddRate"]))
         book_started_at = time.monotonic()

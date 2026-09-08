@@ -47,7 +47,11 @@ class OutcomeReversalClassifier:
             return OutcomeReversalDecision(OutcomeReversalState.UNKNOWN, "invalid_price_inputs")
         direction = Decimal("1") if item.side_index == 0 else Decimal("-1")
         opposite = direction * item.spot_strike_bps < 0 and direction * item.mark_return_bps < 0 and item.oi_return_bps > 0
-        adverse = direction * (item.best_bid / item.fill_vwap - Decimal("1")) < Decimal("-0.02")
+        # We own the selected Outcome token on both sides.  A decline in that
+        # token's executable bid is adverse regardless of whether the token is
+        # YES or NO; multiplying token PnL by the underlying BTC direction
+        # inverted loss/profit classification for NO inventory.
+        adverse = item.best_bid / item.fill_vwap - Decimal("1") < Decimal("-0.02")
         if opposite and adverse and item.consecutive_opposite_observations >= 3:
             return OutcomeReversalDecision(OutcomeReversalState.REVERSAL_CONFIRMED, "three_asof_opposite_observations")
         if opposite or adverse:

@@ -605,7 +605,13 @@ def run_integrated_hyperliquid_bot(
                 if time.time() - last_slow_loop_warning_at >= 30.0:
                     last_slow_loop_warning_at = time.time()
                     logger.warning(f"[OUTCOME LOOP SLOW] total_ms={timing_payload['total_ms']} stages={loop_stages_ms}")
-            time.sleep(max(0.1, refresh_interval - elapsed))
+            wait_sec = max(0.1, refresh_interval - elapsed)
+            if not simulation and live_ws_recorder is not None:
+                # L2 may wake the next serial decision early.  Account checks,
+                # REST confirmation and every mutation remain on this thread.
+                live_ws_recorder.wait_for_l2_update(wait_sec)
+            else:
+                time.sleep(wait_sec)
 
     except KeyboardInterrupt:
         logger.info("Hyperliquid trading bot stopped by user.")

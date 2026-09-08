@@ -477,6 +477,8 @@ X3 是離線建構，沒有網路或交易呼叫；collector 持續寫入後可�
 
 4. **Live BBO display / S3 verified cost basis（完成；2026-09-01）：** `OutcomeWebSocketRecorder` 現在把每個合法 WS `l2Book` snapshot 同步送入 `OutcomePricingState`，所以 terminal/dashboard BBO cache 由 received WS update 保持新鮮；REST book 仍是任何 entry、replace 或 S3 emergency IOC 前唯一的 execution-time book，display cache 絕不授權下單。`OutcomeMakerStateMachine` 亦新增嚴格 durable fallback：若當下 official `userFills` 暫時無法 FIFO 重建成本，才從 SQLite 已去重、`venue=hyperliquid_outcome`、`actual_fill=true` 的 `ORDER_FILLED` 逐筆 FIFO 重建；只有 journal 剩餘數量**恰好等於** exchange account inventory 才可採用，缺 lot、partial history、價格/side 非法或數量不一致一律維持 `missing_verified_fill_vwap` fail-closed。這修復了已記錄 holding path VWAP、但同 tick S3 因 API fill window 不完整被 block 的資料完整性缺口；不以 `entryNtl` 或 UI PnL 代替成本。S3 的真實 IOC 成交仍未發生，故這是 fallback/path fixture evidence，**不是** S3 主網 execution proof。
 5. **Canonical realized PnL / settlement reconciliation（修正完成；2026-09-05）：** `ORDER_FILLED` 是不可變的 official `userFills` evidence，不能回寫或靠 UI/PnL 補欄位。`bot/outcome_pnl_reconciliation.py` 以同 `(outcome_id, side_index)` 的 FIFO lots 對已賣出 fill 產生 `outcome_realized_pnl_lots`：每個 open/close trade pair 保存數量、進場含 fee 成本、出場扣 fee proceeds、net PnL 與 official source id，並以 `(close_trade_id, open_trade_id)` 去重。`scripts/pnl_reconcile_report.py` 因此改讀 canonical lot table，不再把所有 `realized_net_usdc=null` 的 raw fill 報成 $0。對未平倉／到期庫存，runtime 會先以官方 SDK `fetchSettledOutcome` 取得**二元** `settleFraction`；winning side 還必須有 official account `dir=settlement` payout 覆蓋，losing side 還必須有 official spot clearinghouse 的 zero balance。兩者一致才可寫一次 `MARKET_SETTLEMENT` 與 settlement lots；缺 payout、non-binary fraction、或仍有餘額一律 `pending`，絕不以 BTC 現價、UI、local timer 或猜測 payout 記 PnL。process restart 時，也會從 journal 未結 lot 找回舊 market id 繼續查官方 settlement。此修正**不**自動 claim／redeem／merge，亦不擴張任何 order authority；既有歷史 settlement 因未保存 payout evidence 仍會顯示 pending，不能事後偽造。
+
+   **Historical-fill chronology repair（完成；2026-09-08）：** official `userFills` 在 restart recovery 時可能以 newest-first 批次回傳；`order_events.id` 只是本機寫入次序，不能作為 FIFO 交易時間。reconciler 現以 immutable fill payload 的 official `timestamp_ms` 排序，只有缺少該欄位的 legacy row 才保留本機相對次序。每次 reconcile 會把可重建的 `close_kind='sell'` derived projection 與這份權威 chronology 做 transactionally synchronized repair：補入／更新正確 allocation，且只有 stale allocation 引用的 open/close trade id 都仍存在於 immutable fill set 時才移除，永不修改 `ORDER_FILLED` 或 settlement lots；既有正確 lot 保留原 `recorded_at`，新補 lot 使用 official close time，避免歷史修補污染今日 portfolio guard。修補動作以 `OUTCOME_REALIZED_PNL_RECONCILED` 記錄數量與排序規則。此修正處理了 #1201 BUY/SELL 各自完全相抵、卻因倒序 ingest 被誤判仍有 5 winning shares，導致每 30 秒永久等待不存在 payout 的問題；真正持有至結算的正餘額仍必須通過 official settlement 加 winning payout／losing zero-balance evidence，不會因「總買賣相抵」捷徑被提前結案。
 6. **P3 exact-horizon repair（完成；2026-09-05）：** `bot/outcome_markout.py` 新增 `P3_MARKOUT_SCHEMA_VERSION=2`。現行 5 秒 collector 不再輸出無法證明的 1 秒 observation，只在 5/10/30 秒 target 的 ±2.5 秒內選取**最近且 post-fill** executable quote；超時或無 quote 一律 missing。每個 v2 `FILL_MARKOUT` 有 target horizon/tolerance、quote timestamp、`actual_elapsed_ms`、`target_lag_ms` 與 source snapshot event id。`OutcomeP3Pipeline` 的 dedupe key 含 schema version，所以 v1 不會阻止 v2；`outcome_research_report`、`OutcomeResearchGate` 與 X3 fill overlay 只讀 v2。這修復資料標籤，並不把既有正 cycle PnL 解讀成正短期 markout，也不改變 S0 entry、exit、下單權限或 notional。v2 restart 後從零累積，舊 v1 不能拿來湊樣本數。
 7. **驗證與現況：** 新增 far-later quote rejection、nearest-within-tolerance elapsed/snapshot audit、v2 dedupe/report/X3 schema isolation、以及 malformed v2 timing exclusion fixtures；P3/markout/report/OI/research gate/runtime 定向 tests **42 passed**，完整 Python regression **483 passed**，`compileall` 與 `git diff --check` passed。部署新碼後，正式運行組合仍是：一個 Binance OI collector + 一個 launcher live strategy；不要再啟動 `scripts/outcome_shadow.py`。首次運行後必須確認 health report 的兩個 heartbeat 都在 120 秒內、P2 snapshot timestamp 間隔接近設定的 5 秒且 gap alert 不再每次 capture 增加；並以 `python -m bot.outcome_research_report --db logs/outcome_shadow.db --periods 1d` 確認 P3 僅輸出 v2 5/10/30 秒 buckets，缺 v2 rows 時正確顯示 `no_exact_horizon_v2_actual_maker_markouts`。若仍見持續 gap 或 `pending_*_payout_evidence`，停止把該資料用作 P2/P3／PnL evidence，而非放寬 gate。
 
@@ -581,18 +583,29 @@ X3 是離線建構，沒有網路或交易呼叫；collector 持續寫入後可�
 
 **F5 sizing 與 re-entry 的關係。** 同一 daily market的首次 loss 後，S2-3 仍只給一張 cooldown/reclaim-qualified re-entry token；F5 的 dynamic size 只決定該合格 entry 的安全 shares，不能繞過 S2-3、增加 re-entry 次數或以小單規避 portfolio circuit breaker。所有上限是程式內固定 product policy，目的是降低 `.env` 人工輸入與因操作錯誤改變 live risk 的機會。
 
-**現行持倉／出場決策鏈（2026-09-06，後續研究的 canonical 行為規格）。** 以下描述的是已實作 runtime contract，不是對獲利、成交或止損上限的保證；所有正常 sell 仍為 ALO/post-only，且每次改單均須通過 ownership、cancel-confirm、帳戶庫存 readback、fresh L2、non-crossing 與 journal audit。
+**現行持倉／出場決策鏈（更新 2026-09-08，後續研究的 canonical 行為規格）。** 以下描述的是已實作 runtime contract，不是對獲利、成交或止損上限的保證；所有正常 sell 仍為 ALO/post-only，且每次改單均須通過 ownership、cancel-confirm、帳戶庫存 readback、fresh L2、non-crossing 與 journal audit。
 
 1. **進場與初始保護：** flat 時只有 fresh market data、選邊／Tier-A 或 Tier-B gate、價格／風控 gate 同時成立才送 maker BUY。official fill 與帳戶庫存確認後，先取消仍殘留的 audited entry BUY、確認取消，再於同一輪 fresh book 送 full-inventory reduce-only ALO SELL；絕不等待下一輪才嘗試建立保護單。
 2. **持倉時間的唯一錨點：** holding age 固定以該 inventory 的原始 official BUY fill／persisted entry policy time 計算。任何 ALO sell 的 cancel、replacement、同方向恢復或 target 恢復都**不會**重設 1h／2h 計時；僅 flat 後下一筆新的 BUY 才開始新的 holding clock。
 3. **一般獲利路徑：** entry 後先掛 data-derived、fee-after target（資料足夠時 1%–5%，不足時 3%）。未滿 1h 不因普通價格變動而放寬 target；滿 1h 最多收窄到 +3%，滿 2h 最多收窄到 +2%。此為縮短資金占用的 passive target，不是「價格必須先走到 +2% 才能掛單」；持倉確認後首張 sell 一定會存在。
 4. **普通震盪／同方向恢復：** midpoint 的單一抖動、單一 opposite tick、缺失／stale context、壞 book，均不得授權 loss-band。若先前已達 2h 且曾出現反向壓力、但最新 fresh context 又回到 entry side，loss-band 資格立即撤回，現有 sell 依原始 holding age 回到當下 +2% passive target；計時不重算。60 秒最小重掛間隔與 tick hysteresis 防止每個小 tick cancel/replace。
 5. **兩小時後的被動 loss-band：** 只有同時滿足 (a) holding age ≥2h、(b) fee-inclusive price／midpoint 至少低於 entry VWAP 5%、(c) fresh BBO 與仍可 ALO 的 book、(d) spot、Binance mark 與 OI reversal classifier 連續三次確認 opposite thesis，planner 才可選 -5% passive sell。它仍可能 resting、可能無法成交，因而不是 hard stop；若任一證據失效或同方向恢復，立即不再以 loss-band 定價、回到第 3 點的 +2% target。
-6. **對雜訊的現有邊界：** 三次連續 opposite observation、freshness、BBO gate、-5% threshold、2h age 與 requote hysteresis 已阻擋一次性小抖動直接降價。現行 loss-band 的三次 observation 尚未要求彼此有固定最小時間間隔；因此它不是完整的 duration-based reversal filter。後續研究只能以 `OUTCOME_HOLDING_PATH_OBSERVATION`、`OUTCOME_REVERSAL_SHADOW_DECISION`、replacement submit/fill audit 檢驗是否需要增加獨立時間窗，不能未經證據自行再放寬 loss authority。
+6. **對雜訊的現有邊界：** 三次連續 opposite observation、freshness、BBO gate、-5% threshold、2h age 與 requote hysteresis 已阻擋一次性小抖動直接降價。2026-09-08 起 reversal risk 以 healthy WS BBO 最快每 5 秒取一個 observation；holding-path 研究用 fresh REST capture 維持獨立、較低的 30 秒 cadence，不能因同一輪同時有 WS/REST 而重複加計。這個 5 秒間隔只改善風險辨識，不放寬 -5% loss-band 或 S3；S3 仍另要求第 7 點的 60 秒獨立持續窗口。
 7. **S3 emergency exit（唯一 taker-like 例外）：** 若被動 loss-band 已 resting 至少 20 分鐘仍未成交，且 holding ≥2h、三個彼此至少 60 秒的 persistent reversal observations、fresh full depth、fee-inclusive -8% trigger 與 -12% maximum cap 都成立，才可對已驗證完整庫存送**最多一次** price-protected FAK/IOC SELL。這是為避免長時間反轉時永遠被 ALO 困住的獨立風控，而非正常 take-profit、一般減倉或每次反向都可使用的 taker 權限；未成交、不符合 depth/cap、或任何 evidence 不足時 fail-closed。
 8. **loss 後受限重進、平倉與重啟後：** official fills／account truth 先完成 FIFO reconciliation。managed loss exit 後先固定冷卻 15 分鐘；冷卻後只有一張受限 re-entry token，仍須重新通過當下 S0/Tier、fresh book、risk、fee-after target headroom。相同 side 還必須收復前次 official loss exit bid；不同 side 不自動反手，僅在當下完整新方向訊號成立時才可成為候選。official SDK 接受 resting BUY 後 token 才被消耗，該 daily market 的第二次 re-entry 仍拒絕到 rollover。沒有 loss exit 時，確認 flat 且不存在 managed order即可重新從當下 S0/Tier gate 選邊。重啟 recovery 只接管有 matching durable audit、market/coin、inventory 與 ownership 的 managed order；未知／手動訂單一律不接管。
 
-**研究上的解讀限制。** 「同方向重新成立」代表 current thesis evidence 恢復，並不證明該訊號不是噪音；其現行效果只是撤回被動 -5% loss authority，不會自動加倉或重設時鐘。相反地，S3 使用獨立 60 秒窗口是因為它會取得受限 marketable execution 權限，必須比 ALO loss-band 嚴格得多。任何未來將 loss-band 三次 observation 改為 time-spaced、提高／降低 -5% 門檻、或擴大 S3 權限，都必須先新增 journal evidence 與測試，並在本文件登錄後才可啟用。
+**研究上的解讀限制。** 「同方向重新成立」代表 current thesis evidence 恢復，並不證明該訊號不是噪音；其現行效果只是撤回被動 -5% loss authority，不會自動加倉或重設時鐘。相反地，S3 使用獨立 60 秒窗口是因為它會取得受限 marketable execution 權限，必須比 ALO loss-band 的 5 秒 observation 嚴格得多。任何未來提高／降低 observation duration、-5% 門檻或 S3 權限，都必須先新增 journal evidence 與測試，並在本文件登錄後才可啟用。
+
+**H1 — order-book sensitivity 與快速 cancel-only 風控（完成 2026-09-08）。** 此更新把「看見盤口」與「取得交易權限」分開。`OutcomeWebSocketRecorder` 收到 active Outcome L2 後會以 coalesced event 喚醒 launcher 的下一個 serial decision turn；WS callback 本身永遠不讀帳戶、不簽名、不下單。1.5 秒 timeout 仍存在，因此沒有 L2 時 bot 照常輪詢；已開始的 REST／SDK 呼叫不可被 event 中斷，所有 mutation 仍依 account recovery、ownership 與 official SDK 回應序列化。
+
+未成交 entry BUY 有兩條互斥路徑：
+
+- **正常 queue-preserving lane：** 原本 300 秒最小 requote age、兩 tick hysteresis、fresh REST re-evaluation 與 cancel-confirm-next-tick-rebook 全部保留；普通一兩個 tick 或健康 book 的日常變化不會造成 churn。
+- **快速 risk lane：** 僅在 order age 至少 5 秒後，且相同風險原因有至少 3 個 observation、跨越至少 5 秒才可 cancel-only。可用原因限於 healthy-data 下的 confirmed side flip、confirmed signal invalidation、相對原 entry price 超過 entry audit drift ceiling（缺失時沿用 entry bootstrap 25 bps）的不利 WS bid drift，或 top-3 bid depth 已低於 submit baseline、且剩餘總深度不大於 submitted shares 的既有 1.25 倍 capacity safety multiple。WS disconnected/stale/resync-required 也視為「blind resting exposure」風險，但同樣必須持續確認，且只准撤單、不准在壞資料下重掛。快速取消後相同 market/coin 固定 30 秒不得 rebook；cooldown 由 durable lifecycle journal 恢復，不能靠重啟跳過。下一次 BUY 仍須重新通過完整 signal、fresh WS、fresh REST、capacity/spread/drift、portfolio、ALO 與 single-order gates。
+
+`OutcomeReversalClassifier` 同時修正 NO-side adverse PnL：YES/NO 都是直接持有的 Outcome token，adverse 必須定義為該 token executable bid 相對 fill VWAP 下跌超過 2%，不可再乘 BTC underlying direction。舊公式會把 NO token 下跌誤成有利、上漲誤成 adverse；這是 correctness fix，不是止損門檻放寬。新增 `OUTCOME_ENTRY_FAST_RISK` 保存 compact observation/count/duration/BBO/depth evidence；不新增 `.env` 調參面，也不保存額外完整 raw book。
+
+**H1 verification。** YES/NO adverse 對稱、三次／五秒 fast-risk confirmation、正常 300 秒 lane 不變、durable 30 秒 cooldown、WS top-3 depth、L2 coalesced wake-up 與 live-runtime confirmation integration 均有 regression；完整 Python suite **256 passed**、`compileall`、`git diff --check` 與 official SDK sidecar TypeScript build 均通過。這是 deterministic fixture 驗證；首次 live restart 後仍須以 `OUTCOME_ENTRY_FAST_RISK`、`ORDER_CANCEL.entry_requote_reason`、`OUTCOME_RUNTIME_TIMING` 確認實際 cancel detection、cancel round-trip 與未發生 churn，不能把 unit test 當成成交品質證明。
 
 X2 上線前的 Outcome/P3 fills 只可用於 execution/markout 校準，不能作為 OI alpha 的歷史證明；只有 X2 上線後以正確 event-time 收集的新資料，才能進入 X3 OI 增量研究。X1/X2 僅完成資料與範圍基礎，沒有修改 `OutcomeLiveExecutionRuntime` 的 entry source、模型、P0/P2/P3/P4 gate 或任何下單權限。
 
@@ -765,6 +778,38 @@ child_order_notional <= min(
 4. **100 USDC（總 campaign budget）**：拆成多個約 10–25 USDC 的 child clips；每一 clip 送出前重新計算 book、edge、inventory 與 remaining budget。前一 clip 成交不代表必須補滿 100；任何 gate 惡化即停止。不得一次暴露完整 100 USDC，也不得用同價多單偽裝成拆單。
 
 目前「單一市場一次性進場」不變量仍有效。未來 clipping 只有在新增 durable `entry_campaign_id`、child-order budget ledger、跨 restart reconciliation、總曝險原子 claim 與對應測試後，才可把多個 child orders 視為同一個受控 entry campaign；在此之前，每市場仍只准一張最小 BUY。
+
+#### 未來多錢包中央管理擴量（設計規格；尚未實作／未授權 live）
+
+多錢包擴量的目標可以是「每個錢包最多 20 USDC、五個錢包合計最多 100 USDC」，**不是**把原本 20 USDC 平均除成五筆 4 USDC。必須分開設定 `per_wallet_entry_cap` 與 `global_entry_cap`；中央管理的作用是控制合計風險與盤口參與率，而不是強制平均分配：
+
+```text
+aggregate_authorized_notional = min(
+    global_entry_cap,
+    sum(per_wallet_remaining_cap),
+    global_exposure_remaining,
+    global_daily_turnover_remaining,
+    current_book_safe_notional
+)
+```
+
+例如五個錢包的 `per_wallet_entry_cap=20`、`global_entry_cap=100`：盤口安全容量大於等於 100 時可各下 20；安全容量只有 60 時最多部署三個 20；容量 35 時可配置 20+15；容量 18 時只由一個錢包下不超過 18；容量低於官方 10 USDC opening minimum 時全部不下。allocator 不得為追求錢包數平均而建立 sub-minimum order，也不得在一筆成交後自動補足未使用的 campaign budget。
+
+此架構不允許複製多份 repo、替每份 `.env` 放不同 private key，再以不同 `LIVE_PROCESS_LOCK_PATH` 繞過 single-writer。那種部署會讓每個 process 各自通過 capacity、daily turnover、loss breaker、re-entry token 與 open-order gate，卻沒有人知道合計曝險；同一時間讀取舊 book 的多個 process 還可能各自宣稱同一份 touch capacity。多台機器若共用 NAT/public IP，也不能假設 API/WS 配額彼此獨立。
+
+正式實作必須是單一邏輯 control plane、共享市場資料與分離的 wallet execution workers：
+
+1. **Shared market-data owner：** 每個 Outcome market 只維護一份 WS/REST-resync、Binance mark/OI 與 signal snapshot；wallet workers 不各自重複訂閱並形成資料時間差。
+2. **Key isolation：** coordinator 不在 log、DB 或 IPC 傳送 private key；每個 wallet worker 只載入自己的 key／agent authorization，只接受帶 request id、market、side、price、shares、expiry 與 global reservation id 的窄 execution instruction。
+3. **Atomic global allocator：** submit 前先原子保留 global notional、shares、touch participation 與 exit capacity；成功 resting/fill 後轉為 durable exposure，reject/cancel-confirm 後才釋放。兩個 workers 不得同時使用同一份尚未扣除的安全容量。
+4. **All-controlled-wallet book accounting：** 所有受控錢包已掛的 BUY 都視為本方流動性並從可用 touch/depth 扣除，不能把另一個自有錢包的 order 誤認為外部深度；禁止任何受控錢包彼此成交、自成交或製造獎勵量。
+5. **Global portfolio guard：** 除 per-wallet cap 外，另有跨錢包的單市場 exposure、每日 gross turnover、realized-loss、連續 loss、re-entry、S3 emergency capacity 與 kill switch。五個 20 USDC workers 的最壞風險是 100 USDC correlated exposure，不得因分散地址而按五筆獨立小倉解讀。
+6. **Wallet-aware canonical journal：** order/fill/lifecycle/PnL/settlement/campaign schema 都必須包含 wallet identity；global journal 保存 atomic reservation 與跨 restart reconciliation。任一 worker 狀態未知時停止新增 global exposure，但仍允許該 wallet 的 verified inventory protection。
+7. **Deterministic allocation：** 在 edge、queue 與容量相同時使用可審計的輪替或風險剩餘量分配，不讓所有 wallets 在同價互相競逐；不得用 spoofing、layering、大量撤掛或多地址規避 venue/reward限制。
+
+多錢包不增加方向模型的 alpha，也不提供真正分散：相同 signal 通常會使全部 wallets 同方向、同時遭遇 adverse selection。它的合理價值僅是受控增加 aggregate capital、隔離單一 wallet/key 故障，以及在官方規則允許時分離執行帳戶；所有績效與獎勵評估都必須按**受同一操作者控制的 aggregate portfolio**計算。公開活動條款未明確授權多地址獎勵倍增前，reward 一律以 0 計入 sizing；wash trading、self-trading、操縱或用多地址規避限制均屬禁止事項。
+
+實作順序須為：(M0) wallet-aware schema 與純 allocator fixtures；(M1) 單一 process 連接兩個 test wallets、execution disabled；(M2) 僅一個 worker 可 submit、另一個 shadow 驗證 global reservation；(M3) 兩個 wallets 合計仍維持現行 20 USDC global cap；(M4) 通過 account/order/fill/partial-fill/rollover/settlement/restart/kill-switch 後，才可獨立授權把 global cap 提高至 40，後續再按 F5 evidence 逐階段增加。未完成 M0–M3 前，多錢包 live 與不同 lock-path 並行明確禁止。
 
 為降低可預測性，可以在已通過所有風控 gate 的範圍內使用小幅 size/timing variation，但不得用 spoofing、layering、虛假流動性或大量無意成交的撤掛單。保留 queue priority 與限制 cancel rate 的重要性高於形式上的隨機化。
 
