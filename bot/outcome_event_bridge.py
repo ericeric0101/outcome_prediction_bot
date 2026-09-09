@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from decimal import Decimal
+import json
+import sqlite3
 from typing import Any, Dict, Mapping, Optional
 
 from bot.adapters.outcome_auth import outcome_asset_id
@@ -145,6 +147,50 @@ class OutcomeJournalBridge:
         self.journal = journal
         self.run_id = run_id
 
+    def _execution_origin(self, fill: OutcomeFillEvent) -> dict[str, object]:
+        """Classify a fill only from durable local submit evidence.
+
+        ``userFills`` is authoritative for the fact that a fill happened, but
+        the venue does not identify whether the order was clicked in its UI or
+        sent by this process.  We therefore call a fill ``bot_managed`` only
+        when its exact exchange order id has an earlier local Outcome
+        ``ORDER_SUBMIT`` record.  All other fills remain explicitly
+        ``external_manual_or_unknown`` rather than being guessed as manual.
+        """
+        order_id = str(fill.venue_order_id or "").strip()
+        if not order_id:
+            return {
+                "execution_origin": "external_manual_or_unknown",
+                "execution_origin_evidence": "official_fill_has_no_venue_order_id",
+                "matched_submit_order_event_id": None,
+            }
+        try:
+            with sqlite3.connect(self.journal.db_path) as conn:
+                row = conn.execute(
+                    """
+                    SELECT id FROM order_events
+                    WHERE event_type='ORDER_SUBMIT' AND venue_order_id=?
+                      AND json_extract(payload_json, '$.venue')='hyperliquid_outcome'
+                    ORDER BY id ASC LIMIT 1
+                    """,
+                    (order_id,),
+                ).fetchone()
+        except sqlite3.Error:
+            # A journal read failure must never fabricate ownership.  The
+            # official fill is still persisted, conservatively as external.
+            row = None
+        if row is not None:
+            return {
+                "execution_origin": "bot_managed",
+                "execution_origin_evidence": "matched_prior_local_outcome_order_submit",
+                "matched_submit_order_event_id": int(row[0]),
+            }
+        return {
+            "execution_origin": "external_manual_or_unknown",
+            "execution_origin_evidence": "no_matching_local_outcome_order_submit",
+            "matched_submit_order_event_id": None,
+        }
+
     def record_fill(
         self,
         fill: OutcomeFillEvent,
@@ -164,6 +210,7 @@ class OutcomeJournalBridge:
             "timestamp_ms": fill.timestamp_ms,
             "liquidity_class": "maker" if fill.is_maker else "taker",
             "fee_token": fill.fee_token,
+            **self._execution_origin(fill),
         }
         if extra_payload:
             payload.update(dict(extra_payload))

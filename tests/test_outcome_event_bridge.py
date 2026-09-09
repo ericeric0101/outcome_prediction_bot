@@ -74,5 +74,27 @@ def test_records_fill_and_verified_settlement_in_existing_journal(tmp_path):
     assert order[0] == "SELL"
     assert json.loads(order[1])["asset_id"] == 100011451
     assert json.loads(order[1])["liquidity_class"] == "taker"
+    assert json.loads(order[1])["execution_origin"] == "external_manual_or_unknown"
+    assert json.loads(order[1])["execution_origin_evidence"] == "no_matching_local_outcome_order_submit"
     assert json.loads(settlement[0])["outcome"] == "DOWN"
     assert json.loads(settlement[0])["settlement_source"] == "official_outcome_settlement"
+
+
+def test_fill_origin_is_bot_managed_only_with_matching_outcome_submit(tmp_path):
+    journal = TradeJournalDB(tmp_path / "journal.db")
+    journal.log_order_event(
+        "outcome-run", "ORDER_SUBMIT", venue_order_id="43", side="SELL", status="RESTING",
+        instrument_id="#11451", payload={"venue": "hyperliquid_outcome"},
+    )
+    bridge = OutcomeJournalBridge(journal, "outcome-run")
+    fill = OutcomeFillEvent.from_user_fill(
+        {"coin": "#11451", "oid": 43, "tid": 101, "side": "A", "px": "0.58", "sz": "20", "time": 2}
+    )
+
+    assert bridge.record_fill(fill, market_key="outcome:1145") is True
+    with sqlite3.connect(journal.db_path) as conn:
+        raw = conn.execute("SELECT payload_json FROM order_events WHERE event_type='ORDER_FILLED'").fetchone()[0]
+    payload = json.loads(raw)
+    assert payload["execution_origin"] == "bot_managed"
+    assert payload["execution_origin_evidence"] == "matched_prior_local_outcome_order_submit"
+    assert isinstance(payload["matched_submit_order_event_id"], int)

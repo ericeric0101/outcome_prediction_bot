@@ -15,6 +15,7 @@ def test_lifecycle_report_keeps_one_entry_path_and_labels_recovery(tmp_path):
         oi_evidence={"gate_variants": {"spot_mark": {"eligible": True, "side_index": 1}}},
         entry_lifecycle_id="official_buy:entry-order:entry-trade", entry_order_id="entry-order",
         entry_trade_id="entry-trade", entry_filled_at="2026-09-06T01:00:00+00:00", entry_side_index=1,
+        entry_filled_at_source="official_fill_timestamp_ms",
         entry_tier="tier_b_spot_mark", entry_target_return_pct="0.03", entry_time_left_sec=50000,
     )
     recorder.record(OutcomeHoldingPathObservation(best_bid=Decimal("0.75"), best_ask=Decimal("0.76"), holding_age_sec=100, **base))
@@ -26,6 +27,13 @@ def test_lifecycle_report_keeps_one_entry_path_and_labels_recovery(tmp_path):
         Decimal("0"), 9000, 30000, "fresh", {},
     ))
     with sqlite3.connect(journal.db_path) as conn:
+        observation_ids = [row[0] for row in conn.execute(
+            "SELECT id FROM strategy_events WHERE event_type='OUTCOME_HOLDING_PATH_OBSERVATION' ORDER BY id"
+        )]
+        for event_id, ts in zip(observation_ids[:3], (
+            "2026-09-06T01:01:40+00:00", "2026-09-06T03:01:40+00:00", "2026-09-06T03:13:20+00:00",
+        )):
+            conn.execute("UPDATE strategy_events SET ts=? WHERE id=?", (ts, event_id))
         conn.execute(
             """INSERT INTO outcome_realized_pnl_lots
                (close_trade_id, open_trade_id, outcome_id, side_index, close_kind, quantity, cost_usdc, proceeds_usdc, realized_net_usdc, source_json, recorded_at)
@@ -37,6 +45,7 @@ def test_lifecycle_report_keeps_one_entry_path_and_labels_recovery(tmp_path):
     assert payload["legacy_or_ambiguous_observations_excluded"] == 1
     row = payload["lifecycles"][0]
     assert row["entry_day_type"] == "weekend"
+    assert row["holding_age_basis"] == "official_fill_timestamp_ms"
     assert row["same_side_reconfirmed_after_two_hours"] is True
     assert row["thresholds"]["5%"]["breached_after_two_hours"] is True
     assert row["thresholds"]["10%"]["recovered_to_cost_after_breach"] is True

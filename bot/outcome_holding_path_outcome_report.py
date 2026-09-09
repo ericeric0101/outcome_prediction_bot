@@ -48,6 +48,30 @@ def _same_side_reconfirmed(payload: dict[str, Any]) -> bool:
     return False
 
 
+def _observation_age_sec(ts: str, payload: dict[str, Any]) -> tuple[float | None, str]:
+    """Return an event-time age without trusting the formerly submit-based field.
+
+    v3 rows name the official exchange timestamp explicitly.  Older v2 rows
+    stored a journal fill timestamp in ``entry_filled_at``; it is still far
+    more accurate than their erroneous submit-based ``holding_age_sec``, but
+    is intentionally labelled legacy.  Only malformed historical rows fall
+    back to their recorded age.
+    """
+    source = str(payload.get("entry_filled_at_source") or "legacy_journal_fill_timestamp")
+    try:
+        observed_at = datetime.fromisoformat(str(ts)).timestamp()
+        filled_at = datetime.fromisoformat(str(payload["entry_filled_at"])).timestamp()
+        age = observed_at - filled_at
+        if age >= 0:
+            return age, source
+    except (TypeError, ValueError, KeyError, OSError, OverflowError):
+        pass
+    try:
+        return max(0.0, float(payload["holding_age_sec"])), "legacy_recorded_holding_age"
+    except (TypeError, ValueError, KeyError):
+        return None, "unknown"
+
+
 def _close_results(conn: sqlite3.Connection) -> dict[str, tuple[Decimal, Decimal]]:
     results: dict[str, tuple[Decimal, Decimal]] = {}
     for open_trade_id, cost, pnl in conn.execute(
@@ -92,7 +116,10 @@ def report(db_path: str | Path, *, period: str = "1d") -> dict[str, Any]:
     for lifecycle_id, observations in paths.items():
         observations.sort(key=lambda item: item[0])
         first = observations[0][1]
-        returns = [Decimal(str(item[1]["net_exit_vs_entry_pct"])) for item in observations]
+        timed_observations = [
+            (ts, payload, *_observation_age_sec(ts, payload)) for ts, payload in observations
+        ]
+        returns = [Decimal(str(payload["net_exit_vs_entry_pct"])) for _, payload, _, _ in timed_observations]
         target = None
         try:
             target = Decimal(str(first["entry_target_return_pct"]))
@@ -112,8 +139,8 @@ def report(db_path: str | Path, *, period: str = "1d") -> dict[str, Any]:
         for threshold in _THRESHOLDS:
             breach_indices = [i for i, value in enumerate(returns) if value <= threshold]
             breached = bool(breach_indices)
-            after_breach = observations[breach_indices[0] + 1:] if breached else []
-            later_returns = [Decimal(str(item[1]["net_exit_vs_entry_pct"])) for item in after_breach]
+            after_breach = timed_observations[breach_indices[0] + 1:] if breached else []
+            later_returns = [Decimal(str(payload["net_exit_vs_entry_pct"])) for _, payload, _, _ in after_breach]
             recovered_cost = bool(breached and (any(value >= 0 for value in later_returns) or (final_return is not None and final_return >= 0)))
             reached_target = bool(
                 breached and target is not None
@@ -121,18 +148,20 @@ def report(db_path: str | Path, *, period: str = "1d") -> dict[str, Any]:
             )
             threshold_rows[f"{int(abs(threshold) * 100)}%"] = {
                 "ever_breached": breached,
-                "first_breach_ts": observations[breach_indices[0]][0] if breached else None,
+                "first_breach_ts": timed_observations[breach_indices[0]][0] if breached else None,
+                "first_breach_age_sec": timed_observations[breach_indices[0]][2] if breached else None,
+                "first_breach_age_basis": timed_observations[breach_indices[0]][3] if breached else None,
                 "breached_after_two_hours": any(
-                    Decimal(str(payload["net_exit_vs_entry_pct"])) <= threshold
-                    and float(payload.get("holding_age_sec", 0)) >= _TWO_HOURS_SEC
-                    for _, payload in observations
+                    Decimal(str(payload["net_exit_vs_entry_pct"])) <= threshold and age is not None
+                    and age >= _TWO_HOURS_SEC
+                    for _, payload, age, _ in timed_observations
                 ),
                 "recovered_to_cost_after_breach": recovered_cost,
                 "reached_target_after_breach": reached_target,
             }
         reconfirmed = any(
-            float(payload.get("holding_age_sec", 0)) >= _TWO_HOURS_SEC and _same_side_reconfirmed(payload)
-            for _, payload in observations
+            age is not None and age >= _TWO_HOURS_SEC and _same_side_reconfirmed(payload)
+            for _, payload, age, _ in timed_observations
         )
         if final_return is None:
             final_status = "open_or_unreconciled"
@@ -152,6 +181,10 @@ def report(db_path: str | Path, *, period: str = "1d") -> dict[str, Any]:
             "entry_date_taipei": entry_date, "entry_day_type": day_type,
             "entry_tier": tier, "entry_time_left_bucket": time_bucket,
             "entry_time_left_sec": first.get("entry_time_left_sec"),
+            "holding_age_basis": (
+                next(iter({basis for _, _, _, basis in timed_observations}))
+                if len({basis for _, _, _, basis in timed_observations}) == 1 else "mixed"
+            ),
             "observations": len(observations), "mae_pct": str(min(returns)), "mfe_pct": str(max(returns)),
             "same_side_reconfirmed_after_two_hours": reconfirmed,
             "thresholds": threshold_rows, "final_return_pct": str(final_return) if final_return is not None else None,

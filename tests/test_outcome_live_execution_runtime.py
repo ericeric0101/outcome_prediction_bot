@@ -819,6 +819,45 @@ def test_s3_emergency_exit_requires_durable_loss_band_then_uses_price_protected_
     assert gateway.calls[-1][1]["limit_price"] == Decimal("0.70450")
 
 
+def test_fast_failure_exit_uses_official_fill_age_and_never_waits_for_loss_band(monkeypatch, tmp_path):
+    journal = TradeJournalDB(tmp_path / "fast_failure.db")
+    ledger = OutcomeExecutionLedger(journal, "run")
+    base = time.time() + 300
+
+    class FilledAccount(CalibrationAccount):
+        def __init__(self):
+            super().__init__(balances=[{"coin": "+11530", "total": "13", "entryNtl": "10.4"}], orders=[{"coin": "#11530", "side": "A", "oid": "old-sell", "sz": "13"}])
+        def get_user_fills_sync(self, _): return [{"coin": "#11530", "side": "B", "px": "0.80", "sz": "13", "time": 1}]
+
+    class FastFailureGateway(Gateway):
+        def __init__(self, account): self.account, self.calls = account, []
+        def fetch_order_book(self, **_):
+            return {"timestamp": int(base * 1000), "bids": [{"price": "0.710", "size": "20"}], "asks": [{"price": "0.711", "size": "20"}]}
+        def cancel_owned_order(self, **kwargs): self.calls.append(("cancel", kwargs)); self.account.orders = []; return {}
+        def place_price_protected_ioc_exit(self, **kwargs): self.calls.append(("ioc", kwargs)); return {"orderId": "fast-ioc", "status": "filled"}
+
+    account = FilledAccount()
+    gateway = FastFailureGateway(account)
+    store = OutcomeExitLifecycleStore(journal, "run")
+    store.record(OutcomeExitLifecycle("w", 1153, "#11530", "old-sell", Decimal("13"), Decimal("0.76"), 0, "SELL_RESTING"), reason="fixture")
+    runtime = OutcomeLiveExecutionRuntime(account=account, wallet="w", gateway=gateway, ledger=ledger, exit_lifecycle_store=store)
+    runtime._emergency_reversal_windows[(1153, "#11530")] = (base - 121, base - 1, 3)
+    monkeypatch.setattr(runtime, "_official_holding_age_sec", lambda **_: 120.0)
+    monkeypatch.setattr("bot.outcome_live_execution_runtime.time.time", lambda: base)
+    monkeypatch.setattr("bot.outcome_emergency_exit.time.time", lambda: base)
+    finding = type("Finding", (), {"coin": "#11530", "inventory": Decimal("13"), "sell_order_ids": ("old-sell",)})()
+
+    result = runtime._maybe_fast_failure_exit(market=market(), finding=finding)
+
+    assert result is not None and result.state == "emergency_exit_submitted"
+    assert [name for name, _ in gateway.calls] == ["cancel", "ioc"]
+    with sqlite3.connect(journal.db_path) as conn:
+        payload = json.loads(conn.execute(
+            "SELECT payload_json FROM order_events WHERE event_type='ORDER_SUBMIT'"
+        ).fetchone()[0])
+    assert payload["execution_type"] == "fast_failure_price_protected_fak_ioc"
+
+
 def test_s3_young_protected_holding_skips_fee_and_l2_reads(monkeypatch, tmp_path):
     """Ordinary holdings must not pay S3's expensive reads before eligibility."""
     journal = TradeJournalDB(tmp_path / "s3_fast_skip.db")

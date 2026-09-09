@@ -11,7 +11,7 @@ import os
 import sqlite3
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal, ROUND_FLOOR
 
 from bot.adapters.outcome_client import OutcomeClient
@@ -53,6 +53,7 @@ from bot.outcome_market_regime import (
 from bot.outcome_emergency_exit import (
     EmergencyExitAction,
     OutcomeEmergencyExitController,
+    OutcomeEmergencyExitConfig,
     OutcomeEmergencyExitInput,
     OutcomeEmergencyExitPolicy,
     book_age_sec as emergency_book_age_sec,
@@ -118,6 +119,17 @@ class OutcomeLiveExecutionRuntime:
             OutcomeEmergencyExitController(
                 account=self._account_reads, gateway=self.machine.gateway, store=self.exit_lifecycle_store,
                 wallet=wallet, policy=self.emergency_exit_policy,
+            ) if self.exit_lifecycle_store else None
+        )
+        # Live fast-failure is a narrower, earlier sibling of S3.  It shares
+        # S3's official SDK cancel-confirm-fresh-depth-IOC controller and its
+        # one-shot lifecycle token, but never waits two hours for a passive
+        # loss quote once the entry thesis is persistently invalidated.
+        self.fast_failure_exit_policy = OutcomeEmergencyExitPolicy(OutcomeEmergencyExitConfig.fast_failure())
+        self.fast_failure_exit_controller = (
+            OutcomeEmergencyExitController(
+                account=self._account_reads, gateway=self.machine.gateway, store=self.exit_lifecycle_store,
+                wallet=wallet, policy=self.fast_failure_exit_policy,
             ) if self.exit_lifecycle_store else None
         )
         self._holding_context: dict[int, dict[str, object]] = {}
@@ -1121,7 +1133,7 @@ class OutcomeLiveExecutionRuntime:
                 ).fetchone()
                 if row is None:
                     return None
-                _, filled_at, order_id, price, quantity, fill_raw = row
+                _, journal_filled_at, order_id, price, quantity, fill_raw = row
                 if Decimal(str(quantity)) != inventory or Decimal(str(price)) != fill_vwap:
                     return None
                 entry_row = conn.execute(
@@ -1143,11 +1155,26 @@ class OutcomeLiveExecutionRuntime:
             entry_side_index = int(entry_payload.get("side_index"))
             entry_tier = str(entry_payload.get("entry_tier") or "unknown")
             target_return = entry_payload.get("target_return_pct")
+            # `ts` is when our journal received the fill.  It is not the
+            # holding clock: a resting ALO can wait minutes before it fills.
+            # Use the immutable official exchange fill timestamp when it is
+            # present, retaining the journal timestamp only as labelled
+            # legacy fallback evidence.
+            try:
+                official_timestamp_ms = int(fill_payload.get("timestamp_ms"))
+                if official_timestamp_ms <= 0:
+                    raise ValueError("non-positive official fill timestamp")
+                filled_at = datetime.fromtimestamp(official_timestamp_ms / 1000, tz=timezone.utc).isoformat()
+                filled_at_source = "official_fill_timestamp_ms"
+            except (TypeError, ValueError, OSError, OverflowError):
+                filled_at = str(journal_filled_at)
+                filled_at_source = "legacy_journal_fill_timestamp"
             filled_epoch = datetime.fromisoformat(str(filled_at)).timestamp()
             provenance = {
                 "entry_lifecycle_id": f"official_buy:{order_id}:{trade_id}",
                 "entry_order_id": str(order_id), "entry_trade_id": trade_id,
                 "entry_filled_at": str(filled_at), "entry_side_index": entry_side_index,
+                "entry_filled_at_source": filled_at_source,
                 "entry_tier": entry_tier,
                 "entry_target_return_pct": str(target_return) if target_return is not None else None,
                 "entry_time_left_sec": max(0.0, float(market.expiry_timestamp) - filled_epoch),
@@ -1251,6 +1278,7 @@ class OutcomeLiveExecutionRuntime:
             if not Decimal("0") < bid < ask < Decimal("1"):
                 return
             age = 0.0
+            age_basis = "unavailable"
             evidence: dict[str, object] = dict(self._holding_context.get(market.outcome_id, {}))
             with sqlite3.connect(self.ledger.journal.db_path) as conn:
                 row = conn.execute(
@@ -1261,17 +1289,26 @@ class OutcomeLiveExecutionRuntime:
                     (market.outcome_id, coin),
                 ).fetchone()
             if row:
-                age = max(0.0, time.time() - datetime.fromisoformat(str(row[0])).timestamp())
                 payload = json.loads(row[1])
                 if not evidence:
                     evidence = payload.get("entry_evidence") if isinstance(payload.get("entry_evidence"), dict) else {}
             provenance = self._resolve_holding_entry_provenance(
                 market=market, coin=coin, inventory=inventory, fill_vwap=vwap,
             ) or {}
+            try:
+                age = max(0.0, time.time() - datetime.fromisoformat(str(provenance["entry_filled_at"])).timestamp())
+                age_basis = str(provenance.get("entry_filled_at_source") or "legacy_journal_fill_timestamp")
+            except (KeyError, TypeError, ValueError):
+                # Keep an unbound fallback observation for operational
+                # visibility, but label it so the lifecycle report excludes
+                # it rather than treating submit time as a fill time.
+                if row:
+                    age = max(0.0, time.time() - datetime.fromisoformat(str(row[0])).timestamp())
+                    age_basis = "entry_submit_fallback_unbound"
             self.holding_path_recorder.record(OutcomeHoldingPathObservation(
                 market.outcome_id, market.period, coin, inventory, vwap, bid, ask, fee, age,
                 market.time_to_expiry_sec(), "fresh_rest_book", evidence,
-                **provenance,
+                holding_age_basis=age_basis, **provenance,
             ))
             if update_reversal:
                 self._update_holding_reversal(
@@ -1297,6 +1334,112 @@ class OutcomeLiveExecutionRuntime:
             return max(0.0, time.time() - datetime.fromisoformat(str(row[0])).timestamp()) if row else None
         except (TypeError, ValueError, sqlite3.Error):
             return None
+
+    def _official_holding_age_sec(
+        self, *, market: OutcomeMarketSpec, coin: str, inventory: Decimal, fill_vwap: Decimal | None,
+    ) -> float | None:
+        """Use exact official fill time for an early marketable-exit authority.
+
+        Unlike legacy S3, fast-failure must not be advanced by time spent as a
+        resting BUY.  Missing or ambiguous official provenance is fail-closed.
+        """
+        if fill_vwap is None:
+            return None
+        provenance = self._resolve_holding_entry_provenance(
+            market=market, coin=coin, inventory=inventory, fill_vwap=fill_vwap,
+        )
+        try:
+            if provenance is None or provenance.get("entry_filled_at_source") != "official_fill_timestamp_ms":
+                return None
+            return max(0.0, time.time() - datetime.fromisoformat(str(provenance["entry_filled_at"])).timestamp())
+        except (TypeError, ValueError, KeyError):
+            return None
+
+    def _maybe_fast_failure_exit(self, *, market: OutcomeMarketSpec, finding: object) -> LiveExecutionResult | None:
+        """Execute one bounded price-protected exit after rapid thesis failure.
+
+        It is intentionally independent from the two-hour S2/S3 loss-band:
+        the position must be at least one minute old, down at least 10% net,
+        have three independently spaced reversal confirmations, and have full
+        current L2 depth within the fee-inclusive 15% loss cap.  Any missing
+        fact keeps the existing reduce-only ALO sell untouched.
+        """
+        if (
+            self.ledger is None or self.exit_lifecycle_store is None
+            or self.fast_failure_exit_controller is None
+        ):
+            return None
+        if not tuple(getattr(finding, "sell_order_ids", ())):
+            return None
+        coin = str(getattr(finding, "coin", ""))
+        inventory = Decimal(str(getattr(finding, "inventory", "0")))
+        lifecycle = self.exit_lifecycle_store.recover(
+            wallet=self.recovery.wallet, outcome_id=market.outcome_id, coin=coin,
+        )
+        if lifecycle is None or lifecycle.state == "EMERGENCY_EXIT_SUBMITTED":
+            return None
+        if self.exit_lifecycle_store.emergency_attempted(
+            wallet=self.recovery.wallet, outcome_id=market.outcome_id, coin=coin,
+        ):
+            return None
+        fill_vwap = self.machine._fill_vwap_for_inventory(coin=coin, inventory=inventory)
+        entry_age = self._official_holding_age_sec(
+            market=market, coin=coin, inventory=inventory, fill_vwap=fill_vwap,
+        )
+        window = self._emergency_reversal_windows.get((market.outcome_id, coin), (0.0, 0.0, 0))
+        cfg = self.fast_failure_exit_policy.config
+        # These local gates deliberately occur before the fee/L2 requests.
+        if entry_age is None or entry_age < cfg.min_holding_sec:
+            return None
+        if window[2] < cfg.min_independent_reversal_observations or time.time() - window[0] < cfg.min_reversal_duration_sec:
+            return None
+        side_index = 0 if coin == market.yes_coin else 1
+        try:
+            fees = self.recovery.account.get_user_fees_sync(self.recovery.wallet)
+            taker_fee = Decimal(str(fees["userSpotCrossRate"]))
+            book = self._fresh_book_once(market=market, side_index=side_index)
+            bids = parse_bid_levels(book)
+            book_age = emergency_book_age_sec(book, now_ms=int(time.time() * 1000))
+        except (KeyError, TypeError, ValueError, ArithmeticError):
+            bids, book_age, taker_fee = None, None, None
+        item = OutcomeEmergencyExitInput(
+            inventory=inventory, fill_vwap=fill_vwap, taker_close_fee_rate=taker_fee,
+            bids=bids or (), book_age_sec=book_age, holding_age_sec=entry_age,
+            loss_band_unfilled_sec=None, reversal_independent_observations=window[2],
+            reversal_duration_sec=(time.time() - window[0]) if window[0] > 0 else 0.0,
+            already_attempted=False,
+        )
+        plan = self.fast_failure_exit_policy.plan(item)
+        self.ledger.journal.log_strategy_event(self.ledger.run_id, "OUTCOME_FAST_FAILURE_EXIT_DECISION", {
+            "venue": "hyperliquid_outcome", "outcome_id": market.outcome_id, "period": market.period,
+            "coin": coin, "lifecycle_order_id": lifecycle.order_id, "action": plan.action,
+            "reason": plan.reason, "inventory": str(inventory), "holding_age_sec": item.holding_age_sec,
+            "holding_age_basis": "official_fill_timestamp_ms",
+            "independent_reversal_observations": item.reversal_independent_observations,
+            "reversal_duration_sec": item.reversal_duration_sec, "book_age_sec": item.book_age_sec,
+            "limit_price": str(plan.limit_price) if plan.limit_price is not None else None,
+            "executable_vwap": str(plan.executable_vwap) if plan.executable_vwap is not None else None,
+            "net_return_pct": str(plan.net_return_pct) if plan.net_return_pct is not None else None,
+            "execution_submitted": False,
+        })
+        if plan.action is not EmergencyExitAction.EXECUTE:
+            return None
+        result = self.fast_failure_exit_controller.execute(
+            market=market, side_index=side_index, lifecycle=lifecycle, item=item, plan=plan,
+        )
+        if result.state == "emergency_exit_submitted":
+            self.ledger.journal.log_order_event(
+                self.ledger.run_id, "ORDER_SUBMIT", venue_order_id=result.emergency_order_id,
+                side="SELL", status="IOC_SUBMITTED", instrument_id=coin, reason=result.detail,
+                payload={
+                    "venue": "hyperliquid_outcome", "outcome_id": market.outcome_id, "coin": coin,
+                    "execution_type": "fast_failure_price_protected_fak_ioc", "old_order_id": result.old_order_id,
+                    "limit_price": str(plan.limit_price), "planned_net_return_pct": str(plan.net_return_pct),
+                },
+            )
+            fills = self.recovery.account.get_user_fills_sync(self.recovery.wallet)
+            self.ledger.sync_fills(fills=fills, market_key=f"outcome:{market.outcome_id}", period=market.period)
+        return LiveExecutionResult(result.state, result.detail, result.emergency_order_id or result.old_order_id)
 
     def _maybe_emergency_exit(self, *, market: OutcomeMarketSpec, finding: object) -> LiveExecutionResult | None:
         """Run S3 only after all passive/reversal/depth gates independently pass.
@@ -1634,6 +1777,12 @@ class OutcomeLiveExecutionRuntime:
                     market=market, finding=active[0], update_reversal=not reversal_observed,
                 )
                 self._last_holding_path_capture_at[holding_key] = now
+            # Fast-failure is the early, tightly bounded price-protected lane.
+            # It is evaluated before two-hour S3 but shares the same fresh
+            # REST L2/full-inventory/one-shot guarantees.
+            fast_failure = self._maybe_fast_failure_exit(market=market, finding=active[0])
+            if fast_failure is not None:
+                return fast_failure
             # S3 deliberately uses a freshly fetched REST L2 depth walk, not
             # the WebSocket cache.  It may therefore assess an already-held
             # position even when the stream only blocks *new* entries.

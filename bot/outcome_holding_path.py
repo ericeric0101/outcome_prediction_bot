@@ -34,6 +34,11 @@ class OutcomeHoldingPathObservation:
     entry_order_id: str | None = None
     entry_trade_id: str | None = None
     entry_filled_at: str | None = None
+    # New v3 telemetry records the authoritative source of the lifecycle
+    # clock.  A local journal timestamp is useful fallback evidence, but it
+    # must never masquerade as the exchange's official fill time.
+    entry_filled_at_source: str | None = None
+    holding_age_basis: str | None = None
     entry_side_index: int | None = None
     entry_tier: str | None = None
     entry_target_return_pct: str | None = None
@@ -55,6 +60,8 @@ class OutcomeHoldingPathObservation:
             "entry_order_id": self.entry_order_id,
             "entry_trade_id": self.entry_trade_id,
             "entry_filled_at": self.entry_filled_at,
+            "entry_filled_at_source": self.entry_filled_at_source,
+            "holding_age_basis": self.holding_age_basis,
             "entry_side_index": self.entry_side_index,
             "entry_tier": self.entry_tier,
             "entry_target_return_pct": self.entry_target_return_pct,

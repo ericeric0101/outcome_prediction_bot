@@ -4,6 +4,7 @@ from decimal import Decimal
 from bot.lifecycle.outcome_lifecycle import OutcomeMarketSpec
 from bot.outcome_emergency_exit import (
     EmergencyExitAction,
+    OutcomeEmergencyExitConfig,
     OutcomeEmergencyExitController,
     OutcomeEmergencyExitInput,
     OutcomeEmergencyExitPolicy,
@@ -51,6 +52,17 @@ def test_policy_does_not_take_small_adverse_move_or_repeat_an_attempt():
     policy = OutcomeEmergencyExitPolicy()
     assert policy.plan(item(bids=((Decimal("0.75"), Decimal("20")),))).reason == "emergency_loss_trigger_not_reached"
     assert policy.plan(item(already_attempted=True)).reason == "emergency_exit_already_attempted"
+
+
+def test_fast_failure_policy_is_earlier_but_keeps_full_depth_and_price_cap_guards():
+    policy = OutcomeEmergencyExitPolicy(OutcomeEmergencyExitConfig.fast_failure())
+    allowed = policy.plan(item(bids=((Decimal("0.70"), Decimal("20")),), holding_age_sec=120, loss_band_unfilled_sec=None))
+    assert allowed.action is EmergencyExitAction.EXECUTE
+    assert allowed.reason == "fast_failure_price_protected_emergency_ioc_authorized"
+    assert allowed.net_return_pct is not None and allowed.net_return_pct <= Decimal("-0.10")
+    assert allowed.net_return_pct >= Decimal("-0.15")
+    assert policy.plan(item(holding_age_sec=59, loss_band_unfilled_sec=None)).reason == "minimum_holding_time_not_reached"
+    assert policy.plan(item(bids=((Decimal("0.67"), Decimal("20")),), loss_band_unfilled_sec=None)).reason == "insufficient_full_inventory_depth_at_loss_cap"
 
 
 def test_raw_sdk_book_levels_must_be_positive_and_descending():

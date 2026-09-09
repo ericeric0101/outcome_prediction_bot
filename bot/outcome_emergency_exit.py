@@ -35,6 +35,29 @@ class OutcomeEmergencyExitConfig:
     min_reversal_duration_sec: float = 2 * 60
     max_book_age_sec: float = 15.0
     tick_size: Decimal = Decimal("0.00001")
+    # S3 waits for a passive loss quote.  The separately-authorized
+    # fast-failure lane deliberately does not: it exists for a rapidly
+    # invalidated new holding, before a two-hour passive-loss policy applies.
+    require_passive_loss_band: bool = True
+    policy_name: str = "s3"
+
+    @classmethod
+    def fast_failure(cls) -> "OutcomeEmergencyExitConfig":
+        """Code-owned live guard for a quickly invalidated entry thesis.
+
+        This is not an unrestricted stop market order: the same full-depth,
+        fee-inclusive price cap and one-shot controller contract as S3 apply.
+        """
+        return cls(
+            trigger_loss_pct=Decimal("0.10"),
+            max_net_loss_pct=Decimal("0.15"),
+            min_holding_sec=60.0,
+            min_loss_band_unfilled_sec=0.0,
+            min_independent_reversal_observations=3,
+            min_reversal_duration_sec=2 * 60,
+            require_passive_loss_band=False,
+            policy_name="fast_failure",
+        )
 
 
 @dataclass(frozen=True)
@@ -106,7 +129,9 @@ class OutcomeEmergencyExitPolicy:
             return OutcomeEmergencyExitPlan(EmergencyExitAction.BLOCK, "invalid_taker_close_fee")
         if item.holding_age_sec < cfg.min_holding_sec:
             return OutcomeEmergencyExitPlan(EmergencyExitAction.KEEP, "minimum_holding_time_not_reached")
-        if item.loss_band_unfilled_sec is None or item.loss_band_unfilled_sec < cfg.min_loss_band_unfilled_sec:
+        if cfg.require_passive_loss_band and (
+            item.loss_band_unfilled_sec is None or item.loss_band_unfilled_sec < cfg.min_loss_band_unfilled_sec
+        ):
             return OutcomeEmergencyExitPlan(EmergencyExitAction.KEEP, "passive_loss_band_wait_not_elapsed")
         if item.reversal_independent_observations < cfg.min_independent_reversal_observations:
             return OutcomeEmergencyExitPlan(EmergencyExitAction.KEEP, "independent_reversal_observations_not_met")
@@ -144,7 +169,11 @@ class OutcomeEmergencyExitPolicy:
             # Should be unreachable because every included level is >= limit,
             # but retain this independent defence against arithmetic mistakes.
             return OutcomeEmergencyExitPlan(EmergencyExitAction.BLOCK, "depth_walk_exceeds_net_loss_cap", limit, vwap, net_return, item.inventory)
-        return OutcomeEmergencyExitPlan(EmergencyExitAction.EXECUTE, "s3_price_protected_emergency_ioc_authorized", limit, vwap, net_return, item.inventory)
+        return OutcomeEmergencyExitPlan(
+            EmergencyExitAction.EXECUTE,
+            f"{cfg.policy_name}_price_protected_emergency_ioc_authorized",
+            limit, vwap, net_return, item.inventory,
+        )
 
 
 class EmergencyExitAccountReader(Protocol):
