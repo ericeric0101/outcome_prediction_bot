@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any, Literal, Mapping, Protocol
 
 from bot.lifecycle.outcome_lifecycle import OutcomeMarketSpec
 from bot.outcome_execution_gateway import OutcomeExecutionGateway
+from bot.outcome_order_mutation import cancel_and_confirm
 
 if TYPE_CHECKING:
     from monitoring.trade_journal_db import TradeJournalDB
@@ -201,16 +202,30 @@ class OutcomeMakerStateMachine:
                 )
                 existing_price = Decimal(str(covering.get("limitPx", covering.get("px", "0"))))
                 if loss_triggered and existing_price > loss_floor:
-                    self.gateway.cancel_owned_order(market=market, side_index=side_index, order_id=str(covering["oid"]))
-                    self._invalidate_account_reads()
+                    cancellation = cancel_and_confirm(
+                        account=self.account, gateway=self.gateway, wallet=self.wallet,
+                        market=market, side_index=side_index, order_id=str(covering["oid"]),
+                    )
+                    if not cancellation.confirmed:
+                        return MakerTickResult(
+                            "blocked", f"loss threshold crossed; cancellation requires reconciliation: {cancellation.reason}",
+                            str(covering["oid"]), audit,
+                        )
                     return MakerTickResult("blocked", "loss threshold crossed; cancelled old profit sell for maker-only protection reprice", str(covering["oid"]), audit)
                 return MakerTickResult("sell_resting", "inventory is protected by owned ALO sell", str(covering.get("oid")), audit)
             if buys:
                 # Never add exposure after any fill.  The next tick will see
                 # the cancelled remainder and then post the protective sale.
                 order = buys[0]
-                self.gateway.cancel_owned_order(market=market, side_index=side_index, order_id=str(order["oid"]))
-                self._invalidate_account_reads()
+                cancellation = cancel_and_confirm(
+                    account=self.account, gateway=self.gateway, wallet=self.wallet,
+                    market=market, side_index=side_index, order_id=str(order["oid"]),
+                )
+                if not cancellation.confirmed:
+                    return MakerTickResult(
+                        "blocked", f"partial-fill buy cancellation requires reconciliation: {cancellation.reason}",
+                        str(order["oid"]), audit,
+                    )
                 return MakerTickResult("blocked", "cancelled unfilled buy remainder before protective sell", str(order["oid"]), audit)
             # There is no safe generic fallback sell.  In particular, using
             # current best ask here can realize a loss while the journal calls

@@ -14,7 +14,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Literal, Mapping
+from typing import Any, IO, Literal, Mapping
 
 
 class OutcomeSdkSidecarError(RuntimeError):
@@ -38,6 +38,7 @@ class OutcomeSdkSidecarClient:
         self.sidecar_dir = Path(sidecar_dir).resolve()
         self.request_timeout_sec = request_timeout_sec
         self._process: subprocess.Popen[str] | None = None
+        self._stderr_file: IO[str] | None = None
         self._lock = threading.RLock()
         self.last_request_timing: dict[str, Any] | None = None
 
@@ -54,6 +55,7 @@ class OutcomeSdkSidecarClient:
                 except subprocess.TimeoutExpired:
                     process.kill()
                     process.wait(timeout=2)
+            self._close_stderr()
 
     def __enter__(self) -> "OutcomeSdkSidecarClient":
         return self
@@ -67,11 +69,35 @@ class OutcomeSdkSidecarClient:
             return process
         self._process = subprocess.Popen(
             ["node", str(script)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            # Errors are returned on the JSON-lines protocol.  Do not leave a
-            # stderr pipe unread and let verbose Node diagnostics block trading.
-            stderr=subprocess.DEVNULL, text=True, cwd=self.sidecar_dir, bufsize=1,
+            # Keep diagnostics without risking an unread stderr pipe blocking
+            # Node.  Rotation is intentionally bounded and local.
+            stderr=self._open_rotating_stderr(), text=True, cwd=self.sidecar_dir, bufsize=1,
         )
         return self._process
+
+    def _open_rotating_stderr(self) -> IO[str]:
+        self._close_stderr()
+        path = self.sidecar_dir.parent / "logs" / "outcome_sdk_sidecar.stderr.log"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            if path.exists() and path.stat().st_size >= 2 * 1024 * 1024:
+                previous = path.with_suffix(path.suffix + ".1")
+                previous.unlink(missing_ok=True)
+                path.replace(previous)
+        except OSError:
+            # A diagnostics-rotation issue must not block the execution
+            # transport; append to the current file instead.
+            pass
+        self._stderr_file = path.open("a", encoding="utf-8", buffering=1)
+        return self._stderr_file
+
+    def _close_stderr(self) -> None:
+        stream, self._stderr_file = self._stderr_file, None
+        if stream is not None:
+            try:
+                stream.close()
+            except OSError:
+                pass
 
     def _discard_unhealthy_process(self) -> None:
         process, self._process = self._process, None
@@ -82,6 +108,7 @@ class OutcomeSdkSidecarClient:
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait(timeout=2)
+        self._close_stderr()
 
     def request(
         self,

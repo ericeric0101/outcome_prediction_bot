@@ -14,6 +14,7 @@ from typing import Any, Protocol
 from bot.lifecycle.outcome_lifecycle import OutcomeMarketSpec
 from bot.outcome_exit_lifecycle import OutcomeExitLifecycle, OutcomeExitLifecycleStore
 from bot.outcome_exit_quote_planner import ExitQuoteAction, ExitQuotePlan
+from bot.outcome_order_mutation import cancel_and_confirm
 
 
 class ExitAccountReader(Protocol):
@@ -66,21 +67,14 @@ class OutcomeExitRequoteController:
             if owned is None or owned.order_id != lifecycle.order_id:
                 return ExitRequoteResult("reconcile_required", "owned_sell_not_verified_from_account_truth", lifecycle.order_id)
             self.store.record(lifecycle, reason=plan.reason, extra={"state": "CANCEL_SUBMITTED", "planned_price": str(plan.target_price)})
-            try:
-                self.gateway.cancel_owned_order(market=market, side_index=side_index, order_id=lifecycle.order_id)
-                cancel_timing = getattr(self.gateway, "last_sidecar_timing", None)
-                if isinstance(cancel_timing, dict):
-                    timing["cancel"] = dict(cancel_timing)
-            except Exception as exc:
-                self.store.record(lifecycle, reason=f"cancel_exception:{type(exc).__name__}", extra={"state": "RECONCILE_REQUIRED"})
-                return ExitRequoteResult("reconcile_required", "cancel_request_failed", lifecycle.order_id)
-
-            self._invalidate_account_reads()
-
-            orders_after_cancel = self.account.get_open_orders_sync(self.wallet)
-            if any(str(row.get("oid")) == lifecycle.order_id for row in orders_after_cancel):
-                self.store.record(lifecycle, reason="cancel_not_confirmed", extra={"state": "RECONCILE_REQUIRED"})
-                return ExitRequoteResult("reconcile_required", "old_order_still_open_after_cancel", lifecycle.order_id)
+            cancelled = cancel_and_confirm(account=self.account, gateway=self.gateway, wallet=self.wallet,
+                                           market=market, side_index=side_index, order_id=lifecycle.order_id)
+            cancel_timing = getattr(self.gateway, "last_sidecar_timing", None)
+            if isinstance(cancel_timing, dict):
+                timing["cancel"] = dict(cancel_timing)
+            if not cancelled.confirmed:
+                self.store.record(lifecycle, reason=cancelled.reason, extra={"state": "RECONCILE_REQUIRED"})
+                return ExitRequoteResult("reconcile_required", cancelled.reason, lifecycle.order_id)
             inventory_after_cancel = _inventory(self.account.get_spot_clearinghouse_state_sync(self.wallet), lifecycle.coin)
             if inventory_after_cancel <= 0:
                 self.store.record(lifecycle, reason="inventory_flat_after_cancel", extra={"state": "RECONCILE_REQUIRED"})

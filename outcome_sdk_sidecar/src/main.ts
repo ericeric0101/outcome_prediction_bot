@@ -187,7 +187,14 @@ async function handleCommand(request: Request): Promise<Response> {
   const ownedOrder = openOrders.find((order) => String(order.oid) === payload.orderId);
   if (!ownedOrder || ownedOrder.coin !== payload.outcome) throw new Error("order is not an open order owned by the configured wallet with the requested outcome");
   const result = await hip4.trading.cancelOrder([payload]);
-  return { id: request.id, ok: true, result };
+  const statuses = result.response?.data?.statuses ?? [];
+  const rejection = statuses.find((status) => status !== "success");
+  return result.status === "ok" && statuses.length === 1 && !rejection
+    ? { id: request.id, ok: true, result }
+    : { id: request.id, ok: false, result, error: {
+      code: "CANCEL_REJECTED",
+      message: typeof rejection === "object" ? rejection.error : "Outcome cancel was not explicitly accepted",
+    } };
 }
 
 async function handle(request: Request): Promise<Response> {

@@ -61,9 +61,13 @@ def test_runtime_reduce_only_cancels_owned_buys(monkeypatch):
     monkeypatch.setenv("OUTCOME_AUTOMATED_EXECUTION_ENABLED", "1")
     monkeypatch.setenv("OUTCOME_SDK_EXECUTION_ENABLED", "1")
     calls = []
+    account = Account(orders=[{"coin": "#11530", "side": "B", "oid": 7, "sz": "13"}])
     class CancelGateway(Gateway):
-        def cancel_owned_order(self, **kwargs): calls.append(kwargs); return {}
-    runtime = OutcomeLiveExecutionRuntime(account=Account(orders=[{"coin": "#11530", "side": "B", "oid": 7, "sz": "13"}]), wallet="w", gateway=CancelGateway(), stream_health=healthy_stream())
+        def cancel_owned_order(self, **kwargs):
+            calls.append(kwargs)
+            account.orders = []
+            return {}
+    runtime = OutcomeLiveExecutionRuntime(account=account, wallet="w", gateway=CancelGateway(), stream_health=healthy_stream())
     result = runtime.cancel_resting_buys(market=market())
     assert result.state == "cancelled"
     assert calls[0]["order_id"] == "7"
@@ -102,7 +106,23 @@ def test_runtime_blocks_generic_entry_without_exit_policy_even_without_ws_health
 def test_runtime_can_cancel_existing_entry_when_ws_is_stale(monkeypatch):
     monkeypatch.setenv("OUTCOME_AUTOMATED_EXECUTION_ENABLED", "1")
     monkeypatch.setenv("OUTCOME_SDK_EXECUTION_ENABLED", "1")
-    runtime = OutcomeLiveExecutionRuntime(account=Account(orders=[{"coin": "#11530", "side": "B", "oid": 7, "sz": "13"}]), wallet="w", gateway=Gateway())
+    account = Account(orders=[{"coin": "#11530", "side": "B", "oid": 7, "sz": "13"}])
+    class CancelGateway(Gateway):
+        def cancel_owned_order(self, **kwargs): account.orders = []; return {}
+    runtime = OutcomeLiveExecutionRuntime(account=account, wallet="w", gateway=CancelGateway())
+    assert runtime.cancel_resting_buys(market=market()).state == "cancelled"
+
+
+def test_reduce_only_cancels_partial_fill_remainder_even_when_new_entry_is_unsafe(monkeypatch):
+    monkeypatch.setenv("OUTCOME_AUTOMATED_EXECUTION_ENABLED", "1")
+    monkeypatch.setenv("OUTCOME_SDK_EXECUTION_ENABLED", "1")
+    account = Account(
+        balances=[{"coin": "+11530", "total": "6", "hold": "0"}],
+        orders=[{"coin": "#11530", "side": "B", "oid": 7, "sz": "12"}],
+    )
+    class CancelGateway(Gateway):
+        def cancel_owned_order(self, **kwargs): account.orders = []; return {}
+    runtime = OutcomeLiveExecutionRuntime(account=account, wallet="w", gateway=CancelGateway())
     assert runtime.cancel_resting_buys(market=market()).state == "cancelled"
 
 
@@ -584,6 +604,23 @@ def test_s0_exit_tiers_are_anchored_to_entry_not_replacement(monkeypatch, tmp_pa
     assert runtime._strategy_exit_tier(market=market(), coin="#11530") == (Decimal("0.02"), Decimal("0.05"))
 
 
+def test_s0_exit_tier_never_widens_a_low_dynamic_target(monkeypatch, tmp_path):
+    journal = TradeJournalDB(tmp_path / "low-tier.db")
+    journal.log_strategy_event("run", "OUTCOME_LIVE_STRATEGY_ENTRY_PLACED", {
+        "outcome_id": 1153, "coin": "#11530", "target_return_pct": "0.01",
+        "narrow_after_sec": 10, "narrow_return_pct": "0.03",
+        "floor_after_sec": 20, "floor_return_pct": "0.02",
+        "entry_policy_kind": "s0_oi_spot_mark_confirmation",
+    })
+    runtime = OutcomeLiveExecutionRuntime(account=Account(), wallet="w", gateway=Gateway(), ledger=OutcomeExecutionLedger(journal, "run"))
+    import bot.outcome_live_execution_runtime as runtime_module
+    base = runtime_module.time.time()
+    monkeypatch.setattr(runtime_module.time, "time", lambda: base + 11)
+    assert runtime._strategy_exit_tier(market=market(), coin="#11530") == (Decimal("0.01"), None)
+    monkeypatch.setattr(runtime_module.time, "time", lambda: base + 21)
+    assert runtime._strategy_exit_tier(market=market(), coin="#11530") == (Decimal("0.01"), Decimal("0.05"))
+
+
 def test_s0_initial_protective_sell_keeps_five_percent_target_with_e4_enabled(monkeypatch, tmp_path):
     monkeypatch.setenv("OUTCOME_AUTOMATED_EXECUTION_ENABLED", "1")
     monkeypatch.setenv("OUTCOME_SDK_EXECUTION_ENABLED", "1")
@@ -814,7 +851,7 @@ def test_s3_emergency_exit_requires_durable_loss_band_then_uses_price_protected_
     finding = type("Finding", (), {"coin": "#11530", "inventory": Decimal("13"), "sell_order_ids": ("old-sell",)})()
     result = runtime._maybe_emergency_exit(market=market(), finding=finding)
 
-    assert result is not None and result.state == "emergency_exit_submitted"
+    assert result is not None and result.state == "emergency_exit_residual"
     assert [name for name, _ in gateway.calls] == ["cancel", "ioc"]
     assert gateway.calls[-1][1]["limit_price"] == Decimal("0.70450")
 
@@ -849,7 +886,7 @@ def test_fast_failure_exit_uses_official_fill_age_and_never_waits_for_loss_band(
 
     result = runtime._maybe_fast_failure_exit(market=market(), finding=finding)
 
-    assert result is not None and result.state == "emergency_exit_submitted"
+    assert result is not None and result.state == "emergency_exit_residual"
     assert [name for name, _ in gateway.calls] == ["cancel", "ioc"]
     with sqlite3.connect(journal.db_path) as conn:
         payload = json.loads(conn.execute(
@@ -917,5 +954,5 @@ def test_s3_uses_exact_durable_fill_fallback_when_exchange_history_is_temporaril
 
     result = runtime._maybe_emergency_exit(market=market(), finding=finding)
 
-    assert result is not None and result.state == "emergency_exit_submitted"
+    assert result is not None and result.state == "emergency_exit_residual"
     assert [name for name, _ in gateway.calls] == ["cancel", "ioc"]

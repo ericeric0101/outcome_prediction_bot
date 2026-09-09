@@ -408,6 +408,13 @@ class OutcomeLiveExecutionRuntime:
                         order_id=str(result.order_id), price=Decimal(str(result.audit["entry_bid_at_decision"])),
                         replacement_count=0, state="BUY_RESTING",
                     ), reason="initial_audited_s0_alo_buy")
+                    intent_id = result.audit.get("entry_intent_id")
+                    if intent_id and self.ledger is not None:
+                        self.ledger.journal.log_strategy_event(self.ledger.run_id, "OUTCOME_ORDER_INTENT_ACK", {
+                            "venue": "hyperliquid_outcome", "intent_id": str(intent_id),
+                            "outcome_id": market.outcome_id, "coin": coin,
+                            "order_id": str(result.order_id), "execution_submitted": True,
+                        })
             except (KeyError, ValueError):
                 pass
         return LiveExecutionResult(result.state, result.detail, result.order_id)
@@ -595,9 +602,9 @@ class OutcomeLiveExecutionRuntime:
                 # The loss band is only eligible after the two-hour floor
                 # tier.  It is a fee-inclusive -5% passive quote, never an
                 # immediate stop or a taker instruction.
-                return floor, Decimal("0.05")
+                return min(target, narrow, floor), Decimal("0.05")
             if age >= narrow_after:
-                return narrow, None
+                return min(target, narrow), None
             return target, None
         except (KeyError, TypeError, ValueError, ArithmeticError):
             return None
@@ -1427,7 +1434,7 @@ class OutcomeLiveExecutionRuntime:
         result = self.fast_failure_exit_controller.execute(
             market=market, side_index=side_index, lifecycle=lifecycle, item=item, plan=plan,
         )
-        if result.state == "emergency_exit_submitted":
+        if result.state in {"emergency_exit_submitted", "emergency_exit_flat", "emergency_exit_residual"}:
             self.ledger.journal.log_order_event(
                 self.ledger.run_id, "ORDER_SUBMIT", venue_order_id=result.emergency_order_id,
                 side="SELL", status="IOC_SUBMITTED", instrument_id=coin, reason=result.detail,
@@ -1512,7 +1519,7 @@ class OutcomeLiveExecutionRuntime:
         result = self.emergency_exit_controller.execute(
             market=market, side_index=side_index, lifecycle=lifecycle, item=item, plan=plan,
         )
-        if result.state == "emergency_exit_submitted":
+        if result.state in {"emergency_exit_submitted", "emergency_exit_flat", "emergency_exit_residual"}:
             self.ledger.journal.log_order_event(
                 self.ledger.run_id, "ORDER_SUBMIT", venue_order_id=result.emergency_order_id,
                 side="SELL", status="IOC_SUBMITTED", instrument_id=coin, reason=result.detail,
@@ -1651,7 +1658,8 @@ class OutcomeLiveExecutionRuntime:
     def tick_live_strategy(self, *, market: OutcomeMarketSpec, entry_side_index: int | None,
                            entry_reason: str, entry_evidence: dict[str, object],
                            retiring_markets: tuple[OutcomeMarketSpec, ...] = (),
-                           market_context: dict[str, object] | None = None) -> LiveExecutionResult:
+                           market_context: dict[str, object] | None = None,
+                           reduce_only: bool = False) -> LiveExecutionResult:
         """Run S0 and durably record its final admission or rejection reason."""
         self._begin_tick()
         started_at = time.monotonic()
@@ -1659,9 +1667,10 @@ class OutcomeLiveExecutionRuntime:
         result = self._tick_live_strategy(
             market=market, entry_side_index=entry_side_index, entry_reason=entry_reason,
             entry_evidence=entry_evidence, retiring_markets=retiring_markets,
-            market_context=market_context, admission=admission,
+            market_context=market_context, admission=admission, reduce_only=reduce_only,
         )
         admission["timing_runtime_before_journal_ms"] = round((time.monotonic() - started_at) * 1000, 3)
+        admission["reduce_only"] = reduce_only
         journal_started_at = time.monotonic()
         self._record_entry_admission_decision(
             market=market, entry_side_index=entry_side_index, entry_reason=entry_reason,
@@ -1685,7 +1694,7 @@ class OutcomeLiveExecutionRuntime:
                             entry_reason: str, entry_evidence: dict[str, object],
                             retiring_markets: tuple[OutcomeMarketSpec, ...],
                             market_context: dict[str, object] | None,
-                            admission: dict[str, object]) -> LiveExecutionResult:
+                            admission: dict[str, object], reduce_only: bool = False) -> LiveExecutionResult:
         """Run one explicitly gated S0 live strategy lifecycle.
 
         The caller supplies a pure, already fail-closed OI/spot decision.  The
@@ -1789,17 +1798,18 @@ class OutcomeLiveExecutionRuntime:
             emergency = self._maybe_emergency_exit(market=market, finding=active[0])
             if emergency is not None:
                 return emergency
-            entry_requote = self._maybe_requote_entry_buy(
-                market=market, finding=active[0], entry_side_index=entry_side_index,
-                entry_reason=entry_reason, config=config,
-            )
-            if entry_requote is not None:
-                return entry_requote
+            if not reduce_only:
+                entry_requote = self._maybe_requote_entry_buy(
+                    market=market, finding=active[0], entry_side_index=entry_side_index,
+                    entry_reason=entry_reason, config=config,
+                )
+                if entry_requote is not None:
+                    return entry_requote
         health_error = self._stream_ready(market)
-        if health_error:
+        if health_error and not (reduce_only and active):
             admission["market_data_gate"] = health_error.detail
             return health_error
-        admission["market_data_gate"] = "ws_fresh"
+        admission["market_data_gate"] = "ws_fresh" if health_error is None else "ws_stale_existing_exit_rest_fallback"
         if len(active) == 1:
             requote = self._maybe_requote_p3_exit(market=market, finding=active[0])
             if requote is not None:
@@ -1812,6 +1822,9 @@ class OutcomeLiveExecutionRuntime:
         if active:
             admission["account_gate"] = "existing_outcome_inventory_or_order"
             return LiveExecutionResult("blocked", "live strategy has existing Outcome inventory or order")
+        if reduce_only:
+            admission["reduce_only_gate"] = "new_entries_prohibited"
+            return LiveExecutionResult("flat", "reduce-only: no live exposure after entry cancellation")
         if entry_side_index not in (0, 1):
             admission["signal_gate"] = "no_directional_signal"
             return LiveExecutionResult("flat", f"live strategy no entry: {entry_reason}")
@@ -2036,6 +2049,21 @@ class OutcomeLiveExecutionRuntime:
             ),
             **execution_audit,
         }
+        # Write and synchronously commit the exact intended BUY *before*
+        # asking the venue.  An accepted order can then be recovered after a
+        # crash even if the acknowledgement row below was never reached.
+        intent_id = f"{market.outcome_id}:{entry_audit['entry_policy_kind']}:{int(time.time() * 1000)}"
+        entry_audit["entry_intent_id"] = intent_id
+        intent_event_id = self.ledger.journal.log_durable_order_intent(self.ledger.run_id, {
+            "venue": "hyperliquid_outcome", "wallet": self.recovery.wallet,
+            "intent_id": intent_id, "state": "INTENT_DURABLE",
+            "outcome_id": market.outcome_id, "coin": admission["selected_coin"],
+            "side": "BUY", "price": str(price), "shares": shares,
+            "audit": entry_audit,
+        })
+        if intent_event_id is None:
+            return LiveExecutionResult("blocked", "durable pre-submit entry intent unavailable")
+        entry_audit["entry_intent_event_id"] = intent_event_id
         result = self.machine.tick(
             market=market, side_index=entry_side_index, entry_permitted=True,
             entry_audit=entry_audit, entry_max_submit_price=entry_max_submit_price,
@@ -2088,17 +2116,39 @@ class OutcomeLiveExecutionRuntime:
         market: OutcomeMarketSpec,
         tracked_markets: tuple[OutcomeMarketSpec, ...] = (),
     ) -> LiveExecutionResult:
-        """Reduce-only transition: cancel owned entries, never sell/take."""
+        """Cancel entry BUYs with venue confirmation, even if inventory exists.
+
+        This is a risk-reducing action.  It deliberately does not reuse the
+        ``safe_for_new_entry`` gate: a partial fill is precisely when the
+        remaining BUY must be cancelled most urgently.
+        """
         if not self.enabled():
             return LiveExecutionResult("disabled", "automated execution is disabled")
         report = self.recovery.reconcile((market, *tracked_markets))
-        if not report.safe_for_new_entry:
-            return LiveExecutionResult("blocked", f"account recovery blocked cancellation: {report.reason}")
         cancelled: list[str] = []
         for side_index, coin in enumerate((market.yes_coin, market.no_coin)):
             finding = next(item for item in report.findings if item.market_id == market.outcome_id and item.coin == coin)
             for order_id in finding.buy_order_ids:
-                self.machine.gateway.cancel_owned_order(market=market, side_index=side_index, order_id=order_id)
-                self._account_reads.invalidate()
+                from bot.outcome_order_mutation import cancel_and_confirm
+                mutation = cancel_and_confirm(
+                    account=self._account_reads, gateway=self.machine.gateway, wallet=self.recovery.wallet,
+                    market=market, side_index=side_index, order_id=order_id,
+                )
+                if not mutation.confirmed:
+                    return LiveExecutionResult("reconcile_required", f"reduce-only {mutation.reason}", order_id)
                 cancelled.append(order_id)
         return LiveExecutionResult("cancelled" if cancelled else "flat", "cancelled owned entry buys" if cancelled else "no owned entry buy", cancelled[0] if cancelled else None)
+
+    def tick_reduce_only(
+        self, *, market: OutcomeMarketSpec, entry_reason: str, entry_evidence: dict[str, object],
+        retiring_markets: tuple[OutcomeMarketSpec, ...] = (), market_context: dict[str, object] | None = None,
+    ) -> LiveExecutionResult:
+        """No-new-risk tail: cancel BUYs, then continue the full SELL lifecycle."""
+        cancelled = self.cancel_resting_buys(market=market, tracked_markets=retiring_markets)
+        if cancelled.state == "reconcile_required":
+            return cancelled
+        return self.tick_live_strategy(
+            market=market, entry_side_index=None, entry_reason=entry_reason,
+            entry_evidence=entry_evidence, retiring_markets=retiring_markets,
+            market_context=market_context, reduce_only=True,
+        )

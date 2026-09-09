@@ -88,6 +88,38 @@ def test_entry_store_adopts_only_exact_audited_s0_buy(tmp_path):
     ]) is None
 
 
+def test_entry_store_recovers_exact_durable_pre_submit_intent_after_crash(tmp_path):
+    """Venue-accepted BUYs are recoverable even if ORDER_SUBMIT was never written."""
+    journal = TradeJournalDB(tmp_path / "entry_intent.db")
+    store = OutcomeEntryLifecycleStore(journal, "run")
+    event_id = journal.log_durable_order_intent("run", {
+        "venue": "hyperliquid_outcome", "wallet": "w", "outcome_id": 1356,
+        "coin": "#13561", "state": "INTENT_DURABLE", "shares": "18",
+        "audit": {
+            "entry_policy_schema_version": 1,
+            "entry_policy_kind": "s0_trend_continuation",
+            "entry_bid_at_decision": "0.60",
+        },
+    })
+    assert event_id is not None
+    lifecycle = store.recover_or_adopt_audited_submit(
+        wallet="w", outcome_id=1356, coin="#13561", open_orders=[
+            {"coin": "#13561", "side": "B", "oid": "venue-buy", "limitPx": "0.60", "sz": "18"},
+        ],
+    )
+    assert lifecycle is not None
+    assert lifecycle.order_id == "venue-buy"
+
+    # An arbitrary/manual order cannot consume a prior intent with a different
+    # exact quantity or decision price.
+    other = OutcomeEntryLifecycleStore(TradeJournalDB(tmp_path / "entry_intent_other.db"), "run")
+    assert other.recover_or_adopt_audited_submit(
+        wallet="w", outcome_id=1356, coin="#13561", open_orders=[
+            {"coin": "#13561", "side": "B", "oid": "manual", "limitPx": "0.61", "sz": "18"},
+        ],
+    ) is None
+
+
 def test_fast_cancel_cooldown_is_durable(tmp_path):
     journal = TradeJournalDB(tmp_path / "cooldown.db")
     store = OutcomeEntryLifecycleStore(journal, "run")

@@ -51,8 +51,6 @@ class DashboardState:
     pending_redeem_count: int = 0
     pending_redeem_usdc: float = 0.0
     open_exposure_usdc: float = 0.0
-    bot_paused: bool = False
-    flatten_requested: bool = False
     recent_errors: List[Tuple[datetime, str]] = field(default_factory=list)
     last_heartbeat: datetime = field(default_factory=datetime.utcnow)
     consecutive_losses: int = 0
@@ -102,8 +100,6 @@ class DashboardState:
                 pending_redeem_count=self.pending_redeem_count,
                 pending_redeem_usdc=self.pending_redeem_usdc,
                 open_exposure_usdc=self.open_exposure_usdc,
-                bot_paused=self.bot_paused,
-                flatten_requested=self.flatten_requested,
                 recent_errors=list(self.recent_errors),
                 last_heartbeat=self.last_heartbeat,
                 consecutive_losses=self.consecutive_losses,

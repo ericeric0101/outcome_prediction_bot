@@ -32,6 +32,7 @@ class OutcomeExitLifecycle:
 
 class OutcomeExitLifecycleStore:
     EVENT = "OUTCOME_EXIT_LIFECYCLE"
+    MAX_EMERGENCY_ATTEMPTS = 2
 
     def __init__(self, journal: TradeJournalDB, run_id: str) -> None:
         self.journal, self.run_id = journal, run_id
@@ -92,7 +93,7 @@ class OutcomeExitLifecycleStore:
             if not isinstance(payload, dict) or payload.get("state") not in {
                 "SELL_RESTING", "LOSS_BAND_RESTING", "LOSS_BAND_UNFILLED",
                 "REVERSAL_CONFIRMED", "CANCEL_SUBMITTED", "RECONCILE_REQUIRED",
-                "EMERGENCY_CANCEL_SUBMITTED", "EMERGENCY_EXIT_SUBMITTED",
+                "EMERGENCY_CANCEL_SUBMITTED", "EMERGENCY_EXIT_SUBMITTED", "EMERGENCY_RESIDUAL",
             }:
                 return None
             return OutcomeExitLifecycle(
@@ -125,13 +126,13 @@ class OutcomeExitLifecycleStore:
         except (TypeError, ValueError, sqlite3.Error):
             return None
 
-    def emergency_attempted(self, *, wallet: str, outcome_id: int, coin: str) -> bool:
-        """One emergency IOC per Outcome position lifecycle, including restart."""
+    def emergency_attempt_count(self, *, wallet: str, outcome_id: int, coin: str) -> int:
+        """Return durable accepted IOC attempts; submit is not equivalent to flat."""
         try:
             with sqlite3.connect(self.journal.db_path) as conn:
                 row = conn.execute(
                     """
-                    SELECT 1 FROM strategy_events
+                    SELECT COUNT(*) FROM strategy_events
                     WHERE event_type=?
                       AND json_extract(payload_json, '$.venue')='hyperliquid_outcome'
                       AND json_extract(payload_json, '$.wallet')=?
@@ -141,10 +142,14 @@ class OutcomeExitLifecycleStore:
                     LIMIT 1
                     """, (self.EVENT, wallet, outcome_id, coin),
                 ).fetchone()
-            return row is not None
+            return int(row[0] or 0)
         except sqlite3.Error:
-            # A journal failure must not reopen the one-shot execution budget.
-            return True
+            # A journal failure must not reopen an emergency execution budget.
+            return self.MAX_EMERGENCY_ATTEMPTS
+
+    def emergency_attempted(self, *, wallet: str, outcome_id: int, coin: str) -> bool:
+        """True only after the bounded retry budget is exhausted."""
+        return self.emergency_attempt_count(wallet=wallet, outcome_id=outcome_id, coin=coin) >= self.MAX_EMERGENCY_ATTEMPTS
 
     def reconcile_owned_sell(self, *, wallet: str, outcome_id: int, coin: str, inventory: Decimal,
                               open_orders: list[dict[str, Any]]) -> OutcomeExitLifecycle | None:

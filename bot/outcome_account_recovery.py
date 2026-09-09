@@ -6,6 +6,7 @@ from decimal import Decimal
 from typing import Any, Iterable, Protocol
 
 from bot.lifecycle.outcome_lifecycle import OutcomeMarketSpec
+from bot.outcome_coin import is_outcome_coin, normalize_outcome_coin
 
 
 class AccountSnapshotReader(Protocol):
@@ -47,8 +48,7 @@ class OutcomeAccountRecovery:
         # cannot be mistaken for a flat market after a restart.
         balances: dict[str, Decimal] = {}
         for row in snapshot.get("balances", []):
-            coin = str(row.get("coin"))
-            normalized = "#" + coin[1:] if coin.startswith("+") and coin[1:].isdigit() else coin
+            normalized = normalize_outcome_coin(row.get("coin"))
             balances[normalized] = balances.get(normalized, Decimal("0")) + Decimal(str(row.get("total", "0")))
         return balances
 
@@ -62,8 +62,11 @@ class OutcomeAccountRecovery:
 
         # Relevant positions/orders outside the current selection cannot be
         # safely attributed to this run; do not let a fresh signal overlap it.
-        unknown_coins = {coin for coin, total in balances.items() if coin.startswith("#") and total > 0 and coin not in known_coins}
-        unknown_coins.update(str(order.get("coin")) for order in orders if str(order.get("coin", "")).startswith("#") and order.get("coin") not in known_coins)
+        unknown_coins = {coin for coin, total in balances.items() if is_outcome_coin(coin) and total > 0 and coin not in known_coins}
+        unknown_coins.update(
+            normalize_outcome_coin(order.get("coin")) for order in orders
+            if is_outcome_coin(order.get("coin")) and normalize_outcome_coin(order.get("coin")) not in known_coins
+        )
         if unknown_coins:
             unsafe.append(f"unmanaged Outcome exposure: {', '.join(sorted(unknown_coins))}")
 

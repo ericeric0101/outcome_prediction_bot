@@ -8,6 +8,7 @@ from typing import Any, Protocol
 
 from bot.lifecycle.outcome_lifecycle import OutcomeMarketSpec
 from bot.outcome_entry_lifecycle import OutcomeEntryLifecycle, OutcomeEntryLifecycleStore
+from bot.outcome_order_mutation import cancel_and_confirm
 
 
 class EntryQuoteAction(StrEnum):
@@ -159,16 +160,11 @@ class OutcomeEntryRequoteController:
                 self.store.record(lifecycle, reason="inventory_present_before_entry_cancel", extra={"state": "RECONCILE_REQUIRED"})
                 return EntryRequoteResult("reconcile_required", "inventory_present_before_entry_cancel", lifecycle.order_id)
             self.store.record(lifecycle, reason=plan.reason, extra={"state": "CANCEL_SUBMITTED"})
-            try:
-                self.gateway.cancel_owned_order(market=market, side_index=side_index, order_id=lifecycle.order_id)
-            except Exception as exc:
-                self.store.record(lifecycle, reason=f"entry_cancel_exception:{type(exc).__name__}", extra={"state": "RECONCILE_REQUIRED"})
-                return EntryRequoteResult("reconcile_required", "entry_cancel_request_failed", lifecycle.order_id)
-            self._invalidate_account_reads()
-            after_orders = self.account.get_open_orders_sync(self.wallet)
-            if any(str(row.get("oid")) == lifecycle.order_id for row in after_orders):
-                self.store.record(lifecycle, reason="entry_cancel_not_confirmed", extra={"state": "RECONCILE_REQUIRED"})
-                return EntryRequoteResult("reconcile_required", "old_entry_still_open_after_cancel", lifecycle.order_id)
+            cancelled = cancel_and_confirm(account=self.account, gateway=self.gateway, wallet=self.wallet,
+                                           market=market, side_index=side_index, order_id=lifecycle.order_id)
+            if not cancelled.confirmed:
+                self.store.record(lifecycle, reason=f"entry_{cancelled.reason}", extra={"state": "RECONCILE_REQUIRED"})
+                return EntryRequoteResult("reconcile_required", cancelled.reason, lifecycle.order_id)
             if _inventory(self.account.get_spot_clearinghouse_state_sync(self.wallet), lifecycle.coin) != 0:
                 self.store.record(lifecycle, reason="entry_fill_or_inventory_change_during_cancel", extra={"state": "RECONCILE_REQUIRED"})
                 return EntryRequoteResult("reconcile_required", "entry_inventory_changed_during_cancel", lifecycle.order_id)
@@ -202,16 +198,11 @@ class OutcomeEntryRequoteController:
             if _inventory(self.account.get_spot_clearinghouse_state_sync(self.wallet), lifecycle.coin) <= 0:
                 return EntryRequoteResult("reconcile_required", "filled_entry_inventory_not_present", lifecycle.order_id)
             self.store.record(lifecycle, reason="filled_entry_cancel_before_protective_exit", extra={"state": "CANCEL_SUBMITTED"})
-            try:
-                self.gateway.cancel_owned_order(market=market, side_index=side_index, order_id=lifecycle.order_id)
-            except Exception as exc:
-                self.store.record(lifecycle, reason=f"filled_entry_cancel_exception:{type(exc).__name__}", extra={"state": "RECONCILE_REQUIRED"})
-                return EntryRequoteResult("reconcile_required", "filled_entry_cancel_request_failed", lifecycle.order_id)
-            self._invalidate_account_reads()
-            after_orders = self.account.get_open_orders_sync(self.wallet)
-            if any(str(row.get("oid")) == lifecycle.order_id for row in after_orders):
-                self.store.record(lifecycle, reason="filled_entry_cancel_not_confirmed", extra={"state": "RECONCILE_REQUIRED"})
-                return EntryRequoteResult("reconcile_required", "filled_entry_still_open_after_cancel", lifecycle.order_id)
+            cancelled = cancel_and_confirm(account=self.account, gateway=self.gateway, wallet=self.wallet,
+                                           market=market, side_index=side_index, order_id=lifecycle.order_id)
+            if not cancelled.confirmed:
+                self.store.record(lifecycle, reason=f"filled_entry_{cancelled.reason}", extra={"state": "RECONCILE_REQUIRED"})
+                return EntryRequoteResult("reconcile_required", cancelled.reason, lifecycle.order_id)
             remaining_inventory = _inventory(self.account.get_spot_clearinghouse_state_sync(self.wallet), lifecycle.coin)
             if remaining_inventory <= 0:
                 self.store.record(lifecycle, reason="filled_entry_cancelled_inventory_now_flat", extra={"state": "CANCELLED"})

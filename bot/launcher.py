@@ -98,6 +98,7 @@ def run_hyperliquid_preflight_checks(simulation: bool) -> bool:
     client = OutcomeClient(auth)
     logger.info(f"Hyperliquid auth: wallet={auth.wallet_address} agent={auth.agent_address} is_testnet={auth.is_testnet}")
 
+    feeds_verified = False
     try:
         meta = client.get_outcome_meta_sync()
         preferences, allow_fallback = resolve_daily_outcome_scope(os.environ)
@@ -117,10 +118,26 @@ def run_hyperliquid_preflight_checks(simulation: bool) -> bool:
             all_mids = client.get_all_mids_sync()
             btc_mark = all_mids.get("BTC", "N/A")
             logger.info(f"Live Market Feeds Verified -> BTC Mark: ${btc_mark} | YES ({selected.yes_coin}) Bid: {best_bid_yes}, Ask: {best_ask_yes} | Levels: {len(bids_yes)}/{len(asks_yes)}")
+            feeds_verified = bool(bids_yes and asks_yes and btc_mark != "N/A")
         else:
             logger.warning("No active Outcome BTC market right now (waiting for upcoming)")
     except Exception as e:
         logger.warning(f"Live Outcome API check note: {e}")
+
+    if not simulation:
+        if not feeds_verified:
+            logger.error("HYPERLIQUID PREFLIGHT FAILED: live market feeds were not verified")
+            return False
+        try:
+            from bot.outcome_sdk_sidecar import OutcomeSdkSidecarClient
+            sidecar = OutcomeSdkSidecarClient(REPO_ROOT / "outcome_sdk_sidecar", request_timeout_sec=5.0)
+            try:
+                sidecar.request("health")
+            finally:
+                sidecar.close()
+        except Exception as exc:
+            logger.error(f"HYPERLIQUID PREFLIGHT FAILED: official SDK sidecar unavailable: {exc}")
+            return False
 
     mode_text = "SIMULATION" if simulation else "LIVE TRADING"
     logger.info(f"Hyperliquid preflight mode target: {mode_text}")
@@ -497,11 +514,28 @@ def run_integrated_hyperliquid_bot(
                         logger.info("[SIMULATION] Cancelled active entry order in REDUCE_ONLY phase.")
                 else:
                     try:
-                        # Account truth, not the process-local order id, owns
-                        # the daily one-hour reduce-only cancellation.
-                        result = live_execution.cancel_resting_buys(
-                            market=market, tracked_markets=retiring_markets,
-                        )
+                        # REDUCE_ONLY means no new risk, not no position
+                        # management.  It cancels all entry BUY exposure then
+                        # retains protective SELL, passive-loss and bounded
+                        # emergency lifecycle management through expiry.
+                        if live_strategy_gate is not None:
+                            decision = live_strategy_gate.evaluate(
+                                spot_price=Decimal(str(spot_px)) if spot_px > 0 else None,
+                                strike_price=Decimal(str(strike_px)) if strike_px > 0 else None,
+                            )
+                            result = live_execution.tick_reduce_only(
+                                market=market, entry_reason=decision.reason,
+                                entry_evidence=decision.evidence, retiring_markets=retiring_markets,
+                                market_context={
+                                    **decision.evidence, "spot_price": str(spot_px), "strike_price": str(strike_px),
+                                    "yes_best_bid": best_bid_yes, "yes_best_ask": best_ask_yes,
+                                    "no_best_bid": best_bid_no, "no_best_ask": best_ask_no,
+                                },
+                            )
+                        else:
+                            result = live_execution.cancel_resting_buys(
+                                market=market, tracked_markets=retiring_markets,
+                            )
                         logger.info(f"[LIVE OUTCOME REDUCE_ONLY] state={result.state} detail={result.detail}")
                         active_order_id = None
                     except Exception as e:
@@ -616,6 +650,21 @@ def run_integrated_hyperliquid_bot(
     except KeyboardInterrupt:
         logger.info("Hyperliquid trading bot stopped by user.")
     finally:
+        # A process exit must never leave a bot-owned entry BUY live.  This
+        # runs before workers are stopped, uses account truth plus
+        # cancel-confirm, and deliberately leaves every protective SELL
+        # untouched so existing inventory remains covered while offline.
+        if not simulation and current_market is not None:
+            try:
+                result = live_execution.cancel_resting_buys(
+                    market=current_market, tracked_markets=tuple(rollover.retiring_markets),
+                )
+                logger.info(
+                    f"[OUTCOME SHUTDOWN] entry-buy cancellation state={result.state} "
+                    f"detail={result.detail} order={result.order_id}"
+                )
+            except Exception as exc:
+                logger.error(f"[OUTCOME SHUTDOWN] entry-buy cancellation reconciliation failed: {exc}")
         if research_worker is not None:
             research_worker.stop()
         if settlement_worker is not None:

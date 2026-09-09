@@ -5,6 +5,8 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any, Iterable
 
+from bot.outcome_coin import is_outcome_coin
+
 
 @dataclass(frozen=True)
 class OutcomeRiskLimits:
@@ -45,7 +47,7 @@ class OutcomePreTradeRiskGate:
         )
         # Outcome shares settle to at most one quote unit, so valuing each
         # outstanding share at $1 is deliberately conservative.
-        exposure = sum(self._decimal(row, "total") for row in balance_rows if str(row.get("coin", "")).startswith("#"))
+        exposure = sum(self._decimal(row, "total") for row in balance_rows if is_outcome_coin(row.get("coin")))
         if entry <= 0:
             return OutcomeRiskDecision(False, "non_positive_entry_notional", entry, available, exposure)
         if entry > self.limits.max_entry_notional_usdc:

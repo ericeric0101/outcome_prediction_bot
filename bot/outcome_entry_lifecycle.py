@@ -180,10 +180,32 @@ class OutcomeEntryLifecycleStore:
                 ).fetchone()
             payload = json.loads(row[0] or "{}") if row else {}
             audit = payload.get("audit") if isinstance(payload, dict) else None
-            if not isinstance(audit, dict) or audit.get("entry_policy_schema_version") != 1:
+            if not isinstance(audit, dict):
+                # Crash-window recovery: exactly one open BUY may be adopted
+                # only when an fsync'd, matching pre-submit intent exists.
+                with sqlite3.connect(self.journal.db_path) as intent_conn:
+                    intent_row = intent_conn.execute(
+                        """SELECT payload_json FROM strategy_events
+                           WHERE event_type='OUTCOME_ORDER_INTENT'
+                             AND json_extract(payload_json, '$.venue')='hyperliquid_outcome'
+                             AND json_extract(payload_json, '$.wallet')=?
+                             AND CAST(json_extract(payload_json, '$.outcome_id') AS INTEGER)=?
+                             AND json_extract(payload_json, '$.coin')=?
+                             AND json_extract(payload_json, '$.state')='INTENT_DURABLE'
+                           ORDER BY id DESC LIMIT 1""", (wallet, outcome_id, coin),
+                    ).fetchone()
+                intent = json.loads(intent_row[0] or "{}") if intent_row else {}
+                audit = intent.get("audit") if isinstance(intent, dict) else None
+                if not isinstance(audit, dict):
+                    return None
+                expected_shares = Decimal(str(intent.get("shares", "0")))
+                if Decimal(str(order.get("sz", "0"))) != expected_shares:
+                    return None
+                payload = {"outcome_id": intent.get("outcome_id"), "coin": intent.get("coin")}
+            if audit.get("entry_policy_schema_version") != 1:
                 return None
             if audit.get("entry_policy_kind") not in {
-                "s0_oi_spot_mark_confirmation", "s0_spot_mark_tier_b",
+                "s0_oi_spot_mark_confirmation", "s0_spot_mark_tier_b", "s0_trend_continuation",
             }:
                 return None
             if int(payload.get("outcome_id")) != outcome_id or str(payload.get("coin")) != coin:
@@ -195,5 +217,5 @@ class OutcomeEntryLifecycleStore:
         except (KeyError, TypeError, ValueError, ArithmeticError, sqlite3.Error, json.JSONDecodeError):
             return None
         lifecycle = OutcomeEntryLifecycle(wallet, outcome_id, coin, order_id, price, 0, "BUY_RESTING", time.time())
-        self.record(lifecycle, reason="adopted_exact_audited_s0_submit_after_restart")
+        self.record(lifecycle, reason="adopted_exact_audited_s0_submit_or_pre_submit_intent_after_restart")
         return lifecycle

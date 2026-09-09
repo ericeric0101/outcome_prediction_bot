@@ -15,6 +15,7 @@ from typing import Any, Protocol
 
 from bot.lifecycle.outcome_lifecycle import OutcomeMarketSpec
 from bot.outcome_exit_lifecycle import OutcomeExitLifecycle, OutcomeExitLifecycleStore
+from bot.outcome_order_mutation import cancel_and_confirm
 
 
 class EmergencyExitAction(StrEnum):
@@ -234,16 +235,11 @@ class OutcomeEmergencyExitController:
                 "planned_net_return_pct": str(plan.net_return_pct),
                 "planned_executable_vwap": str(plan.executable_vwap),
             })
-            try:
-                self.gateway.cancel_owned_order(market=market, side_index=side_index, order_id=lifecycle.order_id)
-            except Exception as exc:
-                self.store.record(lifecycle, reason=f"emergency_cancel_exception:{type(exc).__name__}", extra={"state": "RECONCILE_REQUIRED"})
-                return EmergencyExitExecutionResult("reconcile_required", "emergency_cancel_request_failed", lifecycle.order_id)
-            self._invalidate_account_reads()
-            after_orders = self.account.get_open_orders_sync(self.wallet)
-            if any(str(row.get("oid")) == lifecycle.order_id for row in after_orders):
-                self.store.record(lifecycle, reason="emergency_cancel_not_confirmed", extra={"state": "RECONCILE_REQUIRED"})
-                return EmergencyExitExecutionResult("reconcile_required", "emergency_old_sell_still_open", lifecycle.order_id)
+            cancelled = cancel_and_confirm(account=self.account, gateway=self.gateway, wallet=self.wallet,
+                                           market=market, side_index=side_index, order_id=lifecycle.order_id)
+            if not cancelled.confirmed:
+                self.store.record(lifecycle, reason=f"emergency_{cancelled.reason}", extra={"state": "RECONCILE_REQUIRED"})
+                return EmergencyExitExecutionResult("reconcile_required", cancelled.reason, lifecycle.order_id)
             after_inventory = _inventory(self.account.get_spot_clearinghouse_state_sync(self.wallet), lifecycle.coin)
             if after_inventory <= 0:
                 self.store.record(lifecycle, reason="emergency_inventory_flat_during_cancel", extra={"state": "RECONCILE_REQUIRED"})
@@ -284,6 +280,34 @@ class OutcomeEmergencyExitController:
                 "limit_price": str(fresh_plan.limit_price), "planned_executable_vwap": str(fresh_plan.executable_vwap),
                 "planned_net_return_pct": str(fresh_plan.net_return_pct), "order_type": "price_protected_fak_ioc",
             })
-            return EmergencyExitExecutionResult("emergency_exit_submitted", "cancel_confirmed_price_protected_ioc_submitted", lifecycle.order_id, emergency_order_id)
+            # FAK/IOC acceptance does not prove a full fill.  Reconcile the
+            # residual immediately; a remaining position receives durable
+            # evidence and retains one bounded retry rather than silently
+            # burning its only emergency budget at submit time.
+            self._invalidate_account_reads()
+            residual = _inventory(self.account.get_spot_clearinghouse_state_sync(self.wallet), lifecycle.coin)
+            if residual <= 0:
+                closed = OutcomeExitLifecycle(
+                    self.wallet, market.outcome_id, lifecycle.coin, emergency_order_id,
+                    Decimal("0"), fresh_plan.limit_price, lifecycle.replacement_count, "CLOSED",
+                )
+                self.store.record(closed, reason="emergency_ioc_inventory_flat_confirmed", extra={
+                    "requested_shares": str(after_inventory), "remaining_inventory": "0",
+                    "emergency_attempt": self.store.emergency_attempt_count(
+                        wallet=self.wallet, outcome_id=market.outcome_id, coin=lifecycle.coin,
+                    ),
+                })
+                return EmergencyExitExecutionResult("emergency_exit_flat", "price_protected_ioc_flat_confirmed", lifecycle.order_id, emergency_order_id)
+            residual_lifecycle = OutcomeExitLifecycle(
+                self.wallet, market.outcome_id, lifecycle.coin, emergency_order_id,
+                residual, fresh_plan.limit_price, lifecycle.replacement_count, "EMERGENCY_RESIDUAL",
+            )
+            self.store.record(residual_lifecycle, reason="emergency_ioc_residual_inventory_requires_protection", extra={
+                "requested_shares": str(after_inventory), "remaining_inventory": str(residual),
+                "emergency_attempt": self.store.emergency_attempt_count(
+                    wallet=self.wallet, outcome_id=market.outcome_id, coin=lifecycle.coin,
+                ),
+            })
+            return EmergencyExitExecutionResult("emergency_exit_residual", "price_protected_ioc_partial_or_zero_fill_residual", lifecycle.order_id, emergency_order_id)
         finally:
             self._in_flight.discard(key)

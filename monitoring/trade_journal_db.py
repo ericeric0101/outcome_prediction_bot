@@ -825,6 +825,27 @@ class TradeJournalDB:
             logger.debug(f"TradeJournalDB log_strategy_event failed: {e}")
             return None
 
+    def log_durable_order_intent(self, run_id: str, payload: Dict[str, Any]) -> Optional[int]:
+        """Persist a pre-submit order intent with a FULL SQLite durability barrier.
+
+        This is deliberately separate from best-effort telemetry: callers use
+        it before a venue mutation and fail closed if the intent cannot commit.
+        """
+        started_at = time.monotonic()
+        try:
+            with self._connect() as conn:
+                conn.execute("PRAGMA synchronous=FULL")
+                cursor = conn.execute(
+                    "INSERT INTO strategy_events (ts, run_id, event_type, payload_json) VALUES (?, ?, ?, ?)",
+                    (_utc_now_iso(), run_id, "OUTCOME_ORDER_INTENT", _json_dumps(payload)),
+                )
+                conn.commit()
+                self.last_write_timing_ms["durable_order_intent"] = round((time.monotonic() - started_at) * 1000, 3)
+                return int(cursor.lastrowid)
+        except Exception as e:
+            logger.error(f"TradeJournalDB durable Outcome order intent failed: {e}")
+            return None
+
     def record_outcome_p3_quote(
         self,
         *,

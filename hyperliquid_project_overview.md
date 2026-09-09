@@ -9,6 +9,21 @@
 
 > **實盤狀態（2026-08-31）**：已在主網驗證 official TypeScript SDK 的 ALO 下單、wallet-owned cancel、official open-order／inventory／`userFills` 回讀、maker buy→ALO sell lifecycle、E2 cancel-confirm-rebook 與 daily-market rollover；`launcher --live` 在 typed `yes` 後可啟動受限 S0 live runtime。這**不**等於策略或經濟驗收完成：P0 官方 settlement/payout、P2 conversion/settlement 成本、P3 bucket-level markout 與 X4 跨 daily-instance OOS alpha 仍未通過，notional 與 ALO-only 風控限制維持有效。
 
+## 現行執行安全不變量（2026-09-09 健檢修正）
+
+下列為現行 live path 的規格；本節優先於任何較早的 migration history 或舊模組名稱。
+
+1. **`REDUCE_ONLY` 仍完整管理既有倉位。** 到期 tail 禁止所有新 BUY，但會先以 account truth 找到並 `cancel → invalidate cache → re-read open orders → confirm absent` 每個 bot-owned BUY remainder；隨後仍執行已持倉的 protective SELL、TP/loss-band rebook、reversal 觀測及受限 emergency exit。資料 stale 不得阻擋這些減風險動作；無法確認取消時進入 `RECONCILE_REQUIRED`，絕不假裝已取消。
+2. **所有 execution lanes 共用取消確認原語。** `bot/outcome_order_mutation.py:cancel_and_confirm` 是 entry rebook、exit rebook、maker partial-fill cleanup、emergency、rollover、reduce-only 與 graceful shutdown 的唯一取消語意。SDK transport acknowledgement 或 local cache 移除都不是取消證據；只有 fresh `frontendOpenOrders` 不再出現 oid 才可進行下一個 mutation。
+3. **TP 目標只可縮窄。** volatility-derived initial target 進入 1h／2h holding tiers 時採 `min(current_target, tier_cap)`；低波動的 +1–2% target 永遠不可被時間 tier 擴大為 +3%。
+4. **Emergency IOC 不是保證止損。** 它是 verified inventory、fresh full-depth、fee-inclusive loss cap 下的一次 price-protected FAK/IOC 嘗試。IOC 後必須立刻以 account inventory 對帳：flat 才記 `CLOSED`；partial/zero fill 則記 `EMERGENCY_RESIDUAL`、回到 protective passive lifecycle，並最多保留 **兩次** confirmed IOC attempts。深度不足於 loss cap 時仍會 block，故二元合約的最壞結算損失不受 -12% IOC limit 保證。
+5. **Live preflight fail-closed。** live mode 必須同時證明可選 daily market 的雙側 L2 與 BTC mark，並通過 official SDK sidecar health；任何 API exception、缺 book 或 sidecar 不可用均返回 false，不能輸出可交易的 `PASSED`。
+6. **Crash window 以 durable pre-submit intent 收斂。** 新 BUY 在 SDK mutation 前以 SQLite `synchronous=FULL` 寫入 exact wallet/outcome/coin/price/shares/policy audit 的 `OUTCOME_ORDER_INTENT`；寫入失敗即不送單。重啟時只可將一張同 coin、同 price、同 shares 的 open BUY 採納為該 intent。官方 SDK 尚未在本 repo 驗證 client order id/idempotency key，故這是 restart recovery safety fence，不得宣稱能消除多 host 同 wallet 的 submit race；同 wallet live writer 仍只能一個。
+7. **Outcome coin canonicalization。** inventory 來源 `+<asset>` 與 book/order 來源 `#<asset>` 先 canonicalize 為 `#<asset>` 後才做 risk/exposure/recovery 判斷；unknown malformed coin 仍 fail-closed。
+8. **唯一 live execution path 與可診斷 sidecar。** legacy `bot/execution/outcome_execution.py` 與其測試已刪除；唯一 mutation path 為 `OutcomeLiveExecutionRuntime → OutcomeExecutionGateway → official TypeScript SDK sidecar`。sidecar stderr 寫入 bounded rotating `logs/outcome_sdk_sidecar.stderr.log`（2 MiB + 一個 rollover），不再丟棄 crash diagnostics。Telegram polling/control code 已完全移除；沒有 `/pause` 或 `/flatten` 這類會誤稱為 kill switch 的控制面。
+
+**架構維護狀態。** `OutcomeLiveExecutionRuntime` 仍是 orchestration boundary，但不可再新增分散的 exchange mutation；本輪已抽出 canonical coin 與 single order-mutation modules，並把 entry/exit/requote/emergency/lifecycle 保持為獨立 components。完整目錄重整為 domain/risk/runtime packages 是非功能性技術債，必須在不改變上述 state-transition contract 的獨立變更中進行，不能作為繞過測試或修改 live strategy 的理由。
+
 ---
 
 ## 零、歷史遷移記錄（僅供 Git 歷史研究；不是現行架構）
@@ -872,7 +887,7 @@ flowchart TD
     CANCEL --> SYNC["重讀 fills / inventory / open orders / fresh L2"]
     SYNC -->|一致且仍為 passive| REPLACE["提交 replacement ALO SELL"]
     SYNC -->|不一致或 crossing| RECON["RECONCILE_REQUIRED；不送 replacement"]
-    FILL -->|S3 gates 全部成立| IOC["price-protected FAK/IOC SELL（最多一次）"]
+    FILL -->|S3 gates 全部成立| IOC["price-protected FAK/IOC SELL（最多兩次；每次均須重驗證）"]
     IOC --> VERIFY["official fills + account truth 對帳"]
     FILL -->|持倉至到期| SETTLE["等待官方結算 evidence"]
     SETTLE -->|official resolution confirms winner| WIN["確認 payout 後才錄入 MARKET_SETTLEMENT"]
@@ -887,7 +902,7 @@ flowchart TD
 3. **失效／風險降低 (ALO-first；S3 例外)**：
    - 現行 Outcome 正式 runtime 只允許 ALO/post-only。達到 loss、time、markout 或流動性條件時，只能依 E0–E4 cancel/replace state machine 重新掛被動 SELL；它不是 guaranteed stop-loss。
    - 每次 replacement 必須先確認舊單已取消、重新同步 partial fills／inventory／open orders，並在 fresh L2 上驗證 `sell price > best_bid`。任何 cancel/fill race、stale book 或 crossing 均 fail-closed。
-   - **S3 唯一例外（2026-08-31 已授權／實作）：** 僅可對已驗證持倉送 full-size、price-protected `FAK`／IOC SELL；必須先通過 2h holding、20m passive loss-band 未成交、3 個獨立 persistent reversal、fresh REST full-depth、fee-inclusive -8% trigger 與 -12% cap。它不是 unrestricted market order，也不支援 buy／重試／擴大 size。任何其他 IOC／FAK／marketable SELL 仍禁止。
+   - **S3 唯一例外（2026-08-31 授權；2026-09-09 partial-fill 修正）：** 僅可對已驗證持倉送 full-size、price-protected `FAK`／IOC SELL；必須先通過 2h holding、20m passive loss-band 未成交、3 個獨立 persistent reversal、fresh REST full-depth、fee-inclusive -8% trigger 與 -12% cap。它不是 unrestricted market order，也不支援 buy／擴大 size。每次 IOC 都以交易所 inventory 對帳；若剩餘倉位，回到 passive protection，最多一次重新驗證後的 bounded retry（合計最多兩次 accepted IOC）。任何其他 IOC／FAK／marketable SELL 仍禁止。
 
 ---
 

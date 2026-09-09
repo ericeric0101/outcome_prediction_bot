@@ -108,11 +108,11 @@ def test_controller_cancels_confirms_rechecks_depth_then_submits_one_ioc(tmp_pat
 
     result = controller.execute(market=market(), side_index=0, lifecycle=lifecycle, item=item(), plan=plan)
 
-    assert result.state == "emergency_exit_submitted"
+    assert result.state == "emergency_exit_residual"
     assert [name for name, _ in gateway.calls] == ["cancel", "book", "ioc"]
     assert gateway.calls[-1][1]["limit_price"] == Decimal("0.70450")
     recovered = store.recover(wallet="w", outcome_id=1153, coin="#11530")
-    assert recovered is not None and recovered.state == "EMERGENCY_EXIT_SUBMITTED"
+    assert recovered is not None and recovered.state == "EMERGENCY_RESIDUAL"
 
 
 def test_controller_never_iocs_before_cancel_confirmation(tmp_path):
@@ -127,5 +127,27 @@ def test_controller_never_iocs_before_cancel_confirmation(tmp_path):
     controller = OutcomeEmergencyExitController(account=account, gateway=gateway, store=store, wallet="w", policy=OutcomeEmergencyExitPolicy())
     result = controller.execute(market=market(), side_index=0, lifecycle=lifecycle, item=item(), plan=OutcomeEmergencyExitPolicy().plan(item()))
 
-    assert result.detail == "emergency_old_sell_still_open"
+    assert result.detail == "old_order_still_open_after_cancel"
     assert [name for name, _ in gateway.calls] == ["cancel"]
+
+
+def test_partial_ioc_records_residual_and_keeps_one_bounded_retry(tmp_path):
+    account, gateway = Account(), Gateway(None)
+    gateway.account = account
+    def partial_ioc(**kwargs):
+        gateway.calls.append(("ioc", kwargs))
+        account.total = "10"
+        return {"orderId": "emergency-8", "status": "filled"}
+    gateway.place_price_protected_ioc_exit = partial_ioc
+    store = OutcomeExitLifecycleStore(TradeJournalDB(tmp_path / "journal.db"), "run")
+    lifecycle = OutcomeExitLifecycle("w", 1153, "#11530", "old-7", Decimal("13"), Decimal("0.76"), 0, "LOSS_BAND_UNFILLED")
+    store.record(lifecycle, reason="loss_band")
+    result = OutcomeEmergencyExitController(
+        account=account, gateway=gateway, store=store, wallet="w", policy=OutcomeEmergencyExitPolicy(),
+    ).execute(market=market(), side_index=0, lifecycle=lifecycle, item=item(), plan=OutcomeEmergencyExitPolicy().plan(item()))
+    assert result.state == "emergency_exit_residual"
+    recovered = store.recover(wallet="w", outcome_id=1153, coin="#11530")
+    assert recovered is not None and recovered.state == "EMERGENCY_RESIDUAL"
+    assert recovered.inventory == Decimal("10")
+    assert store.emergency_attempt_count(wallet="w", outcome_id=1153, coin="#11530") == 1
+    assert store.emergency_attempted(wallet="w", outcome_id=1153, coin="#11530") is False
