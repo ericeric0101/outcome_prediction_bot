@@ -1997,10 +1997,12 @@ class OutcomeLiveExecutionRuntime:
             return LiveExecutionResult("flat", f"live strategy no entry: {reason}")
         admission["portfolio_guard"] = {
             "allowed": True, "reason": portfolio.reason, "enabled": portfolio.enabled,
-            "daily_gross_entry_usdc": str(portfolio.daily_gross_entry_usdc),
-            "daily_realized_net_usdc": str(portfolio.daily_realized_net_usdc),
-            "daily_gross_entry_limit_usdc": str(portfolio.daily_gross_entry_limit_usdc),
-            "daily_realized_loss_limit_usdc": str(portfolio.daily_realized_loss_limit_usdc),
+            "market_session_gross_entry_usdc": str(portfolio.market_session_gross_entry_usdc),
+            "market_session_realized_net_usdc": str(portfolio.market_session_realized_net_usdc),
+            "market_session_gross_entry_limit_usdc": str(portfolio.market_session_gross_entry_limit_usdc),
+            "market_session_realized_loss_limit_usdc": str(portfolio.market_session_realized_loss_limit_usdc),
+            "rolling_24h_realized_net_usdc": str(portfolio.rolling_24h_realized_net_usdc),
+            "rolling_24h_realized_loss_limit_usdc": str(portfolio.rolling_24h_realized_loss_limit_usdc),
             "consecutive_loss_exits": portfolio.consecutive_loss_exits,
             "market_loss_exits": portfolio.market_loss_exits,
         }
