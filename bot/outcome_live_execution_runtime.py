@@ -45,6 +45,11 @@ from bot.outcome_reversal import OutcomeReversalClassifier, OutcomeReversalInput
 from bot.outcome_loss_reentry import OutcomeLossReentryGate
 from bot.outcome_tier_b_execution_gate import OutcomeTierBExecutionGate
 from bot.outcome_portfolio_guard import OutcomePortfolioGuard
+from bot.outcome_market_regime import (
+    OutcomeMarketRegimeInput,
+    OutcomeMarketRegimeShadow,
+    OutcomeToxicFillInput,
+)
 from bot.outcome_emergency_exit import (
     EmergencyExitAction,
     OutcomeEmergencyExitController,
@@ -105,6 +110,9 @@ class OutcomeLiveExecutionRuntime:
         self.loss_reentry_gate = OutcomeLossReentryGate(ledger.journal, ledger.run_id) if ledger else None
         self.tier_b_execution_gate = OutcomeTierBExecutionGate(ledger.journal.db_path) if ledger else None
         self.portfolio_guard = OutcomePortfolioGuard(ledger.journal.db_path) if ledger else None
+        # This observer is deliberately shadow-only.  It has no reference to
+        # an execution controller and cannot alter S0/S2/S3 authority.
+        self.market_regime_shadow = OutcomeMarketRegimeShadow()
         self.emergency_exit_policy = OutcomeEmergencyExitPolicy()
         self.emergency_exit_controller = (
             OutcomeEmergencyExitController(
@@ -128,6 +136,8 @@ class OutcomeLiveExecutionRuntime:
         # lookup is intentionally retried on a later observation rather than
         # cached as a fabricated lifecycle identity.
         self._holding_entry_provenance: dict[tuple[int, str, str, str], dict[str, object]] = {}
+        self._last_regime_shadow_record: dict[int, tuple[str, float]] = {}
+        self._last_toxic_shadow_record: dict[tuple[int, str], tuple[str, float]] = {}
 
     @staticmethod
     def _audit_decimal(audit: dict[str, object], name: str) -> Decimal | None:
@@ -190,6 +200,104 @@ class OutcomeLiveExecutionRuntime:
                 "execution_submitted": False, **evidence,
             })
         return observed.confirmed, observed.reason, evidence
+
+    @staticmethod
+    def _context_decimal(context: dict[str, object], name: str) -> Decimal | None:
+        try:
+            value = context.get(name)
+            return Decimal(str(value)) if value is not None else None
+        except (ArithmeticError, ValueError):
+            return None
+
+    def _observe_market_regime_shadow(
+        self, *, market: OutcomeMarketSpec, entry_side_index: int | None,
+        entry_evidence: dict[str, object], market_context: dict[str, object] | None,
+    ) -> dict[str, object]:
+        """Classify the market for audit only; this never changes an order."""
+        context = dict(market_context or {})
+        continuation = entry_evidence.get("trend_continuation")
+        continuation_data = continuation if isinstance(continuation, dict) else {}
+        bid = self._context_decimal(context, "yes_best_bid")
+        ask = self._context_decimal(context, "yes_best_ask")
+        midpoint = (bid + ask) / Decimal("2") if bid is not None and ask is not None and bid < ask else None
+        decision = self.market_regime_shadow.observe_market(OutcomeMarketRegimeInput(
+            outcome_id=market.outcome_id, now_ts=time.time(), yes_midpoint=midpoint,
+            spot_strike_bps=self._context_decimal(context, "spot_strike_bps"),
+            mark_5m_bps=self._context_decimal(context, "mark_return_bps"),
+            mark_15m_bps=self._context_decimal(continuation_data, "mark_15m_bps"),
+            mark_60m_bps=self._context_decimal(continuation_data, "mark_60m_bps"),
+            candidate_side_index=entry_side_index,
+        ))
+        payload = {
+            "venue": "hyperliquid_outcome", "read_only": True,
+            "outcome_id": market.outcome_id, "period": market.period,
+            "state": decision.state, "reason": decision.reason,
+            "candidate_side_index": entry_side_index,
+            "yes_midpoint": str(midpoint) if midpoint is not None else None,
+            "spot_strike_bps": str(self._context_decimal(context, "spot_strike_bps")) if self._context_decimal(context, "spot_strike_bps") is not None else None,
+            "mark_5m_bps": str(self._context_decimal(context, "mark_return_bps")) if self._context_decimal(context, "mark_return_bps") is not None else None,
+            "mark_15m_bps": str(self._context_decimal(continuation_data, "mark_15m_bps")) if self._context_decimal(continuation_data, "mark_15m_bps") is not None else None,
+            "mark_60m_bps": str(self._context_decimal(continuation_data, "mark_60m_bps")) if self._context_decimal(continuation_data, "mark_60m_bps") is not None else None,
+            "confirmed_crosses_2h": decision.confirmed_crosses_2h,
+            "last_cross_at": decision.last_cross_at,
+            "current_zone": decision.current_zone,
+            "execution_submitted": False,
+        }
+        if self.ledger is not None:
+            previous = self._last_regime_shadow_record.get(market.outcome_id)
+            now = time.monotonic()
+            # Persist state changes immediately and otherwise a compact row at
+            # 30-second cadence.  The in-memory classifier still sees every
+            # strategy tick, so rate limiting storage cannot change a state.
+            if previous is None or previous[0] != str(decision.state) or now - previous[1] >= 30.0:
+                self.ledger.journal.log_strategy_event(self.ledger.run_id, "OUTCOME_MARKET_REGIME_SHADOW", payload)
+                self._last_regime_shadow_record[market.outcome_id] = (str(decision.state), now)
+        return payload
+
+    def _observe_toxic_fill_shadow(self, *, market: OutcomeMarketSpec, finding: object) -> None:
+        """Record a short post-fill adverse-selection candidate without exiting."""
+        if self.ledger is None or self.stream_health is None:
+            return
+        coin = str(getattr(finding, "coin", ""))
+        inventory = Decimal(str(getattr(finding, "inventory", "0")))
+        vwap = self.machine._fill_vwap_for_inventory(coin=coin, inventory=inventory)
+        snapshot = self.stream_health.fresh_book_top(market, coin)
+        if not coin or inventory <= 0 or vwap is None or snapshot is None:
+            return
+        provenance = self._resolve_holding_entry_provenance(
+            market=market, coin=coin, inventory=inventory, fill_vwap=vwap,
+        ) or {}
+        try:
+            filled_at = datetime.fromisoformat(str(provenance["entry_filled_at"])).timestamp()
+            holding_age_sec = max(0.0, time.time() - filled_at)
+            age_basis = "official_fill_timestamp"
+        except (KeyError, TypeError, ValueError):
+            return
+        decision = self.market_regime_shadow.observe_toxic_fill(OutcomeToxicFillInput(
+            outcome_id=market.outcome_id, coin=coin, now_ts=time.time(), holding_age_sec=holding_age_sec,
+            fill_vwap=vwap, best_bid=Decimal(str(snapshot["bid"])),
+            top3_bid_depth=Decimal(str(snapshot["top3_bid_depth"])),
+        ))
+        key, now = (market.outcome_id, coin), time.monotonic()
+        previous = self._last_toxic_shadow_record.get(key)
+        # During the two-minute window retain a compact ten-second path, plus
+        # every state change.  No raw L2 levels are copied to the journal.
+        if previous is not None and previous[0] == str(decision.state) and now - previous[1] < 10.0:
+            return
+        self.ledger.journal.log_strategy_event(self.ledger.run_id, "OUTCOME_TOXIC_FILL_SHADOW", {
+            "venue": "hyperliquid_outcome", "read_only": True,
+            "outcome_id": market.outcome_id, "period": market.period, "coin": coin,
+            "state": decision.state, "reason": decision.reason,
+            "holding_age_sec": round(holding_age_sec, 3), "age_basis": age_basis,
+            "fill_vwap": str(vwap), "best_bid": str(snapshot["bid"]),
+            "top3_bid_depth": str(snapshot["top3_bid_depth"]),
+            "executable_return_pct": str(decision.executable_return_pct) if decision.executable_return_pct is not None else None,
+            "bid_drift_bps": str(decision.bid_drift_bps) if decision.bid_drift_bps is not None else None,
+            "depth_ratio": str(decision.depth_ratio) if decision.depth_ratio is not None else None,
+            "observation_count": decision.observation_count,
+            "duration_sec": round(decision.duration_sec, 3), "execution_submitted": False,
+        })
+        self._last_toxic_shadow_record[key] = (str(decision.state), now)
 
     def _continuation_entry_already_submitted(self, *, outcome_id: int) -> bool:
         """One continuation canary submit per daily market, including restarts."""
@@ -1447,6 +1555,10 @@ class OutcomeLiveExecutionRuntime:
         if self.ledger is None:
             return LiveExecutionResult("blocked", "live strategy requires an execution ledger")
         self._holding_context[market.outcome_id] = dict(market_context or entry_evidence)
+        admission["market_regime_shadow"] = self._observe_market_regime_shadow(
+            market=market, entry_side_index=entry_side_index,
+            entry_evidence=entry_evidence, market_context=market_context,
+        )
         # C1/C2 research capture is strictly public-data, bounded to one row
         # per 30 seconds and independent of whether the canary is enabled.
         self._capture_trend_continuation_path(
@@ -1506,6 +1618,10 @@ class OutcomeLiveExecutionRuntime:
             )
             if filled_entry_cleanup is not None:
                 return filled_entry_cleanup
+            # Toxic-fill is deliberately observation-only in this milestone.
+            # It must never delay the cancel-before-protective-sell boundary
+            # above, nor can it authorize a repricing or taker exit.
+            self._observe_toxic_fill_shadow(market=market, finding=active[0])
             holding_key = (market.outcome_id, str(getattr(active[0], "coin", "")))
             now = time.monotonic()
             reversal_observed = False

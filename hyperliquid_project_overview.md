@@ -607,6 +607,27 @@ X3 是離線建構，沒有網路或交易呼叫；collector 持續寫入後可�
 
 **H1 verification。** YES/NO adverse 對稱、三次／五秒 fast-risk confirmation、正常 300 秒 lane 不變、durable 30 秒 cooldown、WS top-3 depth、L2 coalesced wake-up 與 live-runtime confirmation integration 均有 regression；完整 Python suite **256 passed**、`compileall`、`git diff --check` 與 official SDK sidecar TypeScript build 均通過。這是 deterministic fixture 驗證；首次 live restart 後仍須以 `OUTCOME_ENTRY_FAST_RISK`、`ORDER_CANCEL.entry_requote_reason`、`OUTCOME_RUNTIME_TIMING` 確認實際 cancel detection、cancel round-trip 與未發生 churn，不能把 unit test 當成成交品質證明。
 
+**G13 — Market Regime + Execution Risk unified shadow state machine（完成 shadow implementation；2026-09-09）。** 此工作回應三種不可混為一談的市場型態：(a) 多小時、可延續的單邊趨勢；(b) 接近 strike、方向反覆交叉的 range；(c) 已成交 maker BUY 在方向資料尚未翻轉前即遭 adverse selection 的 toxic fill。Order book 在這裡是**最快的 execution-risk sensor**，不是獨立方向預測器：Spot／Binance mark 的多時間尺度、strike distance 與剩餘時間仍決定 thesis；WS BBO、spread、top-3 bid depth、bid drift 與 fill 後 executable markout 只用來判斷 quote/exit 風險。單一 depth snapshot 可撤回或補回，絕不可單獨授權 side、taker 或損失退出。
+
+`OutcomeMarketRegimeShadow` 是純 in-memory classifier，無 exchange client、journal、gateway 或 controller reference。runtime 每個 S0 tick 將 compact as-of input 送入它，並只在 state 改變或每 30 秒寫一筆 `OUTCOME_MARKET_REGIME_SHADOW`；絕不保存 raw L2/allMids payload。它輸出：
+
+| Shadow state | 定義與目前用途 |
+|---|---|
+| `TREND` | candidate side 的 spot、5m、15m、60m mark 同方向且各達 5 bps；高 probability 本身不是拒絕理由。此 state 現在只記錄，不放寬或新增 entry。 |
+| `TRANSITION` | 多時間尺度任一明確反向，或完成一次 durable midpoint crossover 後的 30 分鐘 settling window。它將來可暫停新 entry／撤未成交追價單，但本版不改現有 Tier-A/B 或 H1 cancel authority。 |
+| `RANGE` | YES midpoint 必須先在 `<=48%` 或 `>=52%` zone 持續 10 分鐘確認，再跨至另一 zone 並持續 10 分鐘；最近兩小時完成至少兩次才成立。49.9%/50.1% tick、一次短暫穿越或缺少 history 都不得被標為 range。現行趨勢策略未來應在此 no-entry；本版僅 telemetry。 |
+| `UNKNOWN` | 缺少 candidate 或任一多時間尺度 input；不以缺資料推定趨勢、range 或反轉。 |
+
+`OUTCOME_TOXIC_FILL_SHADOW` 僅針對可由 immutable official fill timestamp 綁定的**前兩分鐘**持倉觀測。它先記錄同一 lifecycle 的 healthy WS BBO/top-3 depth baseline；只有 executable bid 相對 fill VWAP 已低於 -5%、bid 相對 baseline 下移至少 100 bps、top-3 bid depth 低於 baseline 70%，且同一聯合條件至少三個樣本、跨越至少五秒時，才寫 `TOXIC_FILL` shadow candidate。未達條件為 `NORMAL`／`DETERIORATING`，資料不完整或超出兩分鐘窗為 `UNKNOWN`。這些數字是 code-owned、審計用的初始定義，不是已授權 stop-loss；每個 candidate/state change 或十秒 cadence 只保存 VWAP、BBO、top-3 aggregate depth、return/drift/depth ratio/count/duration，不複製完整 book。
+
+**G13 live authority boundary。** 此 milestone **不改變** Tier-A/B admission、$20 sizing、H1 fast cancel-only、一般 ALO take-profit、S2 loss-band、S3 price-protected IOC、re-entry 或 portfolio guard。尤其 `TRANSITION` 不會取消現有 order，`RANGE` 不會阻擋 entry，`TOXIC_FILL` 不會 reprice、cancel protective sell 或送 taker/IOC；所有 state event 均標記 `read_only=true` 與 `execution_submitted=false`。這使 bot 照常 live 交易，同時在實際市場與實際 fills 旁收集反事實資料，而不是停止交易等待研究。
+
+唯讀命令 `python -m bot.outcome_market_regime_report --db logs/outcome_shadow.db --period 1d` 匯總 state／reason 次數、toxic-fill observation 與每筆 actual S0 entry 當時最近的同市場 shadow regime；它不回放 book、不估計 queue、不推論未觀測 fills，缺 label 明列為 `missing`，絕不可解讀為 trend 或策略績效。
+
+**G13 promotion sequence（尚未授權跳過）。** 先用 shadow report 比較 strict Tier-A/B 的 actual entry 與 counterfactual `TRANSITION/RANGE` labels：必須確認它保留長時段一致趨勢、又能識別 multi-horizon conflict／durable crossover，而非只因 price 高而拒絕。其後只可依序提案：(1) `TRANSITION` cancel-only / no-new-entry canary；(2) 持倉 thesis monitor 的 passive-only target/loss-band adjustment；(3) toxic-fill 的一次 price-protected marketable exit。第 (3) 必須額外證明候選在當時完整 L2 depth 與既有 loss cap 內可退出，且不能只用浮虧百分比；曾深度浮虧後恢復 target 的 lifecycle 是此 gate 的反例。每一層均需獨立 operator approval、durable audit 與 regression，不能由 shadow state 自動取得 mutation authority。
+
+**G13 verification。** 新增 deterministic tests 覆蓋 multi-horizon trend、5m/15m conflict transition、兩次 durable 48/52 crossover range、單 tick 不得算 crossover，以及 toxic fill 必須同時有價格／depth 惡化且三次／五秒確認；完整 Python suite 為 **264 passed**，另以 `compileall` 驗證 runtime import。這是 classifier correctness，不是 alpha、stop-loss 效益或 live fill quality 的證明；首次重啟後須確認 journal 出現 `OUTCOME_MARKET_REGIME_SHADOW`，而新的 official fill 前兩分鐘才可能產生 `OUTCOME_TOXIC_FILL_SHADOW`。
+
 X2 上線前的 Outcome/P3 fills 只可用於 execution/markout 校準，不能作為 OI alpha 的歷史證明；只有 X2 上線後以正確 event-time 收集的新資料，才能進入 X3 OI 增量研究。X1/X2 僅完成資料與範圍基礎，沒有修改 `OutcomeLiveExecutionRuntime` 的 entry source、模型、P0/P2/P3/P4 gate 或任何下單權限。
 
 **X1/X2 驗證（2026-08-26）：** X1 market scope 與 shadow telemetry 測試 **6 passed**；X2 OI schema/contract/dedupe/report 加上 journal tests **12 passed**；真實 Binance public API smoke（隔離 `/private/tmp/binance_oi_x2_smoke.db`）寫入 **10** 筆標記 `backfilled=true` 的 historical 5m rows 與 **1** 筆 current row，current row 的 OI、mark price、index price、taker imbalance、exchange/local timestamp 與 latency 均非空。此 smoke DB 不是正式研究資料集，也沒有向 Outcome 或 Binance 提交任何交易。

@@ -1,4 +1,6 @@
 from decimal import Decimal
+import json
+import sqlite3
 import time
 
 from bot.lifecycle.outcome_lifecycle import OutcomeMarketSpec
@@ -124,6 +126,28 @@ def test_live_entry_fast_risk_requires_persistent_signal_invalidation(monkeypatc
     assert [item[0] for item in decisions] == [False, False, True]
     assert decisions[-1][1] == "confirmed_signal_invalidation"
     assert decisions[-1][2]["observation_count"] == 3
+
+
+def test_market_regime_shadow_is_journalled_without_execution_authority(tmp_path):
+    journal = TradeJournalDB(tmp_path / "regime.db")
+    runtime = OutcomeLiveExecutionRuntime(
+        account=CalibrationAccount(), wallet="w", gateway=Gateway(),
+        ledger=OutcomeExecutionLedger(journal, "run"),
+    )
+    observed = runtime._observe_market_regime_shadow(
+        market=market(), entry_side_index=0,
+        entry_evidence={"trend_continuation": {"mark_15m_bps": "15", "mark_60m_bps": "20"}},
+        market_context={
+            "yes_best_bid": "0.60", "yes_best_ask": "0.61",
+            "spot_strike_bps": "20", "mark_return_bps": "10",
+        },
+    )
+    assert observed["state"] == "TREND"
+    with sqlite3.connect(journal.db_path) as conn:
+        payload = conn.execute(
+            "SELECT payload_json FROM strategy_events WHERE event_type='OUTCOME_MARKET_REGIME_SHADOW'"
+        ).fetchone()[0]
+    assert json.loads(payload)["execution_submitted"] is False
 
 
 def test_p3_calibration_requires_its_own_explicit_gate(monkeypatch, tmp_path):
