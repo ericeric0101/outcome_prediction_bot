@@ -6,10 +6,63 @@ from monitoring.trade_journal_db import TradeJournalDB
 
 
 def _record_loss(journal, gate):
-    journal.log_order_event("run", "ORDER_FILLED", venue_order_id="sell", side="SELL", price=0.80, status="FILLED", instrument_id="#10", payload={
+    journal.log_strategy_event("run", "OUTCOME_LIVE_STRATEGY_ENTRY_PLACED", {
+        "outcome_id": 1, "coin": "#10", "order_id": "buy",
+    })
+    journal.log_order_event("run", "ORDER_FILLED", venue_order_id="buy", side="BUY", price=0.90, qty=10, commission_usdc=0.01, status="FILLED", instrument_id="#10", payload={
+        "venue": "hyperliquid_outcome", "actual_fill": True, "fill_provenance": "hyperliquid_userFills",
+    })
+    journal.log_order_event("run", "ORDER_FILLED", venue_order_id="sell", side="SELL", price=0.80, qty=10, commission_usdc=0.01, status="FILLED", instrument_id="#10", payload={
         "venue": "hyperliquid_outcome", "actual_fill": True, "fill_provenance": "hyperliquid_userFills",
     })
     assert gate.record_confirmed_loss_exit(outcome_id=1, period="1d", coin="#10", order_id="sell") is True
+
+
+def test_profitable_exit_never_records_loss_or_spends_reentry_budget(tmp_path):
+    journal = TradeJournalDB(tmp_path / "journal.db")
+    gate = OutcomeLossReentryGate(journal, "run")
+    journal.log_strategy_event("run", "OUTCOME_LIVE_STRATEGY_ENTRY_PLACED", {
+        "outcome_id": 1, "coin": "#10", "order_id": "buy",
+    })
+    journal.log_order_event("run", "ORDER_FILLED", venue_order_id="buy", side="BUY", price=0.545, qty=36, commission_usdc=0, status="FILLED", instrument_id="#10", payload={
+        "venue": "hyperliquid_outcome", "actual_fill": True, "fill_provenance": "hyperliquid_userFills",
+    })
+    journal.log_order_event("run", "ORDER_FILLED", venue_order_id="sell", side="SELL", price=0.56685, qty=36, commission_usdc=0.00783613, status="FILLED", instrument_id="#10", payload={
+        "venue": "hyperliquid_outcome", "actual_fill": True, "fill_provenance": "hyperliquid_userFills",
+    })
+
+    assert gate.record_confirmed_loss_exit(outcome_id=1, period="1d", coin="#10", order_id="sell") is False
+    decision = gate.evaluate(outcome_id=1, coin="#10", candidate_bid=0.60)
+    assert decision.allowed is True
+    assert decision.reason == "no_confirmed_loss_exit"
+    with sqlite3.connect(journal.db_path) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM strategy_events WHERE event_type='OUTCOME_LOSS_EXIT_CONFIRMED'"
+        ).fetchone()[0] == 0
+
+
+def test_legacy_profitable_loss_event_and_its_reentry_token_are_ignored(tmp_path):
+    journal = TradeJournalDB(tmp_path / "journal.db")
+    gate = OutcomeLossReentryGate(journal, "run")
+    journal.log_strategy_event("run", "OUTCOME_LIVE_STRATEGY_ENTRY_PLACED", {
+        "outcome_id": 1, "coin": "#10", "order_id": "buy",
+    })
+    journal.log_order_event("run", "ORDER_FILLED", venue_order_id="buy", side="BUY", price=0.60, qty=10, commission_usdc=0, status="FILLED", instrument_id="#10", payload={
+        "venue": "hyperliquid_outcome", "actual_fill": True,
+    })
+    journal.log_order_event("run", "ORDER_FILLED", venue_order_id="sell", side="SELL", price=0.70, qty=10, commission_usdc=0, status="FILLED", instrument_id="#10", payload={
+        "venue": "hyperliquid_outcome", "actual_fill": True,
+    })
+    legacy_id = journal.log_strategy_event("run", gate.EVENT, {
+        "outcome_id": 1, "coin": "#10", "order_id": "sell", "loss_exit_price": 0.70,
+    })
+    journal.log_strategy_event("run", gate.REENTRY_EVENT, {
+        "outcome_id": 1, "loss_exit_event_id": legacy_id, "order_id": "obsolete-reentry",
+    })
+
+    decision = gate.evaluate(outcome_id=1, coin="#10", candidate_bid=0.60)
+    assert decision.allowed is True
+    assert decision.reason == "no_confirmed_loss_exit"
 
 
 def test_reentry_gate_requires_official_sell_fill_then_allows_one_reclaimed_entry_after_cooldown(tmp_path):

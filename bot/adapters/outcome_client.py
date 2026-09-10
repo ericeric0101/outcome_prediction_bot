@@ -298,6 +298,18 @@ class OutcomeClient:
         target_user = (user or self.wallet_address).lower()
         return self.post_info_sync({"type": "userFills", "user": target_user})
 
+    def get_user_fills_by_time_sync(
+        self, user: Optional[str] = None, *, start_time_ms: int, end_time_ms: int | None = None,
+    ) -> List[Dict[str, Any]]:
+        """Read the official bounded historical fill window without order authority."""
+        target_user = (user or self.wallet_address).lower()
+        payload: Dict[str, Any] = {
+            "type": "userFillsByTime", "user": target_user, "startTime": int(start_time_ms),
+        }
+        if end_time_ms is not None:
+            payload["endTime"] = int(end_time_ms)
+        return self.post_info_sync(payload)
+
     # --------------------------------------------------------------------------
     # REST /exchange Endpoints
     # --------------------------------------------------------------------------

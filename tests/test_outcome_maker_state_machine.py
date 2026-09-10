@@ -31,6 +31,23 @@ def test_tick_places_one_buy_without_waiting():
     assert [kind for kind, _ in gateway.calls] == ["place"]
 
 
+def test_entry_submit_rechecks_minimum_price_after_fresh_book_read():
+    class LowerBidGateway(Gateway):
+        def fetch_order_book(self, **_):
+            return {"bids": [{"price": "0.545"}], "asks": [{"price": "0.546"}]}
+
+    gateway = LowerBidGateway()
+    result = OutcomeMakerStateMachine(account=Account(), gateway=gateway, wallet="w").tick(
+        market=market(), side_index=0, entry_permitted=True,
+        entry_min_submit_price=Decimal("0.55"),
+        entry_audit={"entry_bid_at_decision": "0.55"},
+    )
+    assert result.state == "flat"
+    assert result.detail == "entry submit price fell below configured minimum"
+    assert gateway.calls == []
+    assert result.audit["entry_submit_bid"] == "0.545"
+
+
 def test_tick_refuses_best_ask_fallback_for_inventory_without_exit_policy():
     gateway = Gateway()
     result = OutcomeMakerStateMachine(account=Account("13"), gateway=gateway, wallet="w").tick(market=market(), side_index=0, entry_permitted=True)

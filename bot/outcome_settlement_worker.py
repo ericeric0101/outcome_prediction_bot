@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import threading
 import time
+from datetime import datetime, timezone
 from typing import Any, Iterable
 
 from loguru import logger
@@ -37,6 +38,90 @@ class OutcomeSettlementWorker:
         self._last_cycle_at = 0.0
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+
+    # The documented userFillsByTime endpoint is bounded.  This overlap makes
+    # delayed/duplicate delivery harmless because evidence is deduplicated by
+    # official trade id, while the persisted high-water mark prevents a
+    # short generic userFills window from losing a late payout after restart.
+    PAYOUT_CURSOR_OVERLAP_MS = 60_000
+    PAYOUT_INITIAL_LOOKBACK_MS = 7 * 24 * 60 * 60 * 1000
+    PAYOUT_MAX_RESPONSE_FILLS = 2_000
+
+    @staticmethod
+    def _fill_timestamp_ms(fill: Any) -> int | None:
+        if not isinstance(fill, dict):
+            return None
+        try:
+            return int(fill.get("time", fill.get("timestamp")))
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _deduplicate_fills(*collections: Iterable[Any]) -> list[dict[str, Any]]:
+        output: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for collection in collections:
+            for fill in collection:
+                if not isinstance(fill, dict):
+                    continue
+                key = str(fill.get("tid") or fill.get("tradeId") or "")
+                if not key:
+                    key = "fallback:" + ":".join(str(fill.get(field, "")) for field in (
+                        "hash", "oid", "coin", "side", "px", "sz", "time", "dir",
+                    ))
+                if key in seen:
+                    continue
+                seen.add(key)
+                output.append(fill)
+        return output
+
+    def _capture_payout_fill_window(self) -> list[dict[str, Any]]:
+        """Persist a complete official payout window before it ages out.
+
+        This never controls active-market orders.  If a response is saturated
+        at the venue's documented limit, it refuses to advance the cursor and
+        falls back to existing current-window evidence rather than pretending
+        the historical range was complete.
+        """
+        method = getattr(self.account, "get_user_fills_by_time_sync", None)
+        if not callable(method):
+            return self.journal.load_outcome_settlement_payout_fills(self.account.wallet_address)
+        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        cursor = self.journal.load_outcome_settlement_fill_cursor(self.account.wallet_address)
+        start_ms = (
+            max(0, cursor - self.PAYOUT_CURSOR_OVERLAP_MS)
+            if cursor is not None else now_ms - self.PAYOUT_INITIAL_LOOKBACK_MS
+        )
+        try:
+            fetched = method(
+                self.account.wallet_address, start_time_ms=start_ms, end_time_ms=now_ms,
+            )
+            if not isinstance(fetched, list):
+                raise TypeError("userFillsByTime response is not a list")
+            if len(fetched) >= self.PAYOUT_MAX_RESPONSE_FILLS:
+                self.journal.log_strategy_event("outcome-settlement-error", "OUTCOME_SETTLEMENT_PAYOUT_CURSOR_BLOCKED", {
+                    "venue": "hyperliquid_outcome", "reason": "user_fills_by_time_response_saturated",
+                    "start_time_ms": start_ms, "end_time_ms": now_ms, "response_count": len(fetched),
+                })
+                return self.journal.load_outcome_settlement_payout_fills(self.account.wallet_address)
+            timestamps = [timestamp for item in fetched if (timestamp := self._fill_timestamp_ms(item)) is not None]
+            # A successful empty interval must still advance the high-water
+            # mark, otherwise every future cycle repeatedly reads seven days.
+            self.journal.record_outcome_settlement_payout_fills(
+                wallet_address=self.account.wallet_address,
+                fills=[item for item in fetched if isinstance(item, dict)],
+                cursor_timestamp_ms=max(timestamps, default=now_ms),
+            )
+        except Exception as exc:
+            self.journal.log_strategy_event("outcome-settlement-error", "OUTCOME_SETTLEMENT_PAYOUT_CURSOR_ERROR", {
+                "venue": "hyperliquid_outcome", "error_type": type(exc).__name__, "error": str(exc),
+                "start_time_ms": start_ms,
+            })
+        return self.journal.load_outcome_settlement_payout_fills(self.account.wallet_address)
+
+    def _log_status_transition(self, outcome_id: int, status: str, detail: str) -> None:
+        if self.journal.update_outcome_settlement_status(outcome_id=outcome_id, status=status):
+            logger.info(f"[OUTCOME SETTLEMENT] #{outcome_id} {detail}")
 
     def add_candidates(self, outcome_ids: Iterable[int]) -> None:
         with self._candidate_lock:
@@ -87,6 +172,7 @@ class OutcomeSettlementWorker:
                 "venue": "hyperliquid_outcome", "error_type": type(exc).__name__, "error": str(exc),
             })
             return
+        payout_history = self._capture_payout_fill_window()
         for outcome_id in sorted(candidates - self._settled_ids):
             if now - self._last_attempt_at.get(outcome_id, 0.0) < self.interval_sec:
                 continue
@@ -94,23 +180,27 @@ class OutcomeSettlementWorker:
             try:
                 settlement = self.settlement_adapter.fetch_outcome_id(outcome_id)
                 if not settlement.settled:
-                    logger.info(f"[OUTCOME SETTLEMENT] #{outcome_id} not yet confirmed by official SDK; holding state.")
+                    self._log_status_transition(
+                        outcome_id, "pending_official_sdk",
+                        "not yet confirmed by official SDK; holding state.",
+                    )
                     continue
-                logger.info(
-                    f"[OUTCOME SETTLEMENT] #{outcome_id} confirmed by official SDK "
-                    f"fraction={settlement.settle_fraction} details={settlement.details}"
-                )
+                current_fills = self.account.get_user_fills_sync(self.account.wallet_address)
                 status = self.pnl_reconciler.reconcile_settlement(
                     settlement=settlement,
-                    raw_fills=self.account.get_user_fills_sync(self.account.wallet_address),
+                    raw_fills=self._deduplicate_fills(current_fills, payout_history),
                     clearinghouse=self.account.get_spot_clearinghouse_state_sync(self.account.wallet_address),
                 )
                 if status in {"recorded", "already_recorded"}:
                     self._settled_ids.add(outcome_id)
-                    logger.info(f"[OUTCOME SETTLEMENT] #{outcome_id} canonical PnL {status}")
+                    self._log_status_transition(
+                        outcome_id, status,
+                        f"official SDK confirmed fraction={settlement.settle_fraction}; canonical PnL {status}",
+                    )
                 else:
-                    logger.info(
-                        f"[OUTCOME SETTLEMENT] #{outcome_id} confirmation retained; canonical PnL {status}"
+                    self._log_status_transition(
+                        outcome_id, status,
+                        f"official SDK confirmed fraction={settlement.settle_fraction}; canonical PnL {status}",
                     )
             except Exception as exc:
                 self.journal.log_strategy_event("outcome-settlement-error", "OUTCOME_SETTLEMENT_WORKER_ERROR", {

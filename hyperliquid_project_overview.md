@@ -1,7 +1,7 @@
 # Hyperliquid Outcome (HIP-4) BTC Daily Prediction Market Trading Bot — Current Authority
 
-> **權威架構版本 (Authority Version)**：2.2.6 (Outcome-only, trend-continuation evidence lane)
-> **建立與審計日期**：2026-08-23；最近修訂：2026-09-07
+> **權威架構版本 (Authority Version)**：2.2.7 (Outcome-only, durable settlement evidence)
+> **建立與審計日期**：2026-08-23；最近修訂：2026-09-10
 > **目標系統**：Hyperliquid HyperCore L1 原生預測市場 — Outcome (HIP-4 協議標準)  
 > **單一權威聲明**：本文件取代原 `project_overview.md`，為系統唯一的設計、架構、量化模型與執行權威規範。
 
@@ -332,7 +332,7 @@ SELL_RESTING
 
 **S0/E6 實作與驗證（2026-09-06 校正）：** `OutcomeOiEntryGate` 的資料門檻不變。`launcher --live` 取得 typed `yes` 後會在 process 內啟用 official SDK execution、S0 與 E4 requote；E5 canary 仍預設關閉。`OUTCOME_LIVE_STRATEGY_ENTRY_PLACED` 寫入 target、1h/2h tier 及 `loss_reprice_pct="0.05"`。`_strategy_exit_tier()` 在 2h 後仍回傳 `(floor_return_pct, 0.05)`，但 planner 僅在 runtime 的 thesis-aware authorization 為 true 時使用 -5% loss-band；其餘情況是 +2% passive target。planner replacement cap 為 `None`，但仍有 60 秒最小重掛間隔、tick hysteresis、ownership、account truth、fresh L2、ALO non-crossing 與 cancel-confirm-rebook 限制。舊文所稱 `loss_reprice_pct=0`、break-even-only、最多兩次 replacement、以及「預設 disabled」均為已淘汰的歷史狀態，不可用於解讀目前 live 行為。
 
-**S0 no-trade band 修訂（2026-08-29）：** 新增 `OUTCOME_LIVE_STRATEGY_MIN_ENTRY_PRICE=0.55`，以 selected side 的 actual first-level maker **bid** 判斷；bid <55¢ 時 `tick_live_strategy()` 回報 `flat: live strategy no-trade band`，且不呼叫 `place_alo`。這直接排除新 1d market 的 50/50 開盤與 50–55% 中心區；三方訊號仍可能被記錄／觀察，但不構成 entry 授權。no-trade regression 與 S0 runtime tests **22 passed**；完整 Python regression **436 passed**、`py_compile`／`git diff --check` 通過。
+**S0 no-trade band 修訂（2026-08-29；submit-time 補強 2026-09-09）：** `OUTCOME_LIVE_STRATEGY_MIN_ENTRY_PRICE=0.55` 以 selected side 的 actual first-level maker **bid** 判斷；bid <55¢ 時 `tick_live_strategy()` 回報 `flat: live strategy no-trade band`，且不呼叫 `place_alo`。此外，strategy decision 與 maker state machine 的 fresh L2 submit read 是兩個不同時間點；後者也必須再次驗證 `bid ≥ 0.55`，若當中下移至 54.5¢ 等價位，回報 `entry submit price fell below configured minimum` 而不送單。這直接排除新 1d market 的 50/50 開盤與 50–55% 中心區；三方訊號仍可能被記錄／觀察，但不構成 entry 授權。
 
 **S0/E6 首張出場與 tier 修正（2026-09-06）：** 首張 ALO sell 仍必定為 fee-after target；持倉未滿 1h 不得用 loss-band，1h 後僅可收窄至 +3%，2h 後僅可收窄至 +2%。最終 tier 的 -5% loss-band 必須再通過持續反向 thesis 與流動性確認，不能由 midpoint 一次抖動單獨觸發；若 thesis 恢復同方向，改回 +2% passive target。此 loss-band 仍不使用 taker，也不是 guaranteed stop。
 
@@ -360,7 +360,7 @@ SELL_RESTING
 
 以 `./.venv/bin/python scripts/outcome_entry_gate_ablation_report.py --db logs/outcome_shadow.db --period 1d` 讀取最新 50,000 個 `strategy_events` primary IDs，輸出每 variant 的 eligible/up/down/added-vs-baseline、baseline 的 actual submitted order/official buy fill 與 baseline admitted 後的 final rejection reason。使用 bounded primary-key window 是為避免 3GB raw WS journal 對無 `event_type` index 的全表掃描阻塞 live writer；可用 `--recent-event-limit` 擴大，但報表必須顯示其 ID window。報表固定 `ready_for_live_gate_change=false`：非 baseline 沒有真實 maker-fill probability、markout、holding time 或 PnL，且同一 daily contract 的樣本高度相關，不能把 hypothetical quote 計為收益。2026-09-03 deployment 前的 DB 尚無此 schema event，所以首次 smoke 正確回報 0 observations；必須重啟正式 launcher 以開始收集。unit tests 覆蓋 12 次 WS reconnect 之後不停止、S0 successful/no-trade final attribution、variant 不改 S0 decision、report 不虛構 counterfactual PnL；完整 Python regression **476 passed**。在累積多個獨立 daily instances 並審閱這份 report 前，不得修改三方 threshold 或放寬 live entry authority。
 
-### S2 — reversal evidence, passive-loss audit, and re-entry discipline（S2-0～S2-3 實作完成；S2-4 未實作／未授權）
+### S2 — reversal evidence, passive-loss audit, and re-entry discipline（S2-0～S2-3 實作完成；原 S2-4 canary 已由後續 F5 部署取代）
 
 **現行風險事實（2026-08-31 journal audit）。** `FILL_MARKOUT` 對最近兩日 21 個 distinct maker BUY 只保存 1/5/10/30 秒窗口；其中最差 30 秒 executable markout 為 **-2.94%**（order `531072712299`），不能外推為整段持倉最大 drawdown。相同 journal 亦有一筆實際帳戶事件：17 NO @ `0.59549` 後以 `0.33414` 賣出，扣 close fee 後約 **-43.93%**；其 payload 為 `liquidity_class=taker`／`research_only`，不是本 bot 的 ALO loss-band。它證明 daily Outcome 可超越 -5% 很多，不能把 S1 的被動 quote 視為風險上限。
 
@@ -371,8 +371,8 @@ SELL_RESTING
 | **S2-0 — full holding-path telemetry（完成 2026-08-31）** | 每個 active confirmed inventory 以 event time 寫入 `OUTCOME_HOLDING_PATH_OBSERVATION`：BBO/mid、net-of-maker-fee executable exit、fill VWAP 比例、holding age、time-left、book health 與 launcher 當 tick 的 as-of OI/mark/spot-strike context。`python -m bot.outcome_holding_path_report --db logs/outcome_shadow.db --period 1d` 產出 per `(market, coin)` observation count、MAE/MFE 與 -5% breach observation/first timestamp；不會以 30 秒 markout 代替整段路徑。 | 純資料、無 exchange mutation。現有資料只會從部署後的新 active holding path 開始；歷史資料不可回填為未曾觀測的 intra-hold 路徑。 |
 | **S2-1 — pure reversal classifier（完成；shadow-only）** | `OutcomeReversalClassifier` 是不接 exchange 的純函式，輸出 `HOLD`、`WEAKENING`、`REVERSAL_CONFIRMED`、`UNKNOWN`。只有 fresh launcher context、可用 book 與連續三次同向 opposite OI/mark/spot-strike evidence 才會 confirmed；缺欄位、資料不新或不健康一律 `UNKNOWN`。runtime 只寫 `OUTCOME_REVERSAL_SHADOW_DECISION`，不以結果下單、撤單或改為 taker。 | 尚無 OOS 參數／盈利證據；confirmed 僅是 journal/lifecycle research state，不是賣出或反向開倉授權。 |
 | **S2-2 — bounded passive loss state machine（完成；ALO-only）** | 現有 2h/-5% loss-band 已有 durable `LOSS_BAND_RESTING`、`LOSS_BAND_UNFILLED`、`REVERSAL_CONFIRMED` state；每次改價仍走 ownership → cancel confirmation → inventory/fill reread → fresh L2 → ALO replacement。`LOSS_BAND_UNFILLED` 明確表示 passive -5% quote 沒有成交，不能被報成已止損。 | 仍禁止 marketable/taker，也禁止自動把 floor 降到 -10%/-20%；gap 時只記錄 path/breach，持倉仍可能保留到反彈或結算。 |
-| **S2-3 — durable post-loss limited re-entry（修訂完成 2026-09-06）** | 只有 managed loss/reversal lifecycle 已由 account truth 確認 inventory=0、owned sell 不在 open orders，且同一 `venue_order_id` 具有 official `userFills`-derived `ORDER_FILLED` 時，才寫 `OUTCOME_LOSS_EXIT_CONFIRMED`。該 event 不是由 UI、PnL、掛出 loss quote 或不同 sell order 推論。一次 confirmed loss 不再封鎖整個 daily market：固定 **15 分鐘**冷卻後，仍須通過當下 S0/Tier direction、fresh book、fee-after target headroom、risk 與 ALO gate；若重做相同 coin，新的 decision bid 必須至少收復該 official loss exit price。不同 coin 也必須有當下相反／新方向的完整 S0/Tier signal，絕不自動反手。official SDK 接受新的 resting BUY 後才 durable 記錄 `OUTCOME_LOSS_REENTRY_SUBMITTED`，同一 market 只消耗一次 token；第二次 loss／第二次 re-entry 仍封鎖至 rollover。舊 S2-3 event 缺 loss price 時只可由其引用的 immutable official fill 讀回，讀不到則 fail-closed。 | 防止 loss 後同 tick 追進，同時避免新 daily market 的單次早期損失浪費剩餘 24 小時。固定常數而非 `.env` 人工調參；不放寬 size、ALO、S3 或一般方向 gate。 |
-| **S2-4 — limited live canary** | 只在 S2-0 至 S2-3 各自通過後，以既有 $11、單一 inventory/order、完整 journal、kill switch、同一 daily market做一個 bounded canary。 | 先驗證 lifecycle correctness，不因少量成功提高 size；若有 unmanaged order、stale data、未對帳 fill 或 official settlement 缺口，立即停止新 entry。 |
+| **S2-3 — durable post-loss limited re-entry（修訂完成 2026-09-10）** | 只有 managed lifecycle 已由 account truth 確認 inventory=0、owned sell 不在 open orders，且同一 `venue_order_id` 具有 official `userFills`-derived `ORDER_FILLED` 時才可評估。進一步必須將該 SELL 與其前一張 bot-owned entry order 的完整 official BUY fills 精確配對，並以 `SELL proceeds − SELL fee − (BUY notional + BUY fees) < 0` 驗證 fee-inclusive realized loss，才寫 `OUTCOME_LOSS_EXIT_CONFIRMED`。`REVERSAL_CONFIRMED` 只是風險狀態，不是損失證據；即使 lifecycle 曾標示 reversal，若最終賣出仍有淨利，絕不可消耗 re-entry token。讀取既有 v1 loss event 時也會以同一 immutable fills 重算；只有能證明為非虧損者會被忽略，其餘缺資料／無法判定的 legacy event 維持 fail-closed。一次 verified loss 不再封鎖整個 daily market：固定 **15 分鐘**冷卻後，仍須通過當下 S0/Tier direction、fresh book、fee-after target headroom、risk 與 ALO gate；若重做相同 coin，新的 decision bid 必須至少收復該 official loss exit price。不同 coin 也必須有當下相反／新方向的完整 S0/Tier signal，絕不自動反手。official SDK 接受新的 resting BUY 後才 durable 記錄 `OUTCOME_LOSS_REENTRY_SUBMITTED`，同一 market 只消耗一次 token；第二次 verified loss／第二次 re-entry 仍封鎖至 rollover。舊 S2-3 event 缺 loss price 時只可由其引用的 immutable official fill 讀回，讀不到則 fail-closed。 | 防止 loss 後同 tick 追進，同時避免「曾偵測 reversal、實際卻獲利平倉」被錯當 loss 而浪費整個市場的交易機會。固定常數而非 `.env` 人工調參；不放寬 size、ALO、S3 或一般方向 gate。 |
+| **S2-4 — historical $11 limited-canary proposal（已取代）** | 原規劃是在 S2-0 至 S2-3 後，以 `$11`、單一 inventory/order、完整 journal 與 kill switch 做 bounded canary。其後的實際受限部署已由 F5 `$20` capacity-aware canary、比例化 portfolio guard 與 execution-quality report 接手。它不是尚待實作的里程碑，也不得將 `$11` 視為現行上限。 | 後續任何 size 或 lifecycle 改動仍須遵守 F5 的 evidence／approval 邊界；不可把歷史 canary 文字當作放寬策略的依據。 |
 
 **S2 後的決策規則。** S2 本身仍只負責早期辨識、被動減損、避免重複進場與量化尾端風險；它不是 guaranteed stop。操作者已於 2026-08-31 另行核准下列 S3 受限 emergency IOC path。它是不同於 ALO-only 的高風險權限，絕不可由 S2 classifier、一般 `reversal` 名稱或提高資金自行推導。
 
@@ -501,13 +501,17 @@ X3 是離線建構，沒有網路或交易呼叫；collector 持續寫入後可�
 
 **P3 bounded-window／fill-time context repair（完成 2026-09-05）：** 已完成上述下一項工程，且不改變任何 live entry、exit、SDK 或 notional 權限。每個 accepted P2 snapshot 現僅將兩側 BBO 與最小 context 寫入 `outcome_p3_quote_index`；其 `(outcome_id, period, coin, snapshot_timestamp_ms)` index 只保留 **5 分鐘**。`outcome_p3_pending_fills` 只保存尚可能取得 5/10/30 秒 evidence 的 actual maker fill，最終 target window（32.5 秒）過後立即清除。capture 不再全表解析 `strategy_events` 或 `order_events`；account poll 發現 fill 時先從 quote index 取得其 **fill 前／同時** as-of context，並可立即比對已在短窗中的 target quote，後續 target 由新的 snapshot 逐一完成。新 `FILL_MARKOUT` 必須帶 `fill_context_status=asof_or_before_fill`、fill-time context timestamp 與 source snapshot id；P3 report、ResearchGate 與 X3 overlay 均排除缺少此欄位的舊 v2/backfill rows。舊 raw P2 journal 不刪除、不重寫，也不會被新程式假裝成剛觀測到的樣本。新 table 由重啟後的 `TradeJournalDB` migration 自動建立；首次新 process 的舊 userFills 若已過 32.5 秒，仍只保存 immutable raw fill、不重灌為 pending P3 sample。定向 tests **19 passed**、完整 Python regression **485 passed**、`compileall`／`git diff --check` 通過。
 
-**F1 — 1d live 策略的頻率與部位擴張計劃（2026-09-05；Tier-B code 完成、operator experiment 尚未啟用）：** canonical FIFO audit 如實保存 122 個 closed lots、110 個正收益與總 realized net **+$10.8963**。其中 **-$10.5261** 是操作者在 S2/S3 stop-loss 尚未存在時，刻意讓錯側倉位持有到期以保存完整失敗資料的歷史 incident；它不得用作判斷目前有 stop-loss contract 的 S0 策略是否可提高頻率／部位的反對證據，也不得從 immutable journal 或總歷史 PnL 中刪除。第一性原則是：不要同時改變方向 gate 與 size，否則任何結果都無法歸因；除此之外，不新增任意 sample-count、shadow run 或額外研究 gate。
+**F1 — 1d live 策略的頻率與部位擴張計劃（2026-09-05；歷史部署紀錄，現行規格以 F5 為準）：** canonical FIFO audit 如實保存 122 個 closed lots、110 個正收益與總 realized net **+$10.8963**。其中 **-$10.5261** 是操作者在 S2/S3 stop-loss 尚未存在時，刻意讓錯側倉位持有到期以保存完整失敗資料的歷史 incident；它不得用作判斷目前有 stop-loss contract 的 S0 策略是否可提高頻率／部位的反對證據，也不得從 immutable journal 或總歷史 PnL 中刪除。第一性原則是：不要同時改變方向 gate 與 size，否則任何結果都無法歸因；除此之外，不新增任意 sample-count、shadow run 或額外研究 gate。
+
+**歷史閱讀界線（2026-09-10）：** 下列 F1-0 至 F1-3 記錄的是當時由 `$11` 到 Tier-B／`$20` 的分階段部署構想，不是當前開關或 notional。現行 live contract 是 F5 的 `$20` capacity-aware lane、比例化 portfolio guard 與 runtime 中的 Tier-A/B gate；實際值仍只由目前 `.env` 與啟動後 process 讀取。這個界線避免把「預設關閉／尚未啟用」等歷史文字誤解成現況。
 
 1. **F1-0：必要的安全部署確認。** 重啟現有 live launcher，即啟用已完成的 read-only P3 capture worker；既有 live strategy 可繼續交易。只需確認 heartbeat 未 stale 與 WS/REST recovered 後才新下單，這是防止使用斷線／舊 book 下單的既有安全不變量，不是額外的策略驗證或 shadow 工作。
 2. **F1-1：Tier-B 開關（完成；預設關閉）。** `OUTCOME_TIER_B_ENABLED=0` 已寫入 `.env` 與 `.env.example`。設為 `1` 時，原本 `spot ∧ Binance mark ∧ OI activity` 的 Tier-A 優先不變；**只有** Tier-A 不成立、但 spot 與 Binance mark 同向時，才允許 `tier_b_spot_mark` entry。fresh Binance OI observation 仍是必需資料健康條件，因 Binance mark 即來自同一 durable stream；放寬的是 OI「必須上升」的 predicate，不把 OI 當方向訊號。50–55¢ no-trade band、fresh WS/REST、price ceiling、fee-after exit、單一 inventory/order、ALO、S2/S3 全部不變。每筆 Tier-B entry 在 `ORDER_SUBMIT`、`OUTCOME_LIVE_STRATEGY_ENTRY_PLACED` 與 admission evidence 均保存 `entry_tier=tier_b_spot_mark`，重啟後的 exit recovery 也接受該 audit policy。gate／runtime audit／recovery 定向 tests **32 passed**。
 3. **F1-2：最小實驗與正式化。** operator 要試用時只改 `OUTCOME_TIER_B_ENABLED=1` 並重啟；若需立即停用，改回 `0` 後重啟。此實驗不需要另開 shadow、也不改手動 target／stop 參數。當 Tier-B 出現 lifecycle／ownership／exit 調和問題時立即關回 `0`；若沒有這類操作性問題，下一次代碼整理移除 env 開關、將 Tier-B 納入正式選邊規則，藉此回到最少人為參數的原則。
 4. **F1-3：$20 部位。** Tier-B 先保持既有 $11；不要在同一個部署同時提高至 $20。待 Tier-B 實際運行無 lifecycle 問題後，將兩個既有硬上限 `OUTCOME_MAX_ENTRY_NOTIONAL_USDC` 與 `OUTCOME_MAX_OUTCOME_EXPOSURE_USDC` 同步改為 `$20`，單一 order/inventory 不變。這是唯一必要的 size 變更；不引入新的動態 sizing、daily-loss 參數或任意驗收門檻。一筆 $20 的最壞虧損接近 $20，S3 的時間／reversal／slippage 限制仍是唯一 emergency protection，並非保證成交。
-5. **F1-4：附件 log 的必要修正計劃。** 2026-09-05 17:28:59–17:31:07 的 `l2Book`／`userFills` HTTP 502 及 WS 502 是 venue temporary outage；client 已依 1/2/4/8/16/30 秒退避重連並於 17:31:07 連回，runtime 在此期間正確以 `ws_disconnected`／`ws_rest_resync_required` 禁止新 entry，無需放寬或另造 reconnect 機制。#1201 則是獨立的 accounting state：官方 SDK 已回 `settleFraction=1`，但 canonical ledger 仍有一筆 5 YES shares 的未配對 opening lot，當下 `userFills` 未提供其 official `dir=settlement` payout，所以 `pending_winning_payout_evidence` 是正確保守狀態、不是可直接猜成 PnL 的錯誤。下一個小型修正只做兩件事：(a) 將相同 pending settlement status 的 terminal log 改為狀態轉移時才輸出，避免每 30 秒重複訊息；(b) 將 official settlement payout evidence 以 persistent cursor／專用 read path 補入 journal，讓 endpoint 的短回溯窗口不會永久遺失已發生 payout。未取得官方 payout 前禁止用 UI 或 `settleFraction=1` 猜測收益；此修正不影響 active-market entry。
+5. **F1-4：settlement evidence cursor 與 terminal 去重（完成；2026-09-10）。** 2026-09-05 17:28:59–17:31:07 的 `l2Book`／`userFills` HTTP 502 及 WS 502 是 venue temporary outage；client 已依 1/2/4/8/16/30 秒退避重連，runtime 在此期間正確以 `ws_disconnected`／`ws_rest_resync_required` 禁止新 entry。這與 #1201 的 accounting state 不同：SDK `settleFraction=1` 並不足以產生 PnL，仍須 official `dir=settlement` payout 或 losing-side zero balance。
+
+   `OutcomeSettlementWorker` 現使用獨立、唯讀的 `userFillsByTime` read path，按 wallet 保存 high-water cursor，查詢時保留 60 秒重疊並以 immutable settlement `trade id` 去重後寫入 `outcome_settlement_payout_fills`。首次啟用只回看 7 天；官方單次回覆達 2,000 fills 時，worker 寫 `OUTCOME_SETTLEMENT_PAYOUT_CURSOR_BLOCKED` 且**不推進** cursor，避免把不完整窗口誤認為已完全讀取。成功的空窗口仍安全推進至觀測時間。running settlement 將本輪 official fills 與此持久 evidence 合併後才交給既有 reconciliation；worker 沒有 gateway、submit 或 cancel 權限，故不影響 active-market entry。`outcome_settlement_status` 只在 status transition 寫入／輸出 terminal，重啟後相同 pending state 不再每 30 秒重複。歷史上在 endpoint 可見範圍外且本機從未保存的 payout（例如舊 #1201）仍不可事後偽造，會維持 pending。這些 migration 在**下次 launcher restart**時建立並開始收集，絕不要求中斷現正運行的 bot。
 
 **F1 post-deployment DB audit（2026-09-05 12:35–14:07 UTC）：** Tier-B 已確實生效，而非只停在 telemetry：在 29 次 admission 中，26 次沒有 spot+mark 同向、2 次為 Tier-A、1 次為 Tier-B。Tier-B 在 13:02:55 UTC 以 `up_spot_mark_tier_b_confirmed` 送出 18 shares YES ALO buy（decision bid 0.58；OI 5m change -4.94 bps、mark +5.93 bps、spot-strike +20.93 bps），官方 maker fill 為 0.575；最終 18 shares maker sell 為 0.61338，cost $10.3500、proceeds $11.03660032（已扣 $0.00423968 sell fee）、canonical realized net **+$0.68660032**。這證明 Tier-B switch、audit provenance、fill reconciliation、exit lifecycle 與 canonical FIFO 的完整 happy path 均正常；它只有一筆，不能單獨宣稱 Tier-B edge 或頻率提升幅度。新的 bounded P3 quote index 在最後 5 分鐘有 40 accepted snapshots（39 個間隔平均 **7.568 秒**、最大 **20.352 秒**、0 個 >30 秒 gap），相較舊 51–72 秒 gap 已大幅改善；這筆 buy/sell 均正確生成 v2 10/30 秒 markout，elapsed 7.629–29.663 秒、target lag 均在 ±2.5 秒，且都帶 `fill_context_status=asof_or_before_fill`。5 秒 label 沒有被偽造：實際 cadence 尚不足以對該兩筆 fill 取得 5 秒 ±2.5 秒 quote，故正確缺失。
 
@@ -641,6 +645,19 @@ X3 是離線建構，沒有網路或交易呼叫；collector 持續寫入後可�
 唯讀命令 `python -m bot.outcome_market_regime_report --db logs/outcome_shadow.db --period 1d` 匯總 state／reason 次數、toxic-fill observation 與每筆 actual S0 entry 當時最近的同市場 shadow regime；它不回放 book、不估計 queue、不推論未觀測 fills，缺 label 明列為 `missing`，絕不可解讀為 trend 或策略績效。
 
 **G13 promotion sequence（尚未授權跳過）。** 先用 shadow report 比較 strict Tier-A/B 的 actual entry 與 counterfactual `TRANSITION/RANGE` labels：必須確認它保留長時段一致趨勢、又能識別 multi-horizon conflict／durable crossover，而非只因 price 高而拒絕。其後只可依序提案：(1) `TRANSITION` cancel-only / no-new-entry canary；(2) 持倉 thesis monitor 的 passive-only target/loss-band adjustment；(3) toxic-fill 的一次 price-protected marketable exit。第 (3) 必須額外證明候選在當時完整 L2 depth 與既有 loss cap 內可退出，且不能只用浮虧百分比；曾深度浮虧後恢復 target 的 lifecycle 是此 gate 的反例。每一層均需獨立 operator approval、durable audit 與 regression，不能由 shadow state 自動取得 mutation authority。
+
+### G15 — late high-price continuation（研究構想；未實作／未授權 live）
+
+**問題定義。** Outcome 1d 的某一 side 高於 90¢ 時，現行 `OutcomeExitTargetPolicy` 仍只以最近 5 分鐘 executable mid move 選擇 fee-after **1–5%** target，並不讀取距結算時間。因此高價 entry 可能因近期波動很低而使用約 +1% target；這不是 `>0.90` 的買入限制，也不是刻意將高價交易縮成固定 +1%。高價本身也不能因「距結算只剩數小時」視為低風險：在 92¢ 買入，理論最大上行約 8¢、而錯誤 outcome 的損失仍接近 92¢。時間只改變可波動窗口，不能取代 outcome 的結算風險、spot-to-strike 安全距離或 order-book 流動性。
+
+**目前 journal 的初步觀察（2026-09-10；只作研究基線）。** 已接受 P2 snapshots 中，距結算 5 小時內、起始 executable best bid ≥90¢ 的 5 分鐘比較有約 **1,155** 個 quote observations，但只來自約 **11** 個獨立 daily markets，不能把重複 quote 當成 1,155 次獨立交易。該資料的 5 分鐘 bid change 中位數約 0¢、5% 分位約 **-2.09¢**，約 30% 為負；15 分鐘與 30 分鐘的 5% 分位約 **-4.43¢／-6.48¢**。細分為 3–5h、1–3h、0–1h 時，5 分鐘 5% 分位約為 **-2.98¢／-1.02¢／-3.56¢**；最後 1h 曾見接近 outcome 全面翻轉的極端路徑。這些數字沒有 counterfactual fill、queue position 或完整 settlement coverage，絕不可當成 alpha、勝率或直接 live threshold。
+
+**日後研究順序（暫不改任何 entry、exit、target、size 或 `.env`）。**
+
+1. 建立 read-only `late_high_price` report，依 price bucket（85/90/92/95¢）、time-left（0–1h、1–3h、3–5h、5h+）、Tier-A/B、weekday/weekend、regime、spread、depth、spot-to-strike buffer 與 5m/15m direction 分桶，輸出 executable BBO 的 5/15/30m forward move、最大不利路徑、settlement、target 可達性與實際 fill/exit；counterfactual 一律與 actual fills 分開。
+2. 先累積更多完整 daily market episodes，再評估「late high-price continuation」：候選不僅要剩 1–5h，也要同時保留 strict S0/Tier、fresh book、capacity、spread/depth/drift、G13 non-transition/non-toxic 狀態，並將 spot-to-strike 距離相對於剩餘時間的實現波動正規化。不可僅以 `bid > .90` 或 countdown 作為 entry 訊號。
+3. 若資料顯示可行，才另提一個 shadow-only dynamic target：在 fee 後 1–3% 範圍比較目標可達性、剩餘至 1.0 headroom、book depth 與下行 tail；例如 92¢→95¢ 是約 3.26% 價格移動，不可先假定必然比現行約 1% 或 5% 更好。
+4. 任何 live canary 都必須單獨獲得操作者授權，且初始每 market 最多一次、維持既有 $20 cap、ALO-only、S2/S3、portfolio guard 與完整 submit/holding/exit audit。資料不足、high-price bucket 的 tail 明顯惡化或 final-hour flip 無法被 buffer/regime 條件排除時，維持不啟用。
 
 **G13 verification。** 新增 deterministic tests 覆蓋 multi-horizon trend、5m/15m conflict transition、兩次 durable 48/52 crossover range、單 tick 不得算 crossover，以及 toxic fill 必須同時有價格／depth 惡化且三次／五秒確認；完整 Python suite 為 **264 passed**，另以 `compileall` 驗證 runtime import。這是 classifier correctness，不是 alpha、stop-loss 效益或 live fill quality 的證明；首次重啟後須確認 journal 出現 `OUTCOME_MARKET_REGIME_SHADOW`，而新的 official fill 前兩分鐘才可能產生 `OUTCOME_TOXIC_FILL_SHADOW`。
 
@@ -913,45 +930,23 @@ flowchart TD
 ```text
 /Users/cheng-kaihuang/Hyperliquid_prediction_bot/
 ├── bot/
-│   ├── adapters/
-│   │   ├── outcome_auth.py        # Agent Key 生成、MessagePack、EIP-712 簽名與 Asset ID 計算
-│   │   └── outcome_client.py      # 原生 Python 非同步/同步 REST (/info, /exchange) 與 WebSocket 串流
-│   ├── lifecycle/
-│   │   ├── outcome_lifecycle.py   # class:priceBinary 規格解析、15m 市場發現與狀態流轉
-│   │   └── legacy.py              # 兼容輔助函式
-│   ├── pricing/
-│   │   └── outcome_pricing.py     # HyperCore BTC Mark Price、L2 盤口追蹤與 10 USDC 經濟學門檻
-│   ├── execution/
-│   │   └── outcome_execution.py   # 舊共用 execution 規格；Outcome 正式 live path 不使用 IOC/taker
-│   ├── outcome_event_bridge.py    # HIP-4 fills / settlement 證據至既有 journal schema
-│   ├── outcome_snapshot_bridge.py # Outcome market book 至既有 MarketSnapshot / PositionState
-│   ├── outcome_account_sync.py    # 唯讀帳戶同步：balances、open orders、fills
-│   ├── outcome_shadow_runner.py   # 唯讀 market/account → PositionManager / ExitEngine / journal
-│   ├── signal_engine.py           # 核心機率偏離評估與 side_score 計算
-│   ├── forecast_state.py          # Sigma 波動度、時間衰減與 Delta 計算
-│   ├── strong_directional_regime.py # 勝率校準分桶與 Resolution EV 機制
-│   ├── position_manager.py        # 單市場 1 筆預算管制與倉位鎖定
-│   ├── app_config.py              # 統一組態配置 (含 HyperliquidConfig)
-│   ├── launcher.py                # 啟動器、預檢 (Preflight) 與多環境管理
-│   └── enums.py                   # MarketPhase, ActiveSide 等枚舉
-├── monitoring/
-│   ├── trade_journal_db.py        # SQLite 本地交易日誌與事件審計
-│   └── pnl_attribution.py         # PnL 多維度歸因分析
-├── execution/
-│   ├── maker_engine.py            # 做市報價計劃生成
-│   └── rebate_model.py            # 費率與 QuoteEconomics 結構
-├── config/
-│   ├── operator.env.example       # 支援的維運人員設定檔範本
-│   └── profiles/
-│       └── btc15_twap_v3.env      # 基準策略參數配置
-├── tests/                         # 310+ 完整單元與回歸測試套件
-├── scripts/outcome_shadow.py      # 正式唯讀 shadow 資料收集命令
-├── scripts/outcome_shadow_dashboard.py # 唯讀 SQLite telemetry dashboard
-├── .env.example                   # 本地環境變數範例 (含 HL_* 密鑰)
-├── README.md                      # 英文官方操作文檔
-├── docs/
-│   └── readme_ZH.md               # 繁體中文官方操作文檔
-└── run_bot.py                     # 主策略執行入口
+│   ├── launcher.py                         # 唯一 live 入口與 typed confirmation
+│   ├── outcome_live_execution_runtime.py   # current market orchestration
+│   ├── outcome_maker_state_machine.py      # ALO buy/sell state transitions
+│   ├── outcome_execution_gateway.py        # 唯一 SDK mutation boundary
+│   ├── outcome_settlement_worker.py        # 獨立唯讀 settlement/payout evidence worker
+│   ├── outcome_pnl_reconciliation.py       # immutable-fill FIFO / settlement lots
+│   ├── outcome_portfolio_guard.py          # $20 session / rolling loss protection
+│   ├── outcome_market_regime.py             # read-only regime / toxic-fill observations
+│   ├── adapters/outcome_client.py           # HyperCore REST/WS read client
+│   └── pricing/、lifecycle/                 # Outcome book / market discovery
+├── outcome_sdk_sidecar/src/main.ts          # 官方 HIP-4 SDK 常駐 sidecar
+├── monitoring/trade_journal_db.py           # SQLite journal、payout cursor 與 status
+├── scripts/                                 # OI collector、health、maintenance、reports
+├── tests/                                   # Outcome-only regression suite
+├── .env.example                             # supported local configuration template
+├── README.md                                # current runbook
+└── hyperliquid_project_overview.md          # 唯一權威設計文件
 ```
 
 ---

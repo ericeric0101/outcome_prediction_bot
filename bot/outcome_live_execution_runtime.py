@@ -2067,6 +2067,7 @@ class OutcomeLiveExecutionRuntime:
         result = self.machine.tick(
             market=market, side_index=entry_side_index, entry_permitted=True,
             entry_audit=entry_audit, entry_max_submit_price=entry_max_submit_price,
+            entry_min_submit_price=config.min_entry_price,
             entry_requested_shares=Decimal(shares),
             entry_max_notional=self.risk_gate.limits.max_entry_notional_usdc,
         )

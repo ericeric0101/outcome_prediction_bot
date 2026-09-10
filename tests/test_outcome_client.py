@@ -42,6 +42,30 @@ def test_sync_user_fees_uses_the_official_read_only_info_request(monkeypatch):
     assert calls == [{"type": "userFees", "user": "0x" + "b" * 40}]
 
 
+def test_sync_user_fills_by_time_uses_official_read_only_info_request(monkeypatch):
+    client = OutcomeClient(OutcomeAuth(wallet_address="0x" + "a" * 40, is_testnet=True))
+    calls = []
+
+    def fake_post_info(payload, **_kwargs):
+        calls.append(payload)
+        return []
+
+    monkeypatch.setattr(client, "post_info_sync", fake_post_info)
+    assert client.get_user_fills_by_time_sync(
+        "0x" + "b" * 40,
+        start_time_ms=123,
+        end_time_ms=456,
+    ) == []
+    assert calls == [
+        {
+            "type": "userFillsByTime",
+            "user": "0x" + "b" * 40,
+            "startTime": 123,
+            "endTime": 456,
+        }
+    ]
+
+
 def test_execution_client_can_fail_fast_without_retry_backoff(monkeypatch):
     client = OutcomeClient(OutcomeAuth(wallet_address="0x" + "a" * 40, is_testnet=True), timeout_sec=3, info_max_retries=1)
     request = httpx.Request("POST", "https://example.test/info")

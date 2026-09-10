@@ -152,6 +152,7 @@ class OutcomeMakerStateMachine:
         loss_band_authorized: bool = False,
         entry_audit: Mapping[str, object] | None = None,
         entry_max_submit_price: Decimal | None = None,
+        entry_min_submit_price: Decimal | None = None,
         entry_requested_shares: Decimal | None = None,
         entry_max_notional: Decimal | None = None,
     ) -> MakerTickResult:
@@ -284,6 +285,17 @@ class OutcomeMakerStateMachine:
             return MakerTickResult("blocked", "entry requested shares must be positive whole inventory")
         if entry_max_notional is not None and requested_shares is not None and bid * requested_shares > entry_max_notional:
             return MakerTickResult("flat", "entry submit notional exceeds configured cap after price drift")
+        # The no-trade band is an execution constraint, not merely a
+        # decision-time heuristic.  A fresh sidecar/L2 read can move lower
+        # between strategy selection and the actual ALO submit; do not turn a
+        # valid 0.55 decision into a 0.545 opening order.
+        if entry_min_submit_price is not None and bid < entry_min_submit_price:
+            audit = dict(entry_audit or {})
+            audit.update({
+                "entry_submit_bid": str(bid),
+                "entry_min_submit_price": str(entry_min_submit_price),
+            })
+            return MakerTickResult("flat", "entry submit price fell below configured minimum", audit=audit)
         if entry_max_submit_price is not None and bid > entry_max_submit_price:
             audit = dict(entry_audit or {})
             decision_bid = audit.get("entry_bid_at_decision")

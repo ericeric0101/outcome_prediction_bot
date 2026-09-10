@@ -152,6 +152,32 @@ class TradeJournalDB:
             recorded_at TEXT NOT NULL
         );
 
+        -- ``userFills`` is a bounded recent window.  Settlement payout fills
+        -- need their own durable high-water mark so a delayed settlement is
+        -- not lost before the generic account-recovery poll sees it.
+        CREATE TABLE IF NOT EXISTS outcome_settlement_fill_cursor (
+            wallet_address TEXT PRIMARY KEY,
+            last_timestamp_ms INTEGER NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS outcome_settlement_payout_fills (
+            wallet_address TEXT NOT NULL,
+            trade_id TEXT NOT NULL,
+            timestamp_ms INTEGER NOT NULL,
+            payload_json TEXT NOT NULL,
+            observed_at TEXT NOT NULL,
+            PRIMARY KEY (wallet_address, trade_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_outcome_settlement_payout_wallet_time
+            ON outcome_settlement_payout_fills(wallet_address, timestamp_ms);
+        -- Persistent status suppresses a terminal-log line every 30 seconds
+        -- while payout evidence is legitimately pending, including restarts.
+        CREATE TABLE IF NOT EXISTS outcome_settlement_status (
+            outcome_id INTEGER PRIMARY KEY,
+            status TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS strategy_events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             ts TEXT NOT NULL,
@@ -1114,6 +1140,88 @@ class TradeJournalDB:
                 return True
         except Exception as e:
             logger.debug(f"TradeJournalDB record_outcome_market_settlement_once failed: {e}")
+            return False
+
+    def load_outcome_settlement_fill_cursor(self, wallet_address: str) -> int | None:
+        try:
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT last_timestamp_ms FROM outcome_settlement_fill_cursor WHERE wallet_address=?",
+                    (str(wallet_address).lower(),),
+                ).fetchone()
+            return int(row[0]) if row is not None else None
+        except (sqlite3.Error, TypeError, ValueError):
+            return None
+
+    def record_outcome_settlement_payout_fills(
+        self, *, wallet_address: str, fills: list[Dict[str, Any]], cursor_timestamp_ms: int,
+    ) -> int:
+        """Persist official settlement fills and advance only after a complete window."""
+        wallet = str(wallet_address).lower()
+        inserted = 0
+        try:
+            with self._connect() as conn:
+                for fill in fills:
+                    if str(fill.get("dir", "")).strip().lower() != "settlement":
+                        continue
+                    timestamp = int(fill.get("time", fill.get("timestamp")))
+                    trade_id = str(fill.get("tid") or fill.get("tradeId") or "")
+                    if not trade_id:
+                        # The official payload normally supplies ``tid``.  If
+                        # it does not, retain a deterministic evidence key;
+                        # never use local receive time as an exchange fact.
+                        trade_id = "fallback:" + ":".join(str(fill.get(key, "")) for key in (
+                            "hash", "oid", "coin", "side", "px", "sz", "time",
+                        ))
+                    cursor = conn.execute(
+                        """INSERT OR IGNORE INTO outcome_settlement_payout_fills
+                           (wallet_address,trade_id,timestamp_ms,payload_json,observed_at)
+                           VALUES (?,?,?,?,?)""",
+                        (wallet, trade_id, timestamp, _json_dumps(fill), _utc_now_iso()),
+                    )
+                    inserted += max(0, int(cursor.rowcount))
+                conn.execute(
+                    """INSERT INTO outcome_settlement_fill_cursor(wallet_address,last_timestamp_ms,updated_at)
+                       VALUES (?,?,?)
+                       ON CONFLICT(wallet_address) DO UPDATE SET
+                         last_timestamp_ms=MAX(last_timestamp_ms, excluded.last_timestamp_ms),
+                         updated_at=excluded.updated_at""",
+                    (wallet, int(cursor_timestamp_ms), _utc_now_iso()),
+                )
+                conn.commit()
+            return inserted
+        except (sqlite3.Error, TypeError, ValueError):
+            return 0
+
+    def load_outcome_settlement_payout_fills(self, wallet_address: str) -> list[Dict[str, Any]]:
+        try:
+            with self._connect() as conn:
+                rows = conn.execute(
+                    """SELECT payload_json FROM outcome_settlement_payout_fills
+                       WHERE wallet_address=? ORDER BY timestamp_ms ASC""",
+                    (str(wallet_address).lower(),),
+                ).fetchall()
+            return [payload for (raw,) in rows if isinstance((payload := json.loads(raw or "{}")), dict)]
+        except (sqlite3.Error, TypeError, ValueError, json.JSONDecodeError):
+            return []
+
+    def update_outcome_settlement_status(self, *, outcome_id: int, status: str) -> bool:
+        """Return true only for a durable settlement-state transition."""
+        try:
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT status FROM outcome_settlement_status WHERE outcome_id=?", (int(outcome_id),)
+                ).fetchone()
+                if row is not None and str(row[0]) == str(status):
+                    return False
+                conn.execute(
+                    """INSERT INTO outcome_settlement_status(outcome_id,status,updated_at) VALUES (?,?,?)
+                       ON CONFLICT(outcome_id) DO UPDATE SET status=excluded.status, updated_at=excluded.updated_at""",
+                    (int(outcome_id), str(status), _utc_now_iso()),
+                )
+                conn.commit()
+            return True
+        except (sqlite3.Error, TypeError, ValueError):
             return False
 
     def upsert_outcome_oi_feature_row(self, *, feature_schema_version: int, outcome_snapshot_event_id: int,
