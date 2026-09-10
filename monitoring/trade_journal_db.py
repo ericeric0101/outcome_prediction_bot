@@ -235,6 +235,32 @@ class TradeJournalDB:
         CREATE INDEX IF NOT EXISTS idx_outcome_p3_pending_market_expiry
             ON outcome_p3_pending_fills(outcome_id, period, expires_at_ms);
 
+        -- Compact read-only evidence for candidates rejected solely because
+        -- their entry spread exceeded the live ceiling.  This deliberately
+        -- records no order intent and is sampled at most once per five-minute
+        -- bucket/coin by the runtime.
+        CREATE TABLE IF NOT EXISTS outcome_wide_spread_candidates (
+            candidate_id TEXT PRIMARY KEY,
+            outcome_id INTEGER NOT NULL,
+            period TEXT NOT NULL,
+            coin TEXT NOT NULL,
+            observed_at_ms INTEGER NOT NULL,
+            payload_json TEXT NOT NULL,
+            recorded_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_outcome_wide_spread_candidate_market_time
+            ON outcome_wide_spread_candidates(outcome_id, period, coin, observed_at_ms);
+        CREATE TABLE IF NOT EXISTS outcome_wide_spread_candidate_paths (
+            candidate_id TEXT NOT NULL,
+            horizon_sec INTEGER NOT NULL,
+            observed_at_ms INTEGER NOT NULL,
+            best_bid TEXT,
+            best_ask TEXT,
+            payload_json TEXT NOT NULL,
+            recorded_at TEXT NOT NULL,
+            PRIMARY KEY (candidate_id, horizon_sec)
+        );
+
         -- Append-only Binance USDⓈ-M observations for Outcome BTC 1d research.
         -- A dedicated table avoids treating a historical REST backfill as if
         -- it had been observable at the same latency as a live event.
@@ -829,6 +855,72 @@ class TradeJournalDB:
         except Exception as e:
             logger.debug(f"TradeJournalDB load_fair_edge_bucket_shadow_simulations failed: {e}")
             return []
+
+    def record_outcome_wide_spread_candidate(
+        self, *, candidate_id: str, outcome_id: int, period: str, coin: str,
+        observed_at_ms: int, payload: Dict[str, Any],
+    ) -> bool:
+        """Persist one read-only wide-spread candidate, idempotently."""
+        try:
+            with self._connect() as conn:
+                cursor = conn.execute(
+                    """INSERT OR IGNORE INTO outcome_wide_spread_candidates
+                       (candidate_id, outcome_id, period, coin, observed_at_ms, payload_json, recorded_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (candidate_id, outcome_id, period, coin, observed_at_ms, _json_dumps(payload), _utc_now_iso()),
+                )
+                conn.commit()
+                return cursor.rowcount == 1
+        except Exception as e:
+            logger.debug(f"TradeJournalDB record_outcome_wide_spread_candidate failed: {e}")
+            return False
+
+    def due_outcome_wide_spread_candidate_paths(
+        self, *, outcome_id: int, period: str, coin: str, observed_at_ms: int,
+        tolerance_ms: int = 30_000,
+    ) -> list[tuple[str, int]]:
+        """Return candidate/horizon pairs whose forward BBO is due now.
+
+        A tolerance makes the evidence resilient to the five-second capture
+        cadence without pretending an unavailable exact timestamp existed.
+        """
+        try:
+            query = """
+                SELECT c.candidate_id, h.horizon_sec
+                FROM outcome_wide_spread_candidates c
+                CROSS JOIN (SELECT ? AS horizon_sec UNION ALL SELECT ? UNION ALL SELECT ?) h
+                LEFT JOIN outcome_wide_spread_candidate_paths p
+                  ON p.candidate_id=c.candidate_id AND p.horizon_sec=h.horizon_sec
+                WHERE c.outcome_id=? AND c.period=? AND c.coin=? AND p.candidate_id IS NULL
+                  AND c.observed_at_ms <= ?
+                  AND c.observed_at_ms + h.horizon_sec * 1000 <= ?
+                  AND c.observed_at_ms + h.horizon_sec * 1000 >= ?
+                ORDER BY c.observed_at_ms
+            """
+            parameters = [300, 900, 1800, outcome_id, period, coin, observed_at_ms, observed_at_ms, observed_at_ms - tolerance_ms]
+            with self._connect() as conn:
+                return [(str(row[0]), int(row[1])) for row in conn.execute(query, parameters).fetchall()]
+        except Exception as e:
+            logger.debug(f"TradeJournalDB due_outcome_wide_spread_candidate_paths failed: {e}")
+            return []
+
+    def record_outcome_wide_spread_candidate_path(
+        self, *, candidate_id: str, horizon_sec: int, observed_at_ms: int,
+        best_bid: str | None, best_ask: str | None, payload: Dict[str, Any],
+    ) -> bool:
+        try:
+            with self._connect() as conn:
+                cursor = conn.execute(
+                    """INSERT OR IGNORE INTO outcome_wide_spread_candidate_paths
+                       (candidate_id, horizon_sec, observed_at_ms, best_bid, best_ask, payload_json, recorded_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (candidate_id, horizon_sec, observed_at_ms, best_bid, best_ask, _json_dumps(payload), _utc_now_iso()),
+                )
+                conn.commit()
+                return cursor.rowcount == 1
+        except Exception as e:
+            logger.debug(f"TradeJournalDB record_outcome_wide_spread_candidate_path failed: {e}")
+            return False
 
     def log_strategy_event(self, run_id: str, event_type: str, payload: Optional[Dict[str, Any]] = None) -> Optional[int]:
         sql = "INSERT INTO strategy_events (ts, run_id, event_type, payload_json) VALUES (?, ?, ?, ?)"

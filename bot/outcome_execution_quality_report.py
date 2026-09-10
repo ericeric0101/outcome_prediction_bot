@@ -97,6 +97,20 @@ def report(db_path: str | Path, *, period: str = "1d") -> dict[str, Any]:
         ).fetchall()
 
     events = [dict(row) for row in order_rows]
+    markouts_by_fill: dict[str, dict[str, Any]] = defaultdict(dict)
+    p3_horizon_counts: dict[str, int] = defaultdict(int)
+    current_p3_horizon_counts: dict[str, int] = defaultdict(int)
+    for event in events:
+        if event["event_type"] != "FILL_MARKOUT":
+            continue
+        payload = _payload(event["payload_json"])
+        fill_id = payload.get("fill_id")
+        horizon = payload.get("horizon_sec")
+        if fill_id is not None and horizon is not None:
+            markouts_by_fill[str(fill_id)][str(horizon)] = payload.get("signed_markout_ps")
+            p3_horizon_counts[str(horizon)] += 1
+            if str(horizon) in {"5", "10", "30"} and payload.get("p3_markout_schema_version") == 2:
+                current_p3_horizon_counts[str(horizon)] += 1
     canary_submits = [event for event in events if _is_capacity_submit(event)]
     all_buy_submit_times = [event["ts"] for event in events if event["event_type"] == "ORDER_SUBMIT" and event["side"] == "BUY"]
     lifecycle = [(str(row["ts"]), str(row["event_type"]), _payload(row["payload_json"])) for row in lifecycle_rows]
@@ -193,6 +207,11 @@ def report(db_path: str | Path, *, period: str = "1d") -> dict[str, Any]:
             "submitted_shares": _text(submitted),
             "submitted_notional_estimate": _text(intended_notional),
             "size_bucket": _bucket(intended_notional), "spread_bps": audit.get("entry_spread_bps"),
+            "entry_bid": audit.get("entry_submit_bid"), "entry_time_left_sec": audit.get("entry_time_left_sec"),
+            "entry_regime_state": audit.get("entry_regime_state"),
+            "entry_regime_reason": audit.get("entry_regime_reason"),
+            "entry_regime_event_id": audit.get("entry_regime_event_id"),
+            "top3_depth_shares": audit.get("entry_top3_depth_shares"),
             "recent_trade_shares_5m": audit.get("entry_recent_trade_shares_5m"),
             "filled_shares": _text(filled_shares), "fill_notional": _text(fill_notional),
             "fill_count": len(fills), "last_entry_fill_at": last_fill_ts,
@@ -206,6 +225,10 @@ def report(db_path: str | Path, *, period: str = "1d") -> dict[str, Any]:
             "holding_sec": _seconds_between(last_fill_ts, last_exit_ts),
             "canonical_realized_cost": _text(canonical_cost) if canonical_cost > 0 else None,
             "canonical_realized_net_usdc": _text(canonical_pnl) if canonical_cost > 0 else None,
+            "p3_fee_adjusted_markout_per_share": {
+                trade_id: markouts_by_fill[trade_id]
+                for trade_id in sorted(fill_trade_ids) if trade_id in markouts_by_fill
+            },
             "lifecycle_state": lifecycle_state,
         }
         rows.append(row)
@@ -223,15 +246,21 @@ def report(db_path: str | Path, *, period: str = "1d") -> dict[str, Any]:
             )
     return {
         "report": "outcome_f5_execution_quality",
-        "schema_version": 1,
+        "schema_version": 2,
         "period": period,
         "entries": rows,
         "entry_count": len(rows),
+        "p3_fee_adjusted_markout_observations": {
+            "total": sum(p3_horizon_counts.values()),
+            "by_horizon_sec": dict(sorted(p3_horizon_counts.items(), key=lambda item: int(item[0]))),
+            "current_5_10_30sec_schema_v2": dict(sorted(current_p3_horizon_counts.items(), key=lambda item: int(item[0]))),
+        },
         "size_buckets": [{"size_bucket": key, **dict(value)} for key, value in sorted(buckets.items())],
         "limits": [
             "Only entries with the durable F5 capacity audit are included.",
             "This is execution and lifecycle evidence, not a claim of scalable alpha or future fill probability.",
             "Canonical realised PnL is reported only when FIFO lots link to immutable official BUY trade ids.",
+            "P3 markouts are joined only through immutable official fill trade IDs; an empty mapping means the horizon was not yet observed or was unavailable.",
         ],
     }
 

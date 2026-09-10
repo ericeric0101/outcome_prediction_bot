@@ -183,7 +183,7 @@ class OutcomeTierBExecutionGate:
             safe_max_shares = min(safe_max_shares, flow_cap)
         max_submit_bid = bid * (Decimal("1") + policy.max_submit_drift_bps / Decimal("10000"))
         if spread_bps > policy.max_spread_bps:
-            return TierBExecutionDecision(False, "tier_b_spread_exceeds_calibrated_ceiling", policy, spread_bps, depth, bid, max_submit_bid, safe_max_shares, recent_trade_shares)
+            return TierBExecutionDecision(False, "entry_spread_exceeds_calibrated_ceiling", policy, spread_bps, depth, bid, max_submit_bid, safe_max_shares, recent_trade_shares)
         if safe_max_shares <= 0:
             return TierBExecutionDecision(False, "tier_b_safe_capacity_zero", policy, spread_bps, depth, bid, max_submit_bid, safe_max_shares, recent_trade_shares)
         return TierBExecutionDecision(True, "tier_b_execution_quality_confirmed", policy, spread_bps, depth, bid, max_submit_bid, safe_max_shares, recent_trade_shares)

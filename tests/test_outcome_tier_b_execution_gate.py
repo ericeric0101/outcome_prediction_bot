@@ -11,7 +11,7 @@ def test_bootstrap_gate_rejects_thin_or_wide_tier_b_book(tmp_path):
         bid=Decimal("0.70"), ask=Decimal("0.72"),
         bid_levels=[{"size": "100"}], requested_shares=Decimal("13"),
     )
-    assert not wide.allowed and wide.reason == "tier_b_spread_exceeds_calibrated_ceiling"
+    assert not wide.allowed and wide.reason == "entry_spread_exceeds_calibrated_ceiling"
     thin = gate.evaluate(
         bid=Decimal("0.70"), ask=Decimal("0.701"),
         bid_levels=[{"size": "2"}, {"size": "3"}], requested_shares=Decimal("13"),

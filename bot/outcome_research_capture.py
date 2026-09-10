@@ -20,6 +20,7 @@ from bot.outcome_p2_quality import P2_SCHEMA_VERSION, build_p2_capture_quality
 from bot.outcome_market_authority import publish_outcome_market_authority
 from bot.outcome_p3_pipeline import OutcomeP3Pipeline
 from bot.outcome_parity import OutcomeParityAnalyzer
+from bot.outcome_spread_candidate_tracker import OutcomeWideSpreadCandidateTracker
 from monitoring.trade_journal_db import TradeJournalDB
 
 
@@ -51,6 +52,7 @@ class OutcomeResearchCapture:
         self._last_capture_ms = 0
         self._last_heartbeat_ms = 0
         self._p3 = OutcomeP3Pipeline(journal, self.run_id)
+        self._wide_spread_candidates = OutcomeWideSpreadCandidateTracker(journal=journal, run_id=self.run_id)
         self._parity = OutcomeParityAnalyzer()
         # Account endpoints are materially slower than public books.  They
         # therefore run on a bounded, read-only background path: P2 snapshots
@@ -231,6 +233,17 @@ class OutcomeResearchCapture:
                         "volatility_regime": "unknown",
                     },
                 },
+            )
+            # This observes only already-captured, accepted public books. It
+            # is a delayed label for read-only wide-spread candidates, never
+            # an extra exchange request or an execution trigger.
+            self._wide_spread_candidates.observe_book(
+                market=market, coin=market.yes_coin, observed_at_ms=capture_complete_at_ms,
+                best_bid=yes_bid, best_ask=yes_ask,
+            )
+            self._wide_spread_candidates.observe_book(
+                market=market, coin=market.no_coin, observed_at_ms=capture_complete_at_ms,
+                best_bid=no_bid, best_ask=no_ask,
             )
         self._last_capture_ms = capture_complete_at_ms
         accepted = quality.get("status") == "accepted"

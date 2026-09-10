@@ -44,6 +44,7 @@ from bot.outcome_trend_continuation import OutcomeTrendContinuationRecorder
 from bot.outcome_reversal import OutcomeReversalClassifier, OutcomeReversalInput, OutcomeReversalState
 from bot.outcome_loss_reentry import OutcomeLossReentryGate
 from bot.outcome_tier_b_execution_gate import OutcomeTierBExecutionGate
+from bot.outcome_spread_candidate_tracker import OutcomeWideSpreadCandidateTracker
 from bot.outcome_portfolio_guard import OutcomePortfolioGuard
 from bot.outcome_market_regime import (
     OutcomeMarketRegimeInput,
@@ -110,6 +111,9 @@ class OutcomeLiveExecutionRuntime:
         self.reversal_classifier = OutcomeReversalClassifier()
         self.loss_reentry_gate = OutcomeLossReentryGate(ledger.journal, ledger.run_id) if ledger else None
         self.tier_b_execution_gate = OutcomeTierBExecutionGate(ledger.journal.db_path) if ledger else None
+        self.wide_spread_candidate_tracker = (
+            OutcomeWideSpreadCandidateTracker(journal=ledger.journal, run_id=ledger.run_id) if ledger else None
+        )
         self.portfolio_guard = OutcomePortfolioGuard(ledger.journal.db_path) if ledger else None
         # This observer is deliberately shadow-only.  It has no reference to
         # an execution controller and cannot alter S0/S2/S3 authority.
@@ -221,6 +225,27 @@ class OutcomeLiveExecutionRuntime:
         except (ArithmeticError, ValueError):
             return None
 
+    def _record_wide_spread_candidate(
+        self, *, market: OutcomeMarketSpec, coin: str, bid: Decimal, ask: Decimal | None,
+        quality: object, entry_tier: str, requested_shares: int, admission: dict[str, object],
+    ) -> None:
+        """Write bounded evidence for a rejected entry; never change its result."""
+        if self.wide_spread_candidate_tracker is None:
+            return
+        if str(getattr(quality, "reason", "")) != "entry_spread_exceeds_calibrated_ceiling":
+            return
+        regime = admission.get("market_regime_shadow")
+        self.wide_spread_candidate_tracker.observe_rejection(
+            market=market, coin=coin, observed_at_ms=int(time.time() * 1000), bid=bid, ask=ask,
+            spread_bps=getattr(quality, "spread_bps", None), entry_tier=entry_tier,
+            time_left_sec=market.time_to_expiry_sec(),
+            regime=regime if isinstance(regime, dict) else None,
+            requested_shares=requested_shares,
+            safe_max_shares=getattr(quality, "safe_max_shares", None),
+            top3_depth_shares=getattr(quality, "top_depth_shares", None),
+            recent_trade_shares_5m=getattr(quality, "recent_trade_shares", None),
+        )
+
     def _observe_market_regime_shadow(
         self, *, market: OutcomeMarketSpec, entry_side_index: int | None,
         entry_evidence: dict[str, object], market_context: dict[str, object] | None,
@@ -262,7 +287,8 @@ class OutcomeLiveExecutionRuntime:
             # 30-second cadence.  The in-memory classifier still sees every
             # strategy tick, so rate limiting storage cannot change a state.
             if previous is None or previous[0] != str(decision.state) or now - previous[1] >= 30.0:
-                self.ledger.journal.log_strategy_event(self.ledger.run_id, "OUTCOME_MARKET_REGIME_SHADOW", payload)
+                event_id = self.ledger.journal.log_strategy_event(self.ledger.run_id, "OUTCOME_MARKET_REGIME_SHADOW", payload)
+                payload["event_id"] = event_id
                 self._last_regime_shadow_record[market.outcome_id] = (str(decision.state), now)
         return payload
 
@@ -1956,6 +1982,10 @@ class OutcomeLiveExecutionRuntime:
             })
             admission["entry_execution_gate"] = {"allowed": quality.allowed, "reason": quality.reason, **execution_audit}
             if not quality.allowed or quality.max_submit_bid is None:
+                self._record_wide_spread_candidate(
+                    market=market, coin=str(admission["selected_coin"]), bid=price, ask=entry_ask,
+                    quality=quality, entry_tier=entry_tier, requested_shares=desired_shares, admission=admission,
+                )
                 return LiveExecutionResult("flat", f"live strategy no entry: {quality.reason}")
             if shares < min_opening_shares:
                 return LiveExecutionResult("flat", "live strategy no entry: entry_safe_capacity_below_venue_minimum")
@@ -1971,6 +2001,11 @@ class OutcomeLiveExecutionRuntime:
             if quality is None or not quality.allowed or quality.max_submit_bid is None:
                 reason = quality.reason if quality is not None else "tier_b_execution_gate_unavailable"
                 admission["tier_b_execution_gate"] = {"allowed": False, "reason": reason}
+                if quality is not None:
+                    self._record_wide_spread_candidate(
+                        market=market, coin=str(admission["selected_coin"]), bid=price, ask=entry_ask,
+                        quality=quality, entry_tier=entry_tier, requested_shares=shares, admission=admission,
+                    )
                 return LiveExecutionResult("flat", f"live strategy no entry: {reason}")
             entry_max_submit_price = quality.max_submit_bid
             execution_audit.update({
@@ -2042,6 +2077,23 @@ class OutcomeLiveExecutionRuntime:
             # as a decision-time preview rather than an asserted exit price.
             "target_price_preview_from_decision_bid": str(target_price_preview),
             "target_decision_at_ms": int(time.time() * 1000),
+            "entry_time_left_sec": market.time_to_expiry_sec(),
+            "entry_regime_state": (
+                admission.get("market_regime_shadow", {}).get("state")
+                if isinstance(admission.get("market_regime_shadow"), dict) else None
+            ),
+            "entry_regime_reason": (
+                admission.get("market_regime_shadow", {}).get("reason")
+                if isinstance(admission.get("market_regime_shadow"), dict) else None
+            ),
+            "entry_regime_current_zone": (
+                admission.get("market_regime_shadow", {}).get("current_zone")
+                if isinstance(admission.get("market_regime_shadow"), dict) else None
+            ),
+            "entry_regime_event_id": (
+                admission.get("market_regime_shadow", {}).get("event_id")
+                if isinstance(admission.get("market_regime_shadow"), dict) else None
+            ),
             "loss_reentry_policy": reentry.reason if reentry is not None else "unavailable",
             "loss_reentry_limited": bool(reentry.is_limited_reentry) if reentry is not None else False,
             "loss_reentry_prior_exit_price": (
