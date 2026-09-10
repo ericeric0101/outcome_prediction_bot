@@ -43,10 +43,22 @@ class OutcomeHoldingPathObservation:
     entry_tier: str | None = None
     entry_target_return_pct: str | None = None
     entry_time_left_sec: float | None = None
+    marketable_exit_vwap: Decimal | None = None
+    marketable_exit_depth_shares: Decimal | None = None
+    taker_close_fee_rate: Decimal | None = None
 
     def payload(self) -> dict[str, Any]:
         executable_exit = self.best_bid * (Decimal("1") - self.maker_close_fee_rate)
         midpoint = (self.best_bid + self.best_ask) / Decimal("2")
+        marketable_full_inventory = (
+            self.marketable_exit_vwap is not None
+            and self.marketable_exit_depth_shares is not None
+            and self.marketable_exit_depth_shares >= self.inventory
+        )
+        taker_exit = (
+            self.marketable_exit_vwap * (Decimal("1") - self.taker_close_fee_rate)
+            if marketable_full_inventory and self.taker_close_fee_rate is not None else None
+        )
         return {
             "venue": "hyperliquid_outcome", "outcome_id": self.outcome_id,
             "period": self.period, "coin": self.coin,
@@ -66,6 +78,12 @@ class OutcomeHoldingPathObservation:
             "entry_tier": self.entry_tier,
             "entry_target_return_pct": self.entry_target_return_pct,
             "entry_time_left_sec": self.entry_time_left_sec,
+            "marketable_exit_vwap": str(self.marketable_exit_vwap) if self.marketable_exit_vwap is not None else None,
+            "marketable_exit_depth_shares": str(self.marketable_exit_depth_shares) if self.marketable_exit_depth_shares is not None else None,
+            "marketable_exit_full_inventory": marketable_full_inventory,
+            "taker_close_fee_rate": str(self.taker_close_fee_rate) if self.taker_close_fee_rate is not None else None,
+            "marketable_net_exit_price": str(taker_exit) if taker_exit is not None else None,
+            "marketable_net_exit_vs_entry_pct": str(taker_exit / self.fill_vwap - Decimal("1")) if taker_exit is not None else None,
         }
 
 

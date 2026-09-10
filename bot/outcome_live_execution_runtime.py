@@ -60,6 +60,7 @@ from bot.outcome_emergency_exit import (
     book_age_sec as emergency_book_age_sec,
     parse_bid_levels,
 )
+from bot.outcome_efficiency_shadow import OutcomeConfidenceEntryShadow, OutcomeQueueAwarePricingShadow
 
 
 @dataclass(frozen=True)
@@ -118,6 +119,8 @@ class OutcomeLiveExecutionRuntime:
         # This observer is deliberately shadow-only.  It has no reference to
         # an execution controller and cannot alter S0/S2/S3 authority.
         self.market_regime_shadow = OutcomeMarketRegimeShadow()
+        self.confidence_entry_shadow = OutcomeConfidenceEntryShadow()
+        self.queue_pricing_shadow = OutcomeQueueAwarePricingShadow()
         self.emergency_exit_policy = OutcomeEmergencyExitPolicy()
         self.emergency_exit_controller = (
             OutcomeEmergencyExitController(
@@ -154,6 +157,7 @@ class OutcomeLiveExecutionRuntime:
         self._holding_entry_provenance: dict[tuple[int, str, str, str], dict[str, object]] = {}
         self._last_regime_shadow_record: dict[int, tuple[str, float]] = {}
         self._last_toxic_shadow_record: dict[tuple[int, str], tuple[str, float]] = {}
+        self._last_efficiency_shadow_record: dict[tuple[str, int, int], tuple[str, float]] = {}
 
     @staticmethod
     def _audit_decimal(audit: dict[str, object], name: str) -> Decimal | None:
@@ -290,6 +294,44 @@ class OutcomeLiveExecutionRuntime:
                 event_id = self.ledger.journal.log_strategy_event(self.ledger.run_id, "OUTCOME_MARKET_REGIME_SHADOW", payload)
                 payload["event_id"] = event_id
                 self._last_regime_shadow_record[market.outcome_id] = (str(decision.state), now)
+        return payload
+
+    def _observe_confidence_entry_shadow(
+        self, *, market: OutcomeMarketSpec, market_context: dict[str, object] | None,
+    ) -> dict[str, object]:
+        payload = self.confidence_entry_shadow.evaluate(
+            context=dict(market_context or {}), time_left_sec=market.time_to_expiry_sec(),
+        )
+        payload.update({"venue": "hyperliquid_outcome", "outcome_id": market.outcome_id, "period": market.period})
+        if self.ledger is not None:
+            fingerprint = f"{payload.get('candidate_side_index')}:{payload.get('candidate_confidence')}:{payload.get('reason')}"
+            key = ("confidence", market.outcome_id, -1)
+            previous = self._last_efficiency_shadow_record.get(key)
+            now = time.monotonic()
+            if previous is None or previous[0] != fingerprint or now - previous[1] >= 30.0:
+                self.ledger.journal.log_strategy_event(self.ledger.run_id, "OUTCOME_CONFIDENCE_ENTRY_SHADOW", payload)
+                self._last_efficiency_shadow_record[key] = (fingerprint, now)
+        return payload
+
+    def _observe_queue_pricing_shadow(
+        self, *, market: OutcomeMarketSpec, side_index: int, book: dict[str, object],
+        requested_shares: int, current_bid: Decimal, confidence: dict[str, object] | None,
+    ) -> dict[str, object]:
+        scores = confidence.get("scores") if isinstance(confidence, dict) else None
+        fair_score = scores.get(str(side_index), {}) if isinstance(scores, dict) else {}
+        payload = self.queue_pricing_shadow.evaluate(
+            side_index=side_index, book=book, requested_shares=requested_shares,
+            fair_score=fair_score if isinstance(fair_score, dict) else {}, current_bid=current_bid,
+        )
+        payload.update({"venue": "hyperliquid_outcome", "outcome_id": market.outcome_id, "period": market.period})
+        if self.ledger is not None:
+            fingerprint = f"{payload.get('action')}:{payload.get('reason')}:{payload.get('shadow_quote')}"
+            key = ("queue", market.outcome_id, side_index)
+            previous = self._last_efficiency_shadow_record.get(key)
+            now = time.monotonic()
+            if previous is None or previous[0] != fingerprint or now - previous[1] >= 30.0:
+                self.ledger.journal.log_strategy_event(self.ledger.run_id, "OUTCOME_QUEUE_PRICING_SHADOW", payload)
+                self._last_efficiency_shadow_record[key] = (fingerprint, now)
         return payload
 
     def _observe_toxic_fill_shadow(self, *, market: OutcomeMarketSpec, finding: object) -> None:
@@ -585,6 +627,17 @@ class OutcomeLiveExecutionRuntime:
         try:
             _, payload = evidence
             raw_fee = payload.get("maker_close_fee_rate")
+            fee = Decimal(str(raw_fee)) if raw_fee is not None else None
+            return fee if fee is not None and Decimal("0") <= fee < Decimal("1") else None
+        except (ArithmeticError, ValueError):
+            return None
+
+    def _persisted_taker_fee(self, *, market: OutcomeMarketSpec, coin: str) -> Decimal | None:
+        evidence = self._persisted_entry_policy_evidence(market=market, coin=coin)
+        if evidence is None:
+            return None
+        try:
+            raw_fee = evidence[1].get("taker_close_fee_rate")
             fee = Decimal(str(raw_fee)) if raw_fee is not None else None
             return fee if fee is not None and Decimal("0") <= fee < Decimal("1") else None
         except (ArithmeticError, ValueError):
@@ -1304,7 +1357,8 @@ class OutcomeLiveExecutionRuntime:
             return
         side_index = 0 if coin == market.yes_coin else 1
         try:
-            top = self._top_of_book(self._fresh_book_once(market=market, side_index=side_index))
+            fresh_book = self._fresh_book_once(market=market, side_index=side_index)
+            top = self._top_of_book(fresh_book)
             if top is None:
                 return
             bid, ask = top
@@ -1338,10 +1392,32 @@ class OutcomeLiveExecutionRuntime:
                 if row:
                     age = max(0.0, time.time() - datetime.fromisoformat(str(row[0])).timestamp())
                     age_basis = "entry_submit_fallback_unbound"
+            remaining = inventory
+            marketable_notional = Decimal("0")
+            marketable_depth = Decimal("0")
+            for level in fresh_book.get("bids", ()):
+                try:
+                    level_price = Decimal(str(level.get("price", level.get("px"))))
+                    level_size = Decimal(str(level.get("size", level.get("sz"))))
+                except (AttributeError, TypeError, ValueError, ArithmeticError):
+                    continue
+                if level_price <= 0 or level_size <= 0:
+                    continue
+                taken = min(remaining, level_size)
+                marketable_notional += taken * level_price
+                marketable_depth += taken
+                remaining -= taken
+                if remaining <= 0:
+                    break
+            marketable_vwap = marketable_notional / inventory if remaining <= 0 and inventory > 0 else None
             self.holding_path_recorder.record(OutcomeHoldingPathObservation(
                 market.outcome_id, market.period, coin, inventory, vwap, bid, ask, fee, age,
                 market.time_to_expiry_sec(), "fresh_rest_book", evidence,
-                holding_age_basis=age_basis, **provenance,
+                holding_age_basis=age_basis,
+                marketable_exit_vwap=marketable_vwap,
+                marketable_exit_depth_shares=marketable_depth,
+                taker_close_fee_rate=self._persisted_taker_fee(market=market, coin=coin),
+                **provenance,
             ))
             if update_reversal:
                 self._update_holding_reversal(
@@ -1737,6 +1813,9 @@ class OutcomeLiveExecutionRuntime:
             market=market, entry_side_index=entry_side_index,
             entry_evidence=entry_evidence, market_context=market_context,
         )
+        admission["confidence_entry_shadow"] = self._observe_confidence_entry_shadow(
+            market=market, market_context=market_context,
+        )
         # C1/C2 research capture is strictly public-data, bounded to one row
         # per 30 seconds and independent of whether the canary is enabled.
         self._capture_trend_continuation_path(
@@ -1869,6 +1948,7 @@ class OutcomeLiveExecutionRuntime:
                 )
         fees = self.recovery.account.get_user_fees_sync(self.recovery.wallet)
         maker_close_fee = Decimal(str(fees["userSpotAddRate"]))
+        taker_close_fee = Decimal(str(fees["userSpotCrossRate"]))
         book_started_at = time.monotonic()
         book = self.machine.gateway.fetch_order_book(market=market, side_index=entry_side_index)
         admission["timing_entry_book_request_ms"] = round((time.monotonic() - book_started_at) * 1000, 3)
@@ -1888,6 +1968,15 @@ class OutcomeLiveExecutionRuntime:
                 "flat",
                 f"live strategy no-trade band: selected bid {price} < {config.min_entry_price}",
             )
+        shadow_requested_shares = max(
+            whole_share_size(price),
+            int((self.risk_gate.limits.max_entry_notional_usdc / price).to_integral_value(rounding=ROUND_FLOOR)),
+        )
+        admission["queue_pricing_shadow"] = self._observe_queue_pricing_shadow(
+            market=market, side_index=entry_side_index, book=book,
+            requested_shares=shadow_requested_shares, current_bid=price,
+            confidence=admission.get("confidence_entry_shadow") if isinstance(admission.get("confidence_entry_shadow"), dict) else None,
+        )
         target_decision = OutcomeExitTargetPolicy(self.ledger.journal.db_path).decide(
             outcome_id=market.outcome_id, side_index=entry_side_index,
         )
@@ -2066,6 +2155,7 @@ class OutcomeLiveExecutionRuntime:
             ),
             "target_volatility_sample_count": target_decision.sample_count,
             "maker_close_fee_rate": str(maker_close_fee),
+            "taker_close_fee_rate": str(taker_close_fee),
             "loss_reprice_pct": "0.05",
             "narrow_after_sec": config.narrow_after_sec,
             "narrow_return_pct": str(config.narrow_return_pct),
@@ -2149,6 +2239,7 @@ class OutcomeLiveExecutionRuntime:
                 # Prior to the two-hour floor tier no loss band is eligible.
                 # Thereafter this is a fee-inclusive -5% passive quote only.
                 "loss_reprice_pct": "0.05", "maker_close_fee_rate": str(maker_close_fee),
+                "taker_close_fee_rate": str(taker_close_fee),
                 "narrow_after_sec": config.narrow_after_sec, "narrow_return_pct": str(config.narrow_return_pct),
                 "floor_after_sec": config.floor_after_sec, "floor_return_pct": str(config.floor_return_pct),
                 "order_id": result.order_id, "entry_reason": entry_reason,
