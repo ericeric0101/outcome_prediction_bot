@@ -32,6 +32,21 @@ def test_gateway_only_uses_official_sidecar_contract():
     assert calls == [("place_limit_order", {"payload": {"marketId": "1153", "outcome": "#11530", "side": "buy", "price": "0.77", "amount": "13", "timeInForce": "ALO"}, "allow_execution": True})]
 
 
+def test_gateway_decision_timing_scope_excludes_a_previous_tick_request():
+    class Sidecar:
+        last_request_timing = {"sidecar_total_ms": 1.25}
+
+        def request(self, _command, **_kwargs):
+            return {"bids": [], "asks": []}
+
+    gateway = OutcomeExecutionGateway(Sidecar())
+    gateway.fetch_order_book(market=_market(), side_index=0)
+    assert len(gateway.timing_events()) == 1
+    gateway.begin_timing_scope()
+    assert gateway.timing_events() == ()
+    assert gateway.last_sidecar_timing is None
+
+
 def test_gateway_rejects_invalid_side_index():
     with pytest.raises(ValueError):
         OutcomeExecutionGateway.outcome_coin(_market(), 2)

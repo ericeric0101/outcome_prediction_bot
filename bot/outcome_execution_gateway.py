@@ -36,6 +36,20 @@ class OutcomeExecutionGateway:
     def __init__(self, sidecar: OutcomeSdkSidecarClient | None = None) -> None:
         self.sidecar = sidecar or OutcomeSdkSidecarClient(Path(__file__).resolve().parent.parent / "outcome_sdk_sidecar")
         self.last_sidecar_timing: dict[str, Any] | None = None
+        self._tick_sidecar_timings: list[dict[str, Any]] = []
+
+    def begin_timing_scope(self) -> None:
+        """Start a decision-local SDK timing ledger.
+
+        ``last_sidecar_timing`` remains available for per-order audit
+        compatibility, but must never be read as evidence for a later tick.
+        """
+        self.last_sidecar_timing = None
+        self._tick_sidecar_timings.clear()
+
+    def timing_events(self) -> tuple[dict[str, Any], ...]:
+        """Immutable copies of only SDK calls made in the current decision."""
+        return tuple(dict(timing) for timing in self._tick_sidecar_timings)
 
     def _request(self, command: str, **kwargs: Any) -> Any:
         started_at = time.monotonic()
@@ -46,6 +60,7 @@ class OutcomeExecutionGateway:
             "gateway_command": command,
             "gateway_total_ms": round((time.monotonic() - started_at) * 1000, 3),
         }
+        self._tick_sidecar_timings.append(dict(self.last_sidecar_timing))
         return result
 
     @staticmethod

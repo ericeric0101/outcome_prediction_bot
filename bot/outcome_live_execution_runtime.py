@@ -61,6 +61,7 @@ from bot.outcome_emergency_exit import (
     parse_bid_levels,
 )
 from bot.outcome_efficiency_shadow import OutcomeConfidenceEntryShadow, OutcomeQueueAwarePricingShadow
+from bot.outcome_active_shadow import OutcomeActiveChallengerShadow
 
 
 @dataclass(frozen=True)
@@ -121,6 +122,9 @@ class OutcomeLiveExecutionRuntime:
         self.market_regime_shadow = OutcomeMarketRegimeShadow()
         self.confidence_entry_shadow = OutcomeConfidenceEntryShadow()
         self.queue_pricing_shadow = OutcomeQueueAwarePricingShadow()
+        # Milestone-B challenger is journal-only.  It owns no account,
+        # gateway, controller or key and cannot alter the production action.
+        self.active_challenger_shadow = OutcomeActiveChallengerShadow()
         self.emergency_exit_policy = OutcomeEmergencyExitPolicy()
         self.emergency_exit_controller = (
             OutcomeEmergencyExitController(
@@ -156,6 +160,7 @@ class OutcomeLiveExecutionRuntime:
         # cached as a fabricated lifecycle identity.
         self._holding_entry_provenance: dict[tuple[int, str, str, str], dict[str, object]] = {}
         self._last_regime_shadow_record: dict[int, tuple[str, float]] = {}
+        self._latest_regime_shadow: dict[int, dict[str, object]] = {}
         self._last_toxic_shadow_record: dict[tuple[int, str], tuple[str, float]] = {}
         self._last_efficiency_shadow_record: dict[tuple[str, int, int], tuple[str, float]] = {}
 
@@ -294,6 +299,7 @@ class OutcomeLiveExecutionRuntime:
                 event_id = self.ledger.journal.log_strategy_event(self.ledger.run_id, "OUTCOME_MARKET_REGIME_SHADOW", payload)
                 payload["event_id"] = event_id
                 self._last_regime_shadow_record[market.outcome_id] = (str(decision.state), now)
+        self._latest_regime_shadow[market.outcome_id] = dict(payload)
         return payload
 
     def _observe_confidence_entry_shadow(
@@ -310,6 +316,31 @@ class OutcomeLiveExecutionRuntime:
             now = time.monotonic()
             if previous is None or previous[0] != fingerprint or now - previous[1] >= 30.0:
                 self.ledger.journal.log_strategy_event(self.ledger.run_id, "OUTCOME_CONFIDENCE_ENTRY_SHADOW", payload)
+                self._last_efficiency_shadow_record[key] = (fingerprint, now)
+        return payload
+
+    def _observe_active_challenger_shadow(
+        self, *, market: OutcomeMarketSpec, market_context: dict[str, object] | None,
+        production_side_index: int | None, production_reason: str,
+        regime: dict[str, object] | None,
+    ) -> dict[str, object]:
+        """Record a B5 counterfactual entry action; never submit it."""
+        payload = self.active_challenger_shadow.evaluate_entry(
+            context=dict(market_context or {}),
+            time_left_sec=market.time_to_expiry_sec(),
+            production_side_index=production_side_index,
+            production_reason=production_reason,
+            regime=regime,
+        )
+        payload.update({"venue": "hyperliquid_outcome", "outcome_id": market.outcome_id, "period": market.period})
+        if self.ledger is not None:
+            challenger = payload.get("challenger") if isinstance(payload.get("challenger"), dict) else {}
+            fingerprint = f"{challenger.get('action')}:{challenger.get('side_index')}:{challenger.get('reason')}"
+            key = ("active_challenger", market.outcome_id, -1)
+            previous = self._last_efficiency_shadow_record.get(key)
+            now = time.monotonic()
+            if previous is None or previous[0] != fingerprint or now - previous[1] >= 30.0:
+                self.ledger.journal.log_strategy_event(self.ledger.run_id, "OUTCOME_ACTIVE_CHALLENGER_SHADOW", payload)
                 self._last_efficiency_shadow_record[key] = (fingerprint, now)
         return payload
 
@@ -423,6 +454,9 @@ class OutcomeLiveExecutionRuntime:
     def _begin_tick(self) -> None:
         self._account_reads.begin_tick()
         self._tick_books.clear()
+        begin_timing_scope = getattr(self.machine.gateway, "begin_timing_scope", None)
+        if callable(begin_timing_scope):
+            begin_timing_scope()
 
     def _fresh_book_once(self, *, market: OutcomeMarketSpec, side_index: int) -> dict[str, object]:
         """One REST L2 snapshot per decision tick for observational logic.
@@ -1410,15 +1444,49 @@ class OutcomeLiveExecutionRuntime:
                 if remaining <= 0:
                     break
             marketable_vwap = marketable_notional / inventory if remaining <= 0 and inventory > 0 else None
+            taker_fee = self._persisted_taker_fee(market=market, coin=coin)
             self.holding_path_recorder.record(OutcomeHoldingPathObservation(
                 market.outcome_id, market.period, coin, inventory, vwap, bid, ask, fee, age,
                 market.time_to_expiry_sec(), "fresh_rest_book", evidence,
                 holding_age_basis=age_basis,
                 marketable_exit_vwap=marketable_vwap,
                 marketable_exit_depth_shares=marketable_depth,
-                taker_close_fee_rate=self._persisted_taker_fee(market=market, coin=coin),
+                taker_close_fee_rate=taker_fee,
                 **provenance,
             ))
+            # B5 observes the same already-fetched full-depth book.  It never
+            # creates an order and therefore adds no REST or SDK call.
+            live_context = dict(evidence)
+            if side_index == 0:
+                live_context.update({
+                    "yes_best_bid": str(bid), "yes_best_ask": str(ask),
+                    "no_best_bid": str(Decimal("1") - ask), "no_best_ask": str(Decimal("1") - bid),
+                })
+            else:
+                live_context.update({
+                    "no_best_bid": str(bid), "no_best_ask": str(ask),
+                    "yes_best_bid": str(Decimal("1") - ask), "yes_best_ask": str(Decimal("1") - bid),
+                })
+            marketable_net = marketable_vwap * (Decimal("1") - taker_fee) if marketable_vwap is not None and taker_fee is not None else None
+            toxic = self._last_toxic_shadow_record.get((market.outcome_id, coin))
+            challenger = self.active_challenger_shadow.evaluate_holding(
+                context=live_context,
+                time_left_sec=market.time_to_expiry_sec(),
+                side_index=side_index,
+                fill_vwap=vwap,
+                marketable_net_exit_price=marketable_net,
+                regime=self._latest_regime_shadow.get(market.outcome_id),
+                toxic_state=toxic[0] if toxic is not None else None,
+            )
+            challenger.update({
+                "venue": "hyperliquid_outcome", "outcome_id": market.outcome_id,
+                "period": market.period, "coin": coin,
+                "entry_lifecycle_id": provenance.get("entry_lifecycle_id"),
+                "holding_age_sec": age,
+            })
+            self.ledger.journal.log_strategy_event(
+                self.ledger.run_id, "OUTCOME_ACTIVE_HOLDING_CHALLENGER_SHADOW", challenger,
+            )
             if update_reversal:
                 self._update_holding_reversal(
                     market=market, coin=coin, side_index=side_index, vwap=vwap,
@@ -1788,7 +1856,11 @@ class OutcomeLiveExecutionRuntime:
                 "book_request_ms": admission.get("timing_entry_book_request_ms"),
                 "journal_write_ms": journal_write_ms,
                 "journal_writer_last_ms": dict(getattr(self.ledger.journal, "last_write_timing_ms", {})),
-                "last_sdk_request": dict(getattr(self.machine.gateway, "last_sidecar_timing", {}) or {}),
+                # These are decision-local ledgers.  Do not replace them with
+                # a sidecar-global "last request": that stale value was the
+                # source of the prior false latency attribution.
+                "account_read_timing": self._account_reads.timing_summary(),
+                "sdk_requests": list(getattr(self.machine.gateway, "timing_events", lambda: ())()),
             })
         return result
 
@@ -1815,6 +1887,13 @@ class OutcomeLiveExecutionRuntime:
         )
         admission["confidence_entry_shadow"] = self._observe_confidence_entry_shadow(
             market=market, market_context=market_context,
+        )
+        admission["active_challenger_shadow"] = self._observe_active_challenger_shadow(
+            market=market,
+            market_context=market_context,
+            production_side_index=entry_side_index,
+            production_reason=entry_reason,
+            regime=admission.get("market_regime_shadow") if isinstance(admission.get("market_regime_shadow"), dict) else None,
         )
         # C1/C2 research capture is strictly public-data, bounded to one row
         # per 30 seconds and independent of whether the canary is enabled.

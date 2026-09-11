@@ -77,3 +77,26 @@ def test_x3_fill_overlay_uses_only_actual_maker_markout(tmp_path):
         features, marks = conn.execute("SELECT features_json,actual_markouts_json FROM outcome_oi_fill_feature_rows").fetchone()
     assert json.loads(features)["actual_fill"] is True
     assert json.loads(marks)["10"]["signed_markout_ps"] == "0.02"
+
+
+def test_x3_resume_checkpoints_batches_and_only_refreshes_the_open_label_window(tmp_path):
+    journal = TradeJournalDB(tmp_path / "journal.db")
+    base = 2_300_000_000_000
+    # The first snapshot is outside the final 60m+label-tolerance refresh
+    # window once the third arrives; a resumed build must not redo it.
+    for timestamp in (base, base + 60_000, base + 3_800_000):
+        journal.log_strategy_event("shadow", "OUTCOME_P2_PARITY_SNAPSHOT", _snapshot(timestamp))
+    progress: list[tuple[int, int]] = []
+    first = OutcomeOiFeaturePipeline(journal).build(
+        batch_size=1, progress=lambda completed, total: progress.append((completed, total)),
+    )
+    assert first.rows_written == 3
+    assert progress == [(1, 3), (2, 3), (3, 3)]
+
+    resumed = OutcomeOiFeaturePipeline(journal).build(batch_size=10)
+    assert resumed.rows_written == 1  # newest row may still gain a 60m label
+    with sqlite3.connect(journal.db_path) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM outcome_oi_feature_rows WHERE feature_schema_version=?",
+            (FEATURE_SCHEMA_VERSION,),
+        ).fetchone()[0] == 3

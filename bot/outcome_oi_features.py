@@ -9,10 +9,11 @@ from __future__ import annotations
 import json
 import math
 import sqlite3
+from bisect import bisect_left, bisect_right
+from collections import defaultdict
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
-from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 from bot.outcome_p2_quality import is_eligible_p2_snapshot
 from bot.outcome_markout import P3_MARKOUT_HORIZONS_SEC, P3_MARKOUT_SCHEMA_VERSION
@@ -63,6 +64,47 @@ class X3BuildResult:
     oi_joined: int
     labels_available: dict[int, int]
     maker_fill_rows: int
+
+
+@dataclass(frozen=True)
+class _OiIndex:
+    """Sorted, prefix-summed local OI evidence for O(log N) as-of features."""
+    points: tuple[_Oi, ...]
+    times: tuple[int, ...]
+    oi_prefix: tuple[float, ...]
+    oi_square_prefix: tuple[float, ...]
+
+    @classmethod
+    def from_points(cls, points: list[_Oi]) -> "_OiIndex":
+        ordered = sorted(points, key=lambda point: point.local_received_at_ms)
+        running_sum = running_square_sum = 0.0
+        sums = [0.0]
+        square_sums = [0.0]
+        for point in ordered:
+            running_sum += point.open_interest
+            running_square_sum += point.open_interest * point.open_interest
+            sums.append(running_sum)
+            square_sums.append(running_square_sum)
+        return cls(tuple(ordered), tuple(point.local_received_at_ms for point in ordered), tuple(sums), tuple(square_sums))
+
+    def as_of_index(self, timestamp_ms: int) -> int | None:
+        index = bisect_right(self.times, timestamp_ms) - 1
+        return index if index >= 0 else None
+
+    def as_of(self, timestamp_ms: int) -> _Oi | None:
+        index = self.as_of_index(timestamp_ms)
+        return self.points[index] if index is not None else None
+
+    def trailing_oi_stats(self, *, timestamp_ms: int, current_index: int) -> tuple[float, float] | None:
+        start = bisect_left(self.times, timestamp_ms - 3_600_000)
+        count = current_index - start + 1
+        if count < 10:
+            return None
+        total = self.oi_prefix[current_index + 1] - self.oi_prefix[start]
+        square_total = self.oi_square_prefix[current_index + 1] - self.oi_square_prefix[start]
+        mean = total / count
+        variance = max(0.0, (square_total - (total * total / count)) / (count - 1))
+        return mean, variance
 
 
 class OutcomeOiFeaturePipeline:
@@ -153,16 +195,11 @@ class OutcomeOiFeaturePipeline:
                 }
         return output
 
-    @staticmethod
-    def _as_of(points: list[_Oi], timestamp_ms: int) -> _Oi | None:
-        # Linear scan is fine for the present research volume and transparent.
-        known = [point for point in points if point.local_received_at_ms <= timestamp_ms]
-        return known[-1] if known else None
-
-    def _oi_features(self, points: list[_Oi], snapshot_ms: int) -> tuple[_Oi | None, dict[str, Any]]:
-        current = self._as_of(points, snapshot_ms)
-        if current is None:
+    def _oi_features(self, index: _OiIndex, snapshot_ms: int) -> tuple[_Oi | None, dict[str, Any]]:
+        current_index = index.as_of_index(snapshot_ms)
+        if current_index is None:
             return None, {"oi_available": False}
+        current = index.points[current_index]
         result: dict[str, Any] = {
             "oi_available": True, "open_interest": current.open_interest,
             "binance_mark_price": current.mark_price, "taker_imbalance": current.taker_imbalance,
@@ -170,7 +207,7 @@ class OutcomeOiFeaturePipeline:
         returns: dict[int, float | None] = {}
         price_returns: dict[int, float | None] = {}
         for horizon in (300, 900, 3600):
-            prior = self._as_of(points, snapshot_ms - horizon * 1000)
+            prior = index.as_of(snapshot_ms - horizon * 1000)
             oi_return = ((current.open_interest / prior.open_interest) - 1.0) * 10_000 if prior else None
             returns[horizon] = oi_return
             result[f"oi_return_{horizon}s_bps"] = oi_return
@@ -184,29 +221,26 @@ class OutcomeOiFeaturePipeline:
             result["price_oi_regime_5m"] = f"price_{'up' if price_returns[300] >= 0 else 'down'}|oi_{'up' if returns[300] >= 0 else 'down'}"
         else:
             result["price_oi_regime_5m"] = None
-        trailing = [p.open_interest for p in points if snapshot_ms - 3_600_000 <= p.local_received_at_ms <= snapshot_ms]
-        if len(trailing) >= 10:
-            mean = sum(trailing) / len(trailing)
-            variance = sum((value - mean) ** 2 for value in trailing) / (len(trailing) - 1)
+        trailing_stats = index.trailing_oi_stats(timestamp_ms=snapshot_ms, current_index=current_index)
+        if trailing_stats is not None:
+            mean, variance = trailing_stats
             result["oi_zscore_1h"] = (current.open_interest - mean) / math.sqrt(variance) if variance > 0 else None
         else:
             result["oi_zscore_1h"] = None
         return current, result
 
     @staticmethod
-    def _labels(snapshots: list[tuple[int, dict[str, Any]]], index: int) -> dict[str, Any]:
-        _, current = snapshots[index]
+    def _labels(current: dict[str, Any], market_times: tuple[int, ...], market_snapshots: tuple[dict[str, Any], ...]) -> dict[str, Any]:
         timestamp = int(current["snapshot_timestamp_ms"])
-        outcome_id = int(current["outcome_id"])
         labels: dict[str, Any] = {}
         for horizon in LABEL_HORIZONS_SEC:
             target = timestamp + horizon * 1000
-            future = next((item for item in snapshots[index + 1:] if int(item[1]["outcome_id"]) == outcome_id and int(item[1]["snapshot_timestamp_ms"]) >= target), None)
+            future_index = bisect_left(market_times, target)
             key = f"future_{horizon}s"
-            if future is None or int(future[1]["snapshot_timestamp_ms"]) > target + LABEL_TOLERANCE_MS:
+            if future_index >= len(market_snapshots) or market_times[future_index] > target + LABEL_TOLERANCE_MS:
                 labels[key] = {"available": False, "reason": "future_accepted_snapshot_unavailable"}
                 continue
-            _, payload = future
+            payload = market_snapshots[future_index]
             record: dict[str, Any] = {"available": True, "label_timestamp_ms": int(payload["snapshot_timestamp_ms"]), "label_lag_ms": int(payload["snapshot_timestamp_ms"]) - target}
             for side in ("yes", "no"):
                 entry_bid, entry_ask, _, _ = _bbo(current[f"{side}_l2"])
@@ -219,52 +253,96 @@ class OutcomeOiFeaturePipeline:
             labels[key] = record
         return labels
 
-    def build(self) -> X3BuildResult:
+    def build(
+        self,
+        *,
+        batch_size: int = 500,
+        rebuild: bool = False,
+        progress: Callable[[int, int], None] | None = None,
+    ) -> X3BuildResult:
+        """Incrementally build X3 without quadratic scans or long write locks.
+
+        Existing rows of the current schema are retained.  The trailing label
+        window is always refreshed because a formerly unavailable 60m label
+        may become observable after a later snapshot arrives.
+        """
         with sqlite3.connect(self.journal.db_path) as conn:
             snapshots = self._snapshots(conn)
             observations = self._observations(conn)
             maker_fills = self._actual_maker_fills(conn)
             markouts_by_fill = self._markouts_by_fill(conn)
-        written = joined = 0
+            existing_ids = set() if rebuild else {
+                int(row[0]) for row in conn.execute(
+                    "SELECT outcome_snapshot_event_id FROM outcome_oi_feature_rows WHERE feature_schema_version=?",
+                    (FEATURE_SCHEMA_VERSION,),
+                )
+            }
+        oi_index = _OiIndex.from_points(observations)
+        by_market: dict[int, list[dict[str, Any]]] = defaultdict(list)
+        for _, snapshot in snapshots:
+            by_market[int(snapshot["outcome_id"])].append(snapshot)
+        market_index = {}
+        for outcome_id, group in by_market.items():
+            ordered = tuple(sorted(group, key=lambda item: int(item["snapshot_timestamp_ms"])))
+            market_index[outcome_id] = (
+                tuple(int(snapshot["snapshot_timestamp_ms"]) for snapshot in ordered), ordered,
+            )
+        newest_snapshot_ms = max((int(snapshot["snapshot_timestamp_ms"]) for _, snapshot in snapshots), default=0)
+        refresh_after_ms = newest_snapshot_ms - (max(LABEL_HORIZONS_SEC) + LABEL_TOLERANCE_MS // 1000) * 1000
+        work = [
+            (event_id, snapshot)
+            for event_id, snapshot in snapshots
+            # An explicit historical-backfill run intentionally changes the
+            # permitted OI evidence, so it must recompute the current schema.
+            if rebuild or self.include_backfilled or event_id not in existing_ids
+            or int(snapshot["snapshot_timestamp_ms"]) >= refresh_after_ms
+        ]
+        joined = 0
         coverage = {horizon: 0 for horizon in LABEL_HORIZONS_SEC}
-        for index, (event_id, snapshot) in enumerate(snapshots):
-            timestamp = int(snapshot["snapshot_timestamp_ms"])
-            oi, features = self._oi_features(observations, timestamp)
-            yes_bid, yes_ask, yes_bid_size, yes_ask_size = _bbo(snapshot["yes_l2"])
-            no_bid, no_ask, no_bid_size, no_ask_size = _bbo(snapshot["no_l2"])
-            features.update({
-                # X4 can only use this decision-time value.  Old snapshots
-                # without it remain valid X3 data but are excluded from the
-                # time-to-expiry walk-forward comparison.
-                "time_left_sec": _number(snapshot.get("time_left_sec")),
-                "strike": _number(snapshot.get("strike")),
-                "yes_bid": yes_bid, "yes_ask": yes_ask, "yes_spread": yes_ask - yes_bid if yes_bid is not None and yes_ask is not None else None,
-                "yes_bid_size": yes_bid_size, "yes_ask_size": yes_ask_size,
-                "no_bid": no_bid, "no_ask": no_ask, "no_spread": no_ask - no_bid if no_bid is not None and no_ask is not None else None,
-                "no_bid_size": no_bid_size, "no_ask_size": no_ask_size,
-            })
-            labels = self._labels(snapshots, index)
-            for horizon in LABEL_HORIZONS_SEC:
-                coverage[horizon] += int(labels[f"future_{horizon}s"]["available"])
-            context = {"market_instance": str(snapshot["outcome_id"]), "snapshot_event_id": event_id,
-                       "event_time_ms": timestamp, "oi_join_rule": "as_of_local_received_at", "oi_backfill_included": self.include_backfilled}
-            if oi is not None:
-                joined += 1
-                context.update({"oi_observation_id": oi.id, "oi_exchange_timestamp_ms": oi.exchange_timestamp_ms,
-                                "oi_local_received_at_ms": oi.local_received_at_ms, "oi_age_ms": timestamp - oi.local_received_at_ms})
-            if self.journal.upsert_outcome_oi_feature_row(feature_schema_version=FEATURE_SCHEMA_VERSION,
-                    outcome_snapshot_event_id=event_id, outcome_id=int(snapshot["outcome_id"]), period="1d",
-                    snapshot_timestamp_ms=timestamp, oi_observation_id=oi.id if oi else None,
-                    oi_exchange_timestamp_ms=oi.exchange_timestamp_ms if oi else None,
-                    oi_local_received_at_ms=oi.local_received_at_ms if oi else None,
-                    oi_age_ms=timestamp - oi.local_received_at_ms if oi else None,
-                    oi_join_direction="as_of_local_received_at", oi_backfilled=bool(oi and oi.backfilled),
-                    features=features, labels=labels, market_context=context):
-                written += 1
+
+        def rows() -> Any:
+            nonlocal joined
+            for event_id, snapshot in work:
+                timestamp = int(snapshot["snapshot_timestamp_ms"])
+                oi, features = self._oi_features(oi_index, timestamp)
+                yes_bid, yes_ask, yes_bid_size, yes_ask_size = _bbo(snapshot["yes_l2"])
+                no_bid, no_ask, no_bid_size, no_ask_size = _bbo(snapshot["no_l2"])
+                features.update({
+                    "time_left_sec": _number(snapshot.get("time_left_sec")), "strike": _number(snapshot.get("strike")),
+                    "yes_bid": yes_bid, "yes_ask": yes_ask, "yes_spread": yes_ask - yes_bid if yes_bid is not None and yes_ask is not None else None,
+                    "yes_bid_size": yes_bid_size, "yes_ask_size": yes_ask_size,
+                    "no_bid": no_bid, "no_ask": no_ask, "no_spread": no_ask - no_bid if no_bid is not None and no_ask is not None else None,
+                    "no_bid_size": no_bid_size, "no_ask_size": no_ask_size,
+                })
+                market_times, market_snapshots = market_index[int(snapshot["outcome_id"])]
+                labels = self._labels(snapshot, market_times, market_snapshots)
+                for horizon in LABEL_HORIZONS_SEC:
+                    coverage[horizon] += int(labels[f"future_{horizon}s"]["available"])
+                context = {"market_instance": str(snapshot["outcome_id"]), "snapshot_event_id": event_id,
+                           "event_time_ms": timestamp, "oi_join_rule": "as_of_local_received_at", "oi_backfill_included": self.include_backfilled}
+                if oi is not None:
+                    joined += 1
+                    context.update({"oi_observation_id": oi.id, "oi_exchange_timestamp_ms": oi.exchange_timestamp_ms,
+                                    "oi_local_received_at_ms": oi.local_received_at_ms, "oi_age_ms": timestamp - oi.local_received_at_ms})
+                yield {
+                    "feature_schema_version": FEATURE_SCHEMA_VERSION, "outcome_snapshot_event_id": event_id,
+                    "outcome_id": int(snapshot["outcome_id"]), "period": "1d", "snapshot_timestamp_ms": timestamp,
+                    "oi_observation_id": oi.id if oi else None,
+                    "oi_exchange_timestamp_ms": oi.exchange_timestamp_ms if oi else None,
+                    "oi_local_received_at_ms": oi.local_received_at_ms if oi else None,
+                    "oi_age_ms": timestamp - oi.local_received_at_ms if oi else None,
+                    "oi_join_direction": "as_of_local_received_at", "oi_backfilled": bool(oi and oi.backfilled),
+                    "features": features, "labels": labels, "market_context": context,
+                }
+
+        written = self.journal.bulk_upsert_outcome_oi_feature_rows(
+            rows(), batch_size=batch_size,
+            progress=(lambda completed: progress(completed, len(work))) if progress else None,
+        )
         fill_rows = 0
         for event_id, fill in maker_fills:
             timestamp = int(fill["timestamp_ms"])
-            oi, features = self._oi_features(observations, timestamp)
+            oi, features = self._oi_features(oi_index, timestamp)
             features.update({"fill_id": fill.get("trade_id"), "fill_side": fill.get("side"), "fill_price": fill.get("price"),
                              "fill_quantity": fill.get("quantity"), "actual_fill": True, "maker": True,
                              "oi_join_rule": "as_of_local_received_at"})

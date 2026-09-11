@@ -15,8 +15,18 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Build Outcome 1d × Binance OI research features; no venue calls")
     parser.add_argument("--db", default="logs/outcome_shadow.db")
     parser.add_argument("--include-backfilled", action="store_true", help="research-only override; default excludes backfill")
+    parser.add_argument("--rebuild", action="store_true", help="recompute all current-schema rows instead of resuming incomplete work")
+    parser.add_argument("--batch-size", type=int, default=500, help="short SQLite transaction size (default: 500)")
     args = parser.parse_args()
-    result = OutcomeOiFeaturePipeline(TradeJournalDB(args.db), include_backfilled=args.include_backfilled).build()
+    if args.batch_size <= 0:
+        parser.error("--batch-size must be positive")
+
+    def progress(completed: int, total: int) -> None:
+        print(f"X3 feature build progress: {completed}/{total} rows", file=sys.stderr, flush=True)
+
+    result = OutcomeOiFeaturePipeline(TradeJournalDB(args.db), include_backfilled=args.include_backfilled).build(
+        batch_size=args.batch_size, rebuild=args.rebuild, progress=progress,
+    )
     print(f"X3 feature build: snapshots={result.eligible_snapshots} rows={result.rows_written} oi_joined={result.oi_joined} maker_fill_rows={result.maker_fill_rows} labels={result.labels_available}")
 
 if __name__ == "__main__":
