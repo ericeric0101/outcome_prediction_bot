@@ -1,7 +1,9 @@
 import json
+from datetime import datetime, timezone
 from decimal import Decimal
 
-from bot.outcome_active_dataset import ACTIVE_DATASET_SCHEMA_VERSION, dataset_report, load_decision_rows
+from bot.outcome_active_dataset import ACTIVE_DATASET_SCHEMA_VERSION, dataset_report, feature_vector, load_decision_rows
+from bot.outcome_calendar_features import market_session_weekday
 from bot.outcome_active_decision import ActiveSideInput, OutcomeActiveActionOptimizer
 from bot.outcome_active_model import OutcomeActiveModel, train_report
 from bot.outcome_active_replay import replay_report
@@ -64,6 +66,25 @@ def test_b1_dataset_is_sampled_and_has_discrete_path_labels(tmp_path):
     result = dataset_report(journal.db_path)
     assert result["schema_version"] == ACTIVE_DATASET_SCHEMA_VERSION
     assert result["live_authority"] is False
+
+
+def test_calendar_features_follow_taipei_14h_market_rollover_not_midnight():
+    # 13:59 Taipei Saturday is still the Friday market; 14:00 begins Saturday.
+    before_rollover = int(datetime(2026, 9, 12, 5, 59, tzinfo=timezone.utc).timestamp() * 1000)
+    after_rollover = int(datetime(2026, 9, 12, 6, 0, tzinfo=timezone.utc).timestamp() * 1000)
+    assert market_session_weekday(before_rollover) == 4
+    assert market_session_weekday(after_rollover) == 5
+    features = {
+        "yes_bid": 0.60, "yes_ask": 0.61, "no_bid": 0.39, "no_ask": 0.40,
+        "time_left_sec": 70_000, "btc_mark_return_300s_bps": 10,
+        "btc_mark_return_900s_bps": 20, "btc_mark_return_3600s_bps": 30,
+        "oi_return_300s_bps": 2,
+    }
+    weekday_vector = feature_vector(features, 0, timestamp_ms=before_rollover)
+    weekend_vector = feature_vector(features, 0, timestamp_ms=after_rollover)
+    assert weekday_vector is not None and weekend_vector is not None
+    assert weekday_vector[8] == 0.0
+    assert weekend_vector[8] == 1.0
 
 
 def test_b2_model_uses_market_walk_forward_and_writes_shadow_artifact(tmp_path):
@@ -144,6 +165,7 @@ def test_b5_shadow_emits_structured_action_without_execution(tmp_path):
     assert result["decision_kind"] == "entry"
     assert result["challenger"]["execution_submitted"] is False
     assert result["observed_context"]["yes_bid"] is not None
+    assert isinstance(result["observed_context"]["market_session_is_weekend"], bool)
 
 
 def test_b3_wait_retains_counterfactual_side_without_submitting():

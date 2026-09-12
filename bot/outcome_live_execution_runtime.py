@@ -8,10 +8,9 @@ from __future__ import annotations
 
 import json
 import os
-import sqlite3
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 from decimal import Decimal, ROUND_FLOOR
 
 from bot.adapters.outcome_client import OutcomeClient
@@ -64,6 +63,13 @@ from bot.outcome_emergency_exit import (
 from bot.outcome_efficiency_shadow import OutcomeConfidenceEntryShadow, OutcomeQueueAwarePricingShadow
 from bot.outcome_active_shadow import OutcomeActiveChallengerShadow
 from bot.outcome_crash_circuit_shadow import OutcomeCrashCircuitObservation, OutcomeCrashCircuitShadow
+from bot.outcome_runtime_supervisors import (
+    OutcomeEntrySupervisor,
+    OutcomeHoldingSupervisor,
+    OutcomeResearchSupervisor,
+    OutcomeRuntimeTickSnapshot,
+)
+from bot.outcome_runtime_journal_view import OutcomeRuntimeJournalView
 
 
 @dataclass(frozen=True)
@@ -159,17 +165,28 @@ class OutcomeLiveExecutionRuntime:
         # canary against an old position without a new explicit operator run.
         self._e5_canary_eligible_order_ids: set[str] = set()
         self._tick_books: dict[tuple[int, int], dict[str, object]] = {}
-        self._last_holding_path_capture_at: dict[tuple[int, str], float] = {}
-        self._last_reversal_risk_observation_at: dict[tuple[int, str], float] = {}
         # Cache only immutable, exact-fill provenance.  A missing/ambiguous
         # lookup is intentionally retried on a later observation rather than
         # cached as a fabricated lifecycle identity.
-        self._holding_entry_provenance: dict[tuple[int, str, str, str], dict[str, object]] = {}
         self._last_regime_shadow_record: dict[int, tuple[str, float]] = {}
         self._latest_regime_shadow: dict[int, dict[str, object]] = {}
         self._last_toxic_shadow_record: dict[tuple[int, str], tuple[str, float]] = {}
         self._last_efficiency_shadow_record: dict[tuple[str, int, int], tuple[str, float]] = {}
         self._last_crash_shadow_record: dict[str, tuple[str, float]] = {}
+        self._last_flat_fill_sync_at = float("-inf")
+        self.journal_view = OutcomeRuntimeJournalView(ledger.journal.db_path if ledger else None)
+        # These narrow services own decision ordering.  Atomic execution and
+        # recovery primitives remain injected above and keep their existing
+        # independently tested contracts.
+        self.research_supervisor = OutcomeResearchSupervisor()
+        self.holding_supervisor = OutcomeHoldingSupervisor()
+        self.entry_supervisor = OutcomeEntrySupervisor()
+        self._current_tick_snapshot: OutcomeRuntimeTickSnapshot | None = None
+
+    @staticmethod
+    def _result(state: str, detail: str, order_id: str | None = None) -> LiveExecutionResult:
+        """Supervisor result factory without introducing a circular import."""
+        return LiveExecutionResult(state, detail, order_id)
 
     @staticmethod
     def _audit_decimal(audit: dict[str, object], name: str) -> Decimal | None:
@@ -419,24 +436,7 @@ class OutcomeLiveExecutionRuntime:
 
     def _continuation_entry_already_submitted(self, *, outcome_id: int) -> bool:
         """One continuation canary submit per daily market, including restarts."""
-        if self.ledger is None:
-            return True
-        try:
-            with sqlite3.connect(f"file:{self.ledger.journal.db_path}?mode=ro", uri=True) as conn:
-                rows = conn.execute(
-                    "SELECT payload_json FROM strategy_events "
-                    "WHERE event_type='OUTCOME_LIVE_STRATEGY_ENTRY_PLACED' ORDER BY id DESC LIMIT 500"
-                ).fetchall()
-        except sqlite3.Error:
-            return True
-        for (raw,) in rows:
-            try:
-                payload = json.loads(raw or "{}")
-                if int(payload.get("outcome_id")) == outcome_id and payload.get("entry_tier") == "tier_c_trend_continuation":
-                    return True
-            except (TypeError, ValueError, json.JSONDecodeError):
-                continue
-        return False
+        return self.journal_view.continuation_entry_already_submitted(outcome_id)
 
     def _capture_trend_continuation_path(
         self, *, market: OutcomeMarketSpec, entry_evidence: dict[str, object], market_context: dict[str, object] | None,
@@ -460,6 +460,7 @@ class OutcomeLiveExecutionRuntime:
 
     def _begin_tick(self) -> None:
         self._account_reads.begin_tick()
+        self.journal_view.begin_tick()
         self._tick_books.clear()
         begin_timing_scope = getattr(self.machine.gateway, "begin_timing_scope", None)
         if callable(begin_timing_scope):
@@ -561,13 +562,7 @@ class OutcomeLiveExecutionRuntime:
         return OutcomeLiveExecutionRuntime.exit_requote_enabled() and os.environ.get("OUTCOME_EXIT_REQUOTE_CANARY_ENABLED") == "1"
 
     def _daily_calibration_entries(self) -> int:
-        if not self.ledger:
-            return 0
-        with sqlite3.connect(self.ledger.journal.db_path) as conn:
-            row = conn.execute(
-                "SELECT COUNT(*) FROM strategy_events WHERE event_type='OUTCOME_P3_CALIBRATION_ENTRY_PLACED' AND date(ts)=date('now')"
-            ).fetchone()
-        return int(row[0] or 0)
+        return self.journal_view.daily_calibration_entries()
 
     def _persisted_entry_policy_evidence(self, *, market: OutcomeMarketSpec, coin: str) -> tuple[str, dict[str, object]] | None:
         """Load a verified entry policy, preferring strategy evidence.
@@ -578,73 +573,7 @@ class OutcomeLiveExecutionRuntime:
         follow-up strategy event commits.  When both records exist, their
         target and fee fields must agree; disagreement is fail-closed.
         """
-        if self.ledger is None:
-            return None
-        try:
-            with sqlite3.connect(self.ledger.journal.db_path) as conn:
-                row = conn.execute(
-                    """
-                    SELECT ts, payload_json FROM strategy_events
-                    WHERE event_type IN ('OUTCOME_P3_CALIBRATION_ENTRY_PLACED', 'OUTCOME_LIVE_STRATEGY_ENTRY_PLACED')
-                      AND CAST(json_extract(payload_json, '$.outcome_id') AS INTEGER)=?
-                      AND json_extract(payload_json, '$.coin')=?
-                    ORDER BY id DESC LIMIT 1
-                    """,
-                    (market.outcome_id, coin),
-                ).fetchone()
-                if row:
-                    timestamp, raw_payload = str(row[0]), row[1]
-                    payload = json.loads(raw_payload)
-                    if not isinstance(payload, dict):
-                        return None
-                    # Legacy/P3 entries may predate submit-audit evidence.
-                    # For new S0 entries, verify the matching order record
-                    # whenever it is present, without making old positions
-                    # impossible to reconcile after deployment.
-                    if str(payload.get("sampling_policy", "")) in {
-                        "oi_spot_mark_confirmation", "spot_mark_tier_b",
-                    }:
-                        order_id = str(payload.get("order_id") or "")
-                        if order_id:
-                            audit_row = conn.execute(
-                                """
-                                SELECT payload_json FROM order_events
-                                WHERE event_type='ORDER_SUBMIT' AND side='BUY' AND venue_order_id=?
-                                ORDER BY id DESC LIMIT 1
-                                """, (order_id,),
-                            ).fetchone()
-                            if audit_row:
-                                order_payload = json.loads(audit_row[0] or "{}")
-                                audit = order_payload.get("audit") if isinstance(order_payload, dict) else None
-                                if isinstance(audit, dict) and audit.get("entry_policy_schema_version") == 1:
-                                    for field in ("target_return_pct", "maker_close_fee_rate"):
-                                        if str(audit.get(field)) != str(payload.get(field)):
-                                            return None
-                    return timestamp, payload
-
-                # No strategy event: recover only from the dedicated S0
-                # submit audit, scoped to the exact market/coin.  This is the
-                # crash-window fallback, not a license to adopt manual buys.
-                rows = conn.execute(
-                    """
-                    SELECT ts, payload_json FROM order_events
-                    WHERE event_type='ORDER_SUBMIT' AND side='BUY' AND instrument_id=?
-                      AND CAST(json_extract(payload_json, '$.outcome_id') AS INTEGER)=?
-                    ORDER BY id DESC LIMIT 20
-                    """, (coin, market.outcome_id),
-                ).fetchall()
-            for timestamp, raw_payload in rows:
-                order_payload = json.loads(raw_payload or "{}")
-                audit = order_payload.get("audit") if isinstance(order_payload, dict) else None
-                if (
-                    isinstance(audit, dict)
-                    and audit.get("entry_policy_schema_version") == 1
-                    and audit.get("entry_policy_kind") in {"s0_oi_spot_mark_confirmation", "s0_spot_mark_tier_b"}
-                ):
-                    return str(timestamp), audit
-            return None
-        except (KeyError, TypeError, ValueError, sqlite3.Error, json.JSONDecodeError):
-            return None
+        return self.journal_view.persisted_entry_policy(market, coin)
 
     def _persisted_p3_exit_policy(self, *, market: OutcomeMarketSpec, coin: str) -> OutcomeP3CalibrationConfig | None:
         """Recover the policy that created a still-managed P3/S0 inventory."""
@@ -1240,76 +1169,7 @@ class OutcomeLiveExecutionRuntime:
         history can still be ambiguous after a restart; such a path remains
         unlabelled rather than being assigned to the latest strategy event.
         """
-        if self.ledger is None:
-            return None
-        key = (market.outcome_id, coin, str(inventory), str(fill_vwap))
-        cached = self._holding_entry_provenance.get(key)
-        if cached is not None:
-            return cached
-        try:
-            with sqlite3.connect(self.ledger.journal.db_path) as conn:
-                row = conn.execute(
-                    """SELECT id, ts, venue_order_id, price, qty, payload_json
-                       FROM order_events
-                       WHERE event_type='ORDER_FILLED' AND side='BUY' AND instrument_id=?
-                         AND CAST(json_extract(payload_json, '$.outcome_id') AS INTEGER)=?
-                         AND json_extract(payload_json, '$.coin')=?
-                         AND json_extract(payload_json, '$.actual_fill')=1
-                       ORDER BY id DESC LIMIT 1""",
-                    (coin, market.outcome_id, coin),
-                ).fetchone()
-                if row is None:
-                    return None
-                _, journal_filled_at, order_id, price, quantity, fill_raw = row
-                if Decimal(str(quantity)) != inventory or Decimal(str(price)) != fill_vwap:
-                    return None
-                entry_row = conn.execute(
-                    """SELECT payload_json FROM strategy_events
-                       WHERE event_type='OUTCOME_LIVE_STRATEGY_ENTRY_PLACED'
-                         AND CAST(json_extract(payload_json, '$.outcome_id') AS INTEGER)=?
-                         AND json_extract(payload_json, '$.coin')=?
-                         AND json_extract(payload_json, '$.order_id')=?
-                       ORDER BY id DESC LIMIT 1""",
-                    (market.outcome_id, coin, str(order_id)),
-                ).fetchone()
-            fill_payload = json.loads(fill_raw or "{}")
-            entry_payload = json.loads(entry_row[0] or "{}") if entry_row else {}
-            if not isinstance(fill_payload, dict) or not isinstance(entry_payload, dict):
-                return None
-            trade_id = str(fill_payload.get("trade_id") or "")
-            if not trade_id:
-                return None
-            entry_side_index = int(entry_payload.get("side_index"))
-            entry_tier = str(entry_payload.get("entry_tier") or "unknown")
-            target_return = entry_payload.get("target_return_pct")
-            # `ts` is when our journal received the fill.  It is not the
-            # holding clock: a resting ALO can wait minutes before it fills.
-            # Use the immutable official exchange fill timestamp when it is
-            # present, retaining the journal timestamp only as labelled
-            # legacy fallback evidence.
-            try:
-                official_timestamp_ms = int(fill_payload.get("timestamp_ms"))
-                if official_timestamp_ms <= 0:
-                    raise ValueError("non-positive official fill timestamp")
-                filled_at = datetime.fromtimestamp(official_timestamp_ms / 1000, tz=timezone.utc).isoformat()
-                filled_at_source = "official_fill_timestamp_ms"
-            except (TypeError, ValueError, OSError, OverflowError):
-                filled_at = str(journal_filled_at)
-                filled_at_source = "legacy_journal_fill_timestamp"
-            filled_epoch = datetime.fromisoformat(str(filled_at)).timestamp()
-            provenance = {
-                "entry_lifecycle_id": f"official_buy:{order_id}:{trade_id}",
-                "entry_order_id": str(order_id), "entry_trade_id": trade_id,
-                "entry_filled_at": str(filled_at), "entry_side_index": entry_side_index,
-                "entry_filled_at_source": filled_at_source,
-                "entry_tier": entry_tier,
-                "entry_target_return_pct": str(target_return) if target_return is not None else None,
-                "entry_time_left_sec": max(0.0, float(market.expiry_timestamp) - filled_epoch),
-            }
-            self._holding_entry_provenance[key] = provenance
-            return provenance
-        except (TypeError, ValueError, ArithmeticError, sqlite3.Error, json.JSONDecodeError):
-            return None
+        return self.journal_view.exact_holding_provenance(market, coin, inventory, fill_vwap)
 
     def _update_holding_reversal(
         self, *, market: OutcomeMarketSpec, coin: str, side_index: int,
@@ -1467,16 +1327,9 @@ class OutcomeLiveExecutionRuntime:
             age = 0.0
             age_basis = "unavailable"
             evidence: dict[str, object] = dict(self._holding_context.get(market.outcome_id, {}))
-            with sqlite3.connect(self.ledger.journal.db_path) as conn:
-                row = conn.execute(
-                    """SELECT ts, payload_json FROM strategy_events
-                       WHERE event_type='OUTCOME_LIVE_STRATEGY_ENTRY_PLACED'
-                         AND CAST(json_extract(payload_json, '$.outcome_id') AS INTEGER)=?
-                         AND json_extract(payload_json, '$.coin')=? ORDER BY id DESC LIMIT 1""",
-                    (market.outcome_id, coin),
-                ).fetchone()
-            if row:
-                payload = json.loads(row[1])
+            entry = self.journal_view.latest_strategy_entry(market, coin)
+            if entry:
+                _, payload = entry
                 if not evidence:
                     evidence = payload.get("entry_evidence") if isinstance(payload.get("entry_evidence"), dict) else {}
             provenance = self._resolve_holding_entry_provenance(
@@ -1489,8 +1342,8 @@ class OutcomeLiveExecutionRuntime:
                 # Keep an unbound fallback observation for operational
                 # visibility, but label it so the lifecycle report excludes
                 # it rather than treating submit time as a fill time.
-                if row:
-                    age = max(0.0, time.time() - datetime.fromisoformat(str(row[0])).timestamp())
+                if entry:
+                    age = max(0.0, time.time() - datetime.fromisoformat(str(entry[0])).timestamp())
                     age_basis = "entry_submit_fallback_unbound"
             remaining = inventory
             marketable_notional = Decimal("0")
@@ -1576,25 +1429,11 @@ class OutcomeLiveExecutionRuntime:
                         "time_left_sec": market.time_to_expiry_sec(),
                     },
                 )
-        except (sqlite3.Error, ValueError, TypeError, KeyError, IndexError, json.JSONDecodeError):
+        except (ValueError, TypeError, KeyError, IndexError, json.JSONDecodeError):
             return
 
     def _live_entry_age_sec(self, *, market: OutcomeMarketSpec, coin: str) -> float | None:
-        if self.ledger is None:
-            return None
-        try:
-            with sqlite3.connect(self.ledger.journal.db_path) as conn:
-                row = conn.execute(
-                    """SELECT ts FROM strategy_events
-                       WHERE event_type='OUTCOME_LIVE_STRATEGY_ENTRY_PLACED'
-                         AND CAST(json_extract(payload_json, '$.outcome_id') AS INTEGER)=?
-                         AND json_extract(payload_json, '$.coin')=?
-                       ORDER BY id DESC LIMIT 1""",
-                    (market.outcome_id, coin),
-                ).fetchone()
-            return max(0.0, time.time() - datetime.fromisoformat(str(row[0])).timestamp()) if row else None
-        except (TypeError, ValueError, sqlite3.Error):
-            return None
+        return self.journal_view.live_entry_age_sec(market, coin)
 
     def _official_holding_age_sec(
         self, *, market: OutcomeMarketSpec, coin: str, inventory: Decimal, fill_vwap: Decimal | None,
@@ -1965,24 +1804,10 @@ class OutcomeLiveExecutionRuntime:
         if self.ledger is None:
             return LiveExecutionResult("blocked", "live strategy requires an execution ledger")
         self._holding_context[market.outcome_id] = dict(market_context or entry_evidence)
-        admission["market_regime_shadow"] = self._observe_market_regime_shadow(
-            market=market, entry_side_index=entry_side_index,
-            entry_evidence=entry_evidence, market_context=market_context,
-        )
-        admission["confidence_entry_shadow"] = self._observe_confidence_entry_shadow(
-            market=market, market_context=market_context,
-        )
-        admission["active_challenger_shadow"] = self._observe_active_challenger_shadow(
-            market=market,
-            market_context=market_context,
-            production_side_index=entry_side_index,
-            production_reason=entry_reason,
-            regime=admission.get("market_regime_shadow") if isinstance(admission.get("market_regime_shadow"), dict) else None,
-        )
-        # C1/C2 research capture is strictly public-data, bounded to one row
-        # per 30 seconds and independent of whether the canary is enabled.
-        self._capture_trend_continuation_path(
-            market=market, entry_evidence=entry_evidence, market_context=market_context,
+        self.research_supervisor.observe_entry(
+            self, market=market, entry_side_index=entry_side_index,
+            entry_reason=entry_reason, entry_evidence=entry_evidence,
+            market_context=market_context, admission=admission,
         )
         config = OutcomeLiveStrategyConfig.from_env()
         tracked_markets = (market, *retiring_markets)
@@ -1993,19 +1818,6 @@ class OutcomeLiveExecutionRuntime:
             "safe_for_new_entry": bool(getattr(report, "safe_for_new_entry", False)),
             "reason": str(getattr(report, "reason", "unknown")),
         }
-        # An IOC may fill between the previous tick and this account snapshot.
-        # Import official fills before evaluating its durable loss/re-entry
-        # consequence; otherwise an emergency close could be misclassified as
-        # merely a missing order.
-        try:
-            self.ledger.sync_fills(
-                fills=self.recovery.account.get_user_fills_sync(self.recovery.wallet),
-                market_key=f"outcome:{market.outcome_id}", period=market.period,
-            )
-        except Exception:
-            # Account recovery remains the hard safety source; missing fill
-            # history means no inferred loss/re-entry transition.
-            pass
         self._reconcile_exit_lifecycles(market=market, report=report)
         retired_active = [
             finding for finding in report.findings
@@ -2018,7 +1830,38 @@ class OutcomeLiveExecutionRuntime:
                 "market rollover pending: retiring Outcome has live inventory or order; new entry refused",
             )
         active = [finding for finding in report.findings if finding.market_id == market.outcome_id and finding.state != "flat"]
+        pending_owned_entry = not active and self.entry_lifecycle_store is not None and any(
+            self.entry_lifecycle_store.recover(
+                wallet=self.recovery.wallet, outcome_id=market.outcome_id, coin=coin,
+            ) is not None
+            for coin in (market.yes_coin, market.no_coin)
+        )
+        # An IOC may fill between ticks.  While exposure exists, import its
+        # official fills each decision.  A flat wallet does not need that
+        # account endpoint every 1.5s; a bounded 15s poll still catches an
+        # externally completed/manual lifecycle without creating a /info
+        # request storm alongside recovery and research workers.
+        now_monotonic = time.monotonic()
+        if active or pending_owned_entry or now_monotonic - self._last_flat_fill_sync_at >= 15.0:
+            try:
+                self.ledger.sync_fills(
+                    fills=self.recovery.account.get_user_fills_sync(self.recovery.wallet),
+                    market_key=f"outcome:{market.outcome_id}", period=market.period,
+                )
+                if not active and not pending_owned_entry:
+                    self._last_flat_fill_sync_at = now_monotonic
+            except Exception:
+                # Account recovery remains the hard safety source; missing
+                # fill history means no inferred loss/re-entry transition.
+                pass
         admission["active_current_market_count"] = len(active)
+        snapshot = OutcomeRuntimeTickSnapshot(
+            market=market, report=report, active=tuple(active),
+            pending_owned_entry=pending_owned_entry,
+            entry_side_index=entry_side_index, entry_reason=entry_reason,
+            reduce_only=reduce_only, observed_monotonic=time.monotonic(),
+        )
+        self._current_tick_snapshot = snapshot
         self._record_entry_gate_decision(
             market=market, entry_side_index=entry_side_index, entry_reason=entry_reason,
             entry_evidence=entry_evidence, active=active,
@@ -2028,115 +1871,24 @@ class OutcomeLiveExecutionRuntime:
         )
         if fill_visibility_barrier is not None:
             return fill_visibility_barrier
-        if len(active) == 1:
-            # A filled buy plus an open owned remainder is the only state
-            # where cancellation is more urgent than every observational
-            # read.  Do it first so a slow holding-path REST capture cannot
-            # extend the interval before the first protective sell.
-            filled_entry_cleanup = self._cancel_filled_entry_and_place_protection(
-                market=market, finding=active[0],
-            )
-            if filled_entry_cleanup is not None:
-                return filled_entry_cleanup
-            # Toxic-fill is deliberately observation-only in this milestone.
-            # It must never delay the cancel-before-protective-sell boundary
-            # above, nor can it authorize a repricing or taker exit.
-            self._observe_toxic_fill_shadow(market=market, finding=active[0])
-            holding_key = (market.outcome_id, str(getattr(active[0], "coin", "")))
-            now = time.monotonic()
-            reversal_observed = False
-            if now - self._last_reversal_risk_observation_at.get(holding_key, float("-inf")) >= self._REVERSAL_RISK_MIN_INTERVAL_SEC:
-                reversal_observed = self._observe_holding_reversal_ws(market=market, finding=active[0])
-                if reversal_observed:
-                    self._last_reversal_risk_observation_at[holding_key] = now
-            if now - self._last_holding_path_capture_at.get(holding_key, float("-inf")) >= self._HOLDING_PATH_MIN_INTERVAL_SEC:
-                self._capture_holding_path(
-                    market=market, finding=active[0], update_reversal=not reversal_observed,
-                )
-                self._last_holding_path_capture_at[holding_key] = now
-            # Fast-failure is the early, tightly bounded price-protected lane.
-            # It is evaluated before two-hour S3 but shares the same fresh
-            # REST L2/full-inventory/one-shot guarantees.
-            fast_failure = self._maybe_fast_failure_exit(market=market, finding=active[0])
-            if fast_failure is not None:
-                return fast_failure
-            # S3 deliberately uses a freshly fetched REST L2 depth walk, not
-            # the WebSocket cache.  It may therefore assess an already-held
-            # position even when the stream only blocks *new* entries.
-            emergency = self._maybe_emergency_exit(market=market, finding=active[0])
-            if emergency is not None:
-                return emergency
-            if not reduce_only:
-                entry_requote = self._maybe_requote_entry_buy(
-                    market=market, finding=active[0], entry_side_index=entry_side_index,
-                    entry_reason=entry_reason, config=config,
-                )
-                if entry_requote is not None:
-                    return entry_requote
+        holding_result = self.holding_supervisor.manage_before_stream_gate(
+            self, snapshot=snapshot, config=config,
+        )
+        if holding_result is not None:
+            return holding_result
         health_error = self._stream_ready(market)
         if health_error and not (reduce_only and active):
             admission["market_data_gate"] = health_error.detail
             return health_error
         admission["market_data_gate"] = "ws_fresh" if health_error is None else "ws_stale_existing_exit_rest_fallback"
-        if len(active) == 1:
-            requote = self._maybe_requote_p3_exit(market=market, finding=active[0])
-            if requote is not None:
-                return requote
-            persisted_exit = self._advance_persisted_p3_exit(market=market, finding=active[0])
-            if persisted_exit is not None:
-                return persisted_exit
-        if not report.safe_for_new_entry:
-            return LiveExecutionResult("blocked", f"account recovery blocked live strategy: {report.reason}")
-        if active:
-            admission["account_gate"] = "existing_outcome_inventory_or_order"
-            return LiveExecutionResult("blocked", "live strategy has existing Outcome inventory or order")
-        if self.entry_lifecycle_store is not None:
-            pending_ambiguous = self.entry_lifecycle_store.pending_ambiguous_submit(
-                wallet=self.recovery.wallet, outcome_id=market.outcome_id,
-            )
-            if pending_ambiguous is not None:
-                # An open order can become visible after the response timeout.
-                # Adopt only the exact durable intent, then make the next tick
-                # re-read account truth; never submit a replacement here.
-                try:
-                    open_orders = self.recovery.account.get_open_orders_sync(self.recovery.wallet)
-                    adopted = None
-                    for coin in (market.yes_coin, market.no_coin):
-                        candidate = self.entry_lifecycle_store.recover_or_adopt_audited_submit(
-                            wallet=self.recovery.wallet, outcome_id=market.outcome_id,
-                            coin=coin, open_orders=open_orders,
-                        )
-                        if candidate is not None:
-                            adopted = candidate
-                            break
-                except Exception:
-                    adopted = None
-                admission["ambiguous_submit_fence"] = {
-                    "blocked": True, "intent_id": pending_ambiguous.get("intent_id"),
-                    "recovered_order_id": adopted.order_id if adopted is not None else None,
-                }
-                if adopted is not None:
-                    return LiveExecutionResult("blocked", "ambiguous prior entry adopted; refreshing account truth before any new action", adopted.order_id)
-                return LiveExecutionResult("blocked", "ambiguous prior entry submission; reconciliation required before any new entry")
-        if reduce_only:
-            admission["reduce_only_gate"] = "new_entries_prohibited"
-            return LiveExecutionResult("flat", "reduce-only: no live exposure after entry cancellation")
-        if entry_side_index not in (0, 1):
-            admission["signal_gate"] = "no_directional_signal"
-            return LiveExecutionResult("flat", f"live strategy no entry: {entry_reason}")
-        admission["selected_side_index"] = entry_side_index
-        admission["selected_coin"] = self.machine.gateway.outcome_coin(market, entry_side_index)
-        if self.entry_lifecycle_store is not None:
-            cooldown = self.entry_lifecycle_store.fast_rebook_cooldown_remaining(
-                wallet=self.recovery.wallet, outcome_id=market.outcome_id,
-                coin=str(admission["selected_coin"]),
-                cooldown_sec=self.entry_planner.config.fast_rebook_cooldown_sec,
-            )
-            admission["entry_fast_rebook_cooldown_remaining_sec"] = round(cooldown, 3)
-            if cooldown > 0:
-                return LiveExecutionResult(
-                    "flat", f"live strategy no entry: fast_risk_rebook_cooldown ({cooldown:.1f}s remaining)",
-                )
+        holding_result = self.holding_supervisor.manage_after_stream_gate(self, snapshot=snapshot)
+        if holding_result is not None:
+            return holding_result
+        entry_preflight = self.entry_supervisor.preflight(
+            self, snapshot=snapshot, admission=admission, config=config,
+        )
+        if entry_preflight is not None:
+            return entry_preflight
         fees = self.recovery.account.get_user_fees_sync(self.recovery.wallet)
         maker_close_fee = Decimal(str(fees["userSpotAddRate"]))
         taker_close_fee = Decimal(str(fees["userSpotCrossRate"]))

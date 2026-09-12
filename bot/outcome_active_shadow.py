@@ -1,6 +1,7 @@
 """B5 live observer for the active challenger; permanently mutation-free."""
 from __future__ import annotations
 
+from bot.outcome_calendar_features import market_session_calendar_features
 from decimal import Decimal
 from typing import Any, Mapping
 
@@ -33,6 +34,7 @@ class OutcomeActiveChallengerShadow:
         regime: Mapping[str, object] | None,
     ) -> dict[str, Any]:
         features = live_feature_view(context, time_left_sec=time_left_sec)
+        calendar = market_session_calendar_features(int(features["observation_timestamp_ms"]))
         candidates: list[ActiveSideInput] = []
         scores: dict[str, Any] = {}
         for side_index, prefix in ((0, "yes"), (1, "no")):
@@ -65,6 +67,8 @@ class OutcomeActiveChallengerShadow:
                 "btc_mark_return_900s_bps": features.get("btc_mark_return_900s_bps"),
                 "btc_mark_return_3600s_bps": features.get("btc_mark_return_3600s_bps"),
                 "oi_return_300s_bps": features.get("oi_return_300s_bps"),
+                "market_session_weekday": calendar["market_session_weekday"],
+                "market_session_is_weekend": calendar["market_session_is_weekend"],
             },
             "fee_assumptions": {"taker_open": "0.0007", "maker_close": "0.0004"},
             "scores": scores,

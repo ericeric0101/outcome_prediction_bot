@@ -19,7 +19,7 @@ from loguru import logger
 
 from dashboard_state import DashboardState
 from bot.adapters.outcome_auth import OutcomeAuth
-from bot.adapters.outcome_client import OutcomeClient
+from bot.adapters.outcome_client import OutcomeClient, OutcomeInfoCooldownError
 from bot.lifecycle.outcome_lifecycle import (
     OutcomeMarketSpec,
     discover_btc_markets_by_preference,
@@ -312,6 +312,7 @@ def run_integrated_hyperliquid_bot(
     refresh_interval = 1.5 if not test_mode else 1.0
     last_log_time = 0.0
     last_slow_loop_warning_at = 0.0
+    last_info_cooldown_warning_at = 0.0
     market_preferences, market_allow_fallback = resolve_daily_outcome_scope(os.environ)
     shutdown_requested = threading.Event()
     saved_sigterm_handler = install_graceful_shutdown_handler(shutdown_requested)
@@ -505,6 +506,14 @@ def run_integrated_hyperliquid_bot(
                             runtime_result = live_execution.tick_market(market=market, entry_side_index=entry_side_index)
                         active_order_id = runtime_result.order_id if runtime_result.state in {"buy_placed", "buy_resting"} else None
                         logger.info(f"[LIVE OUTCOME RUNTIME] state={runtime_result.state} detail={runtime_result.detail} order={runtime_result.order_id}")
+                    except OutcomeInfoCooldownError as e:
+                        # A local cooldown intentionally sends no request and
+                        # is already fail-closed.  Keep it operationally
+                        # visible without turning every bounded tick into an
+                        # apparent runtime error.
+                        if time.time() - last_info_cooldown_warning_at >= 30.0:
+                            last_info_cooldown_warning_at = time.time()
+                            logger.warning(f"Outcome live runtime rate-limited fail-closed: {e}")
                     except Exception as e:
                         logger.error(f"Outcome live runtime failed closed: {e}")
                     finally:
@@ -687,9 +696,12 @@ def run_integrated_hyperliquid_bot(
                     logger.warning(f"[OUTCOME LOOP SLOW] total_ms={timing_payload['total_ms']} stages={loop_stages_ms}")
             wait_sec = max(0.1, refresh_interval - elapsed)
             if not simulation and live_ws_recorder is not None:
-                # L2 may wake the next serial decision early.  Account checks,
-                # REST confirmation and every mutation remain on this thread.
-                live_ws_recorder.wait_for_l2_update(wait_sec)
+                # L2 updates remain in the recorder cache, but must not make
+                # a complete account-recovery/REST decision run for every
+                # book tick.  That previously turned a 1.5s target cadence
+                # into sub-second /info bursts and venue 429s.  Mutations
+                # still use fresh REST after their own cancel confirmation.
+                shutdown_requested.wait(wait_sec)
             else:
                 shutdown_requested.wait(wait_sec)
 

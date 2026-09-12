@@ -16,10 +16,11 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
+from bot.outcome_calendar_features import market_session_calendar_features
 from bot.outcome_oi_features import FEATURE_SCHEMA_VERSION, LABEL_HORIZONS_SEC
 
 
-ACTIVE_DATASET_SCHEMA_VERSION = 1
+ACTIVE_DATASET_SCHEMA_VERSION = 2
 ACTIVE_FEATURE_NAMES = (
     "side_mid",
     "side_spread",
@@ -29,6 +30,11 @@ ACTIVE_FEATURE_NAMES = (
     "signed_mark_15m_bps",
     "signed_mark_60m_bps",
     "oi_activity_5m_bps",
+    "market_session_is_weekend",
+    "market_session_weekday_sin",
+    "market_session_weekday_cos",
+    "weekend_side_spread",
+    "weekend_signed_mark_5m_bps",
 )
 
 
@@ -40,7 +46,9 @@ def _finite(value: object) -> float | None:
     return result if math.isfinite(result) else None
 
 
-def feature_vector(features: Mapping[str, object], side_index: int) -> tuple[float, ...] | None:
+def feature_vector(
+    features: Mapping[str, object], side_index: int, *, timestamp_ms: int | None = None,
+) -> tuple[float, ...] | None:
     prefix = "yes" if side_index == 0 else "no"
     bid, ask = _finite(features.get(f"{prefix}_bid")), _finite(features.get(f"{prefix}_ask"))
     time_left = _finite(features.get("time_left_sec"))
@@ -52,15 +60,28 @@ def feature_vector(features: Mapping[str, object], side_index: int) -> tuple[flo
         return None
     direction = 1.0 if side_index == 0 else -1.0
     midpoint = (bid + ask) / 2.0
+    # Offline rows always supply their immutable observation timestamp.  Live
+    # B5 callers inject the current observation timestamp into ``features``.
+    raw_timestamp = timestamp_ms if timestamp_ms is not None else _finite(features.get("observation_timestamp_ms"))
+    if raw_timestamp is None:
+        return None
+    calendar = market_session_calendar_features(int(raw_timestamp))
+    weekend = 1.0 if calendar["market_session_is_weekend"] else 0.0
+    signed_mark_5m = direction * float(marks[0])
     return (
         midpoint,
         ask - bid,
         midpoint - 0.5,
         min(time_left, 86_400.0) / 86_400.0,
-        direction * float(marks[0]),
+        signed_mark_5m,
         direction * float(marks[1]),
         direction * float(marks[2]),
         abs(oi),
+        weekend,
+        float(calendar["market_session_weekday_sin"]),
+        float(calendar["market_session_weekday_cos"]),
+        weekend * (ask - bid),
+        weekend * signed_mark_5m,
     )
 
 
@@ -145,7 +166,7 @@ def load_decision_rows(
             key = (outcome_id, side_index)
             if timestamp_ms - last.get(key, -interval_ms) < interval_ms:
                 continue
-            vector = feature_vector(features, side_index)
+            vector = feature_vector(features, side_index, timestamp_ms=timestamp_ms)
             bid, ask = _finite(features.get(f"{prefix}_bid")), _finite(features.get(f"{prefix}_ask"))
             if vector is None or bid is None or ask is None:
                 continue
@@ -159,6 +180,10 @@ def load_decision_rows(
 
 def dataset_report(db_path: str | Path, *, period: str = "1d", sample_interval_sec: int = 60) -> dict[str, Any]:
     rows = load_decision_rows(db_path, period=period, sample_interval_sec=sample_interval_sec)
+    weekdays = {str(day): 0 for day in range(7)}
+    for row in rows:
+        weekday = int(market_session_calendar_features(row.timestamp_ms)["market_session_weekday"])
+        weekdays[str(weekday)] += 1
     return {
         "report": "outcome_active_decision_dataset",
         "schema_version": ACTIVE_DATASET_SCHEMA_VERSION,
@@ -168,6 +193,11 @@ def dataset_report(db_path: str | Path, *, period: str = "1d", sample_interval_s
         "rows": len(rows),
         "market_instances": len({row.outcome_id for row in rows}),
         "sides": {str(side): sum(row.side_index == side for row in rows) for side in (0, 1)},
+        "market_session_weekday_rows": weekdays,
+        "market_session_day_type_rows": {
+            "weekday": sum(not bool(market_session_calendar_features(row.timestamp_ms)["market_session_is_weekend"]) for row in rows),
+            "weekend": sum(bool(market_session_calendar_features(row.timestamp_ms)["market_session_is_weekend"]) for row in rows),
+        },
         "label_coverage": {
             name: sum(row.targets.get(name) is not None for row in rows)
             for name in ("future_bid_300s", "future_bid_900s", "future_bid_1800s", "future_bid_3600s", "observed_horizon_mfe", "observed_horizon_mae")

@@ -109,10 +109,15 @@ def shadow_report(
 
     action_counts: Counter[str] = Counter()
     all_action_counts: Counter[str] = Counter()
+    action_counts_by_day_type: dict[str, Counter[str]] = {"weekday": Counter(), "weekend": Counter(), "unknown": Counter()}
+    unseen_by_day_type: Counter[str] = Counter()
     production_reason_counts: Counter[str] = Counter()
     holding_action_counts: Counter[str] = Counter()
     unseen_markets: set[int] = set()
     horizon_returns: dict[int, list[Decimal]] = {horizon: [] for horizon in HORIZONS_SEC}
+    horizon_returns_by_day_type: dict[int, dict[str, list[Decimal]]] = {
+        horizon: {"weekday": [], "weekend": [], "unknown": []} for horizon in HORIZONS_SEC
+    }
     horizon_coverage: Counter[int] = Counter()
     entry_events = unseen_entry_events = holding_events = 0
     for raw_ts, event_type, raw_payload in raw_events:
@@ -148,6 +153,10 @@ def shadow_report(
         production_reason_counts[str(payload.get("production_reason") or "unknown")] += 1
         observed = payload.get("observed_context")
         observed = observed if isinstance(observed, Mapping) else {}
+        raw_weekend = observed.get("market_session_is_weekend")
+        day_type = "weekend" if raw_weekend is True else "weekday" if raw_weekend is False else "unknown"
+        unseen_by_day_type[day_type] += 1
+        action_counts_by_day_type[day_type][action] += 1
         prefix = "yes" if side_index == 0 else "no"
         ask = _decimal(observed.get(f"{prefix}_ask"))
         quote = _decimal(challenger.get("quote"))
@@ -165,7 +174,9 @@ def shadow_report(
             if future_bid is None or future_bid <= 0:
                 continue
             horizon_coverage[horizon] += 1
-            horizon_returns[horizon].append(future_bid * (Decimal("1") - Decimal("0.0004")) / cost - Decimal("1"))
+            net_return = future_bid * (Decimal("1") - Decimal("0.0004")) / cost - Decimal("1")
+            horizon_returns[horizon].append(net_return)
+            horizon_returns_by_day_type[horizon][day_type].append(net_return)
 
     path_summary: dict[str, Any] = {}
     for horizon, values in horizon_returns.items():
@@ -173,6 +184,14 @@ def shadow_report(
             "observations": len(values),
             "mean_fee_adjusted_return": str(sum(values, Decimal("0")) / len(values)) if values else None,
             "positive_rate": sum(value > 0 for value in values) / len(values) if values else None,
+            "by_market_session_day_type": {
+                day_type: {
+                    "observations": len(day_values),
+                    "mean_fee_adjusted_return": str(sum(day_values, Decimal("0")) / len(day_values)) if day_values else None,
+                    "positive_rate": sum(value > 0 for value in day_values) / len(day_values) if day_values else None,
+                }
+                for day_type, day_values in horizon_returns_by_day_type[horizon].items()
+            },
         }
     blockers: list[str] = []
     if len(unseen_markets) < 5:
@@ -190,6 +209,10 @@ def shadow_report(
         "unseen_entry_events": unseen_entry_events,
         "holding_events": holding_events,
         "entry_actions": dict(action_counts),
+        "unseen_entry_market_session_day_type_counts": dict(unseen_by_day_type),
+        "unseen_entry_actions_by_market_session_day_type": {
+            day_type: dict(counts) for day_type, counts in action_counts_by_day_type.items()
+        },
         "all_entry_actions_operational": dict(all_action_counts),
         "holding_actions": dict(holding_action_counts),
         "production_reason_counts": dict(production_reason_counts),

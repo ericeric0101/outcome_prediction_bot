@@ -18,7 +18,9 @@ from typing import Any, Iterable, Mapping
 from bot.outcome_active_dataset import ACTIVE_DATASET_SCHEMA_VERSION, ACTIVE_FEATURE_NAMES, ActiveDecisionRow, load_decision_rows
 
 
-ACTIVE_MODEL_SCHEMA_VERSION = 1
+# Calendar columns alter the feature-vector contract.  Reject older frozen
+# artifacts rather than silently scoring them against a shifted vector.
+ACTIVE_MODEL_SCHEMA_VERSION = 2
 FAIR_TARGETS = ("future_bid_300s", "future_bid_900s", "future_bid_1800s", "future_bid_3600s")
 PROBABILITY_TARGETS = (
     "hit_plus_1pct_1h",

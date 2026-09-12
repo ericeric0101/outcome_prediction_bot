@@ -1,6 +1,7 @@
 """E3/E4 read-only confidence entry and queue-aware quote decisions."""
 from __future__ import annotations
 
+import time
 from decimal import Decimal
 from typing import Any, Mapping
 
@@ -18,6 +19,9 @@ def live_feature_view(context: Mapping[str, object], *, time_left_sec: float) ->
         "btc_mark_return_900s_bps": continuation.get("mark_15m_bps"),
         "btc_mark_return_3600s_bps": continuation.get("mark_60m_bps"),
         "oi_return_300s_bps": context.get("oi_return_bps"),
+        # Every B5 scoring call is an observation.  This timestamp supplies
+        # the same Taipei market-session calendar features used offline.
+        "observation_timestamp_ms": int(time.time() * 1000),
     }
 
 

@@ -10,12 +10,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
+from bot.outcome_calendar_features import market_session_calendar_features
 from bot.outcome_oi_features import FEATURE_SCHEMA_VERSION
 
-MODEL_SCHEMA_VERSION = 1
+MODEL_SCHEMA_VERSION = 2
 FEATURE_NAMES = (
     "side_mid", "side_spread", "side_probability_distance", "time_left_fraction",
     "signed_mark_5m_bps", "signed_mark_15m_bps", "signed_mark_60m_bps", "oi_activity_5m_bps",
+    "market_session_is_weekend", "market_session_weekday_sin", "market_session_weekday_cos",
+    "weekend_side_spread", "weekend_signed_mark_5m_bps",
 )
 
 
@@ -27,7 +30,7 @@ def _finite(value: object) -> float | None:
     return result if math.isfinite(result) else None
 
 
-def _vector(features: Mapping[str, Any], side_index: int) -> tuple[float, ...] | None:
+def _vector(features: Mapping[str, Any], side_index: int, *, timestamp_ms: int | None = None) -> tuple[float, ...] | None:
     prefix = "yes" if side_index == 0 else "no"
     bid, ask = _finite(features.get(f"{prefix}_bid")), _finite(features.get(f"{prefix}_ask"))
     time_left = _finite(features.get("time_left_sec"))
@@ -39,9 +42,17 @@ def _vector(features: Mapping[str, Any], side_index: int) -> tuple[float, ...] |
         return None
     direction = 1.0 if side_index == 0 else -1.0
     mid = (bid + ask) / 2
+    raw_timestamp = timestamp_ms if timestamp_ms is not None else _finite(features.get("observation_timestamp_ms"))
+    if raw_timestamp is None:
+        return None
+    calendar = market_session_calendar_features(int(raw_timestamp))
+    weekend = 1.0 if calendar["market_session_is_weekend"] else 0.0
+    signed_mark_5m = direction * marks[0]
     return (
         mid, ask - bid, mid - 0.5, min(time_left, 86_400.0) / 86_400.0,
-        direction * marks[0], direction * marks[1], direction * marks[2], abs(oi),
+        signed_mark_5m, direction * marks[1], direction * marks[2], abs(oi),
+        weekend, float(calendar["market_session_weekday_sin"]), float(calendar["market_session_weekday_cos"]),
+        weekend * (ask - bid), weekend * signed_mark_5m,
     )
 
 
@@ -80,7 +91,7 @@ def _rows(db_path: str | Path, horizon_sec: int) -> list[_Row]:
         if not isinstance(features, dict) or not isinstance(label, dict) or label.get("available") is not True:
             continue
         for side_index, prefix in ((0, "yes"), (1, "no")):
-            vector = _vector(features, side_index)
+            vector = _vector(features, side_index, timestamp_ms=int(timestamp_ms))
             future_bid = _finite(label.get(f"{prefix}_future_bid"))
             key = (int(outcome_id), side_index)
             previous = last_by_market_side.get(key)

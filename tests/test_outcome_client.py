@@ -84,8 +84,8 @@ def test_execution_client_can_fail_fast_without_retry_backoff(monkeypatch):
     assert calls == [1]
 
 
-def test_429_blocks_other_wallet_account_reads_without_sending_another_request(monkeypatch):
-    """A second client must share the first client's per-wallet cooldown."""
+def test_429_blocks_all_other_info_reads_without_sending_another_request(monkeypatch):
+    """A second client must share the first venue-wide /info cooldown."""
     auth = OutcomeAuth(wallet_address="0x" + "c" * 40, is_testnet=True)
     first = OutcomeClient(auth, info_max_retries=1)
     second = OutcomeClient(auth, info_max_retries=1)
@@ -108,11 +108,15 @@ def test_429_blocks_other_wallet_account_reads_without_sending_another_request(m
 
     monkeypatch.setattr(first, "get_sync_client", lambda: FirstClient())
     monkeypatch.setattr(second, "get_sync_client", lambda: SecondClient())
-    with pytest.raises(httpx.HTTPStatusError):
-        first.post_info_sync({"type": "spotClearinghouseState", "user": auth.wallet_address})
-    with pytest.raises(OutcomeInfoCooldownError):
-        second.post_info_sync({"type": "frontendOpenOrders", "user": auth.wallet_address, "dex": "ALL_DEXS"})
-    assert calls == ["first"]
+    try:
+        with pytest.raises(httpx.HTTPStatusError):
+            first.post_info_sync({"type": "spotClearinghouseState", "user": auth.wallet_address})
+        with pytest.raises(OutcomeInfoCooldownError):
+            second.post_info_sync({"type": "l2Book", "coin": "#123"})
+        assert calls == ["first"]
+    finally:
+        with OutcomeClient._info_cooldown_lock:
+            OutcomeClient._info_cooldowns.clear()
 
 
 @pytest.mark.anyio
