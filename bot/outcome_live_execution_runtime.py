@@ -62,6 +62,7 @@ from bot.outcome_emergency_exit import (
 )
 from bot.outcome_efficiency_shadow import OutcomeConfidenceEntryShadow, OutcomeQueueAwarePricingShadow
 from bot.outcome_active_shadow import OutcomeActiveChallengerShadow
+from bot.outcome_crash_circuit_shadow import OutcomeCrashCircuitObservation, OutcomeCrashCircuitShadow
 
 
 @dataclass(frozen=True)
@@ -77,6 +78,7 @@ class OutcomeLiveExecutionRuntime:
     # L2 request even while a managed sell was safely resting.
     _HOLDING_PATH_MIN_INTERVAL_SEC = 30.0
     _REVERSAL_RISK_MIN_INTERVAL_SEC = 5.0
+    _CRASH_SHADOW_MIN_INTERVAL_SEC = 10.0
 
     def __init__(self, *, account: OutcomeClient, wallet: str, gateway: OutcomeExecutionGateway | None = None, risk_gate: OutcomePreTradeRiskGate | None = None, stream_health: OutcomeStreamHealth | None = None, ledger: OutcomeExecutionLedger | None = None, research_gate: OutcomeResearchGate | None = None, exit_planner: OutcomeExitQuotePlanner | None = None, exit_lifecycle_store: OutcomeExitLifecycleStore | None = None, exit_requote_controller: OutcomeExitRequoteController | None = None, entry_planner: OutcomeEntryQuotePlanner | None = None, entry_lifecycle_store: OutcomeEntryLifecycleStore | None = None, entry_requote_controller: OutcomeEntryRequoteController | None = None) -> None:
         self._account_reads = OutcomeAccountReadCache(account)
@@ -125,6 +127,9 @@ class OutcomeLiveExecutionRuntime:
         # Milestone-B challenger is journal-only.  It owns no account,
         # gateway, controller or key and cannot alter the production action.
         self.active_challenger_shadow = OutcomeActiveChallengerShadow()
+        # This records fast WS crash features for later calibration.  It is
+        # deliberately separate from S3 / fast-failure authority.
+        self.crash_circuit_shadow = OutcomeCrashCircuitShadow()
         self.emergency_exit_policy = OutcomeEmergencyExitPolicy()
         self.emergency_exit_controller = (
             OutcomeEmergencyExitController(
@@ -163,6 +168,7 @@ class OutcomeLiveExecutionRuntime:
         self._latest_regime_shadow: dict[int, dict[str, object]] = {}
         self._last_toxic_shadow_record: dict[tuple[int, str], tuple[str, float]] = {}
         self._last_efficiency_shadow_record: dict[tuple[str, int, int], tuple[str, float]] = {}
+        self._last_crash_shadow_record: dict[str, tuple[str, float]] = {}
 
     @staticmethod
     def _audit_decimal(audit: dict[str, object], name: str) -> Decimal | None:
@@ -1307,7 +1313,8 @@ class OutcomeLiveExecutionRuntime:
     def _update_holding_reversal(
         self, *, market: OutcomeMarketSpec, coin: str, side_index: int,
         vwap: Decimal, bid: Decimal, ask: Decimal, evidence: dict[str, object], book_source: str,
-    ) -> None:
+        holding_audit: dict[str, object] | None = None,
+    ) -> str:
         def _decimal(name: str) -> Decimal | None:
             try:
                 value = evidence.get(name)
@@ -1348,6 +1355,15 @@ class OutcomeLiveExecutionRuntime:
                 "coin": coin, "state": decision.state, "reason": decision.reason,
                 "book_source": book_source, "oi_context_fresh": context_fresh,
                 "emergency_independent_observations": self._emergency_reversal_windows.get(key, (0.0, 0.0, 0))[2],
+                # These fields are research/audit only.  They deliberately do
+                # not influence the existing S2/S3 execution policy.
+                "entry_lifecycle_id": (holding_audit or {}).get("entry_lifecycle_id"),
+                "entry_trade_id": (holding_audit or {}).get("entry_trade_id"),
+                "holding_age_sec": (holding_audit or {}).get("holding_age_sec"),
+                "time_left_sec": (holding_audit or {}).get("time_left_sec"),
+                "entry_side_index": (holding_audit or {}).get("entry_side_index"),
+                "entry_tier": (holding_audit or {}).get("entry_tier"),
+                "entry_target_return_pct": (holding_audit or {}).get("entry_target_return_pct"),
                 "execution_submitted": False,
             })
         if decision.state.value == "REVERSAL_CONFIRMED" and self.exit_lifecycle_store is not None:
@@ -1359,6 +1375,7 @@ class OutcomeLiveExecutionRuntime:
                     lifecycle, reason="reversal_classifier_shadow_confirmed",
                     extra={"state": "REVERSAL_CONFIRMED"},
                 )
+        return str(decision.state.value)
 
     def _observe_holding_reversal_ws(self, *, market: OutcomeMarketSpec, finding: object) -> bool:
         """Update the risk classifier from healthy WS BBO without waiting for research REST capture."""
@@ -1367,15 +1384,63 @@ class OutcomeLiveExecutionRuntime:
         coin = str(getattr(finding, "coin", ""))
         inventory = Decimal(str(getattr(finding, "inventory", "0")))
         vwap = self.machine._fill_vwap_for_inventory(coin=coin, inventory=inventory)
-        bbo = self.stream_health.fresh_bbo(market, coin)
-        if inventory <= 0 or vwap is None or bbo is None:
+        book_top = self.stream_health.fresh_book_top(market, coin)
+        if inventory <= 0 or vwap is None or book_top is None:
             return False
         side_index = 0 if coin == market.yes_coin else 1
         evidence = dict(self._holding_context.get(market.outcome_id, {}))
-        self._update_holding_reversal(
+        bid, ask = Decimal(str(book_top["bid"])), Decimal(str(book_top["ask"]))
+        provenance = self._resolve_holding_entry_provenance(
+            market=market, coin=coin, inventory=inventory, fill_vwap=vwap,
+        ) or {}
+        lifecycle_id = str(provenance.get("entry_lifecycle_id") or "")
+        try:
+            holding_age_sec = max(0.0, time.time() - datetime.fromisoformat(str(provenance["entry_filled_at"])).timestamp())
+        except (KeyError, TypeError, ValueError, OSError, OverflowError):
+            holding_age_sec = None
+        holding_audit = {
+            **provenance, "holding_age_sec": holding_age_sec,
+            "time_left_sec": market.time_to_expiry_sec(),
+        }
+        reversal_state = self._update_holding_reversal(
             market=market, coin=coin, side_index=side_index, vwap=vwap,
-            bid=bbo[0], ask=bbo[1], evidence=evidence, book_source="fresh_ws_bbo",
+            bid=bid, ask=ask, evidence=evidence, book_source="fresh_ws_bbo", holding_audit=holding_audit,
         )
+        if lifecycle_id and self.ledger is not None:
+            def _evidence_decimal(name: str) -> Decimal | None:
+                try:
+                    value = evidence.get(name)
+                    return Decimal(str(value)) if value is not None else None
+                except (ArithmeticError, TypeError, ValueError):
+                    return None
+            try:
+                oi_age_ms = int(evidence.get("oi_age_ms"))
+            except (TypeError, ValueError):
+                oi_age_ms = None
+            crash = self.crash_circuit_shadow.observe(OutcomeCrashCircuitObservation(
+                lifecycle_id=lifecycle_id, outcome_id=market.outcome_id, period=market.period, coin=coin,
+                timestamp=time.time(), fill_vwap=vwap, bid=bid, ask=ask,
+                top3_bid_depth=Decimal(str(book_top["top3_bid_depth"])),
+                spot_strike_bps=_evidence_decimal("spot_strike_bps"),
+                mark_return_bps=_evidence_decimal("mark_return_bps"),
+                oi_return_bps=_evidence_decimal("oi_return_bps"), oi_age_ms=oi_age_ms,
+                regime_state=str((self._latest_regime_shadow.get(market.outcome_id) or {}).get("state") or "UNKNOWN"),
+                reversal_state=reversal_state,
+                holding_age_sec=holding_age_sec, time_left_sec=market.time_to_expiry_sec(),
+                entry_side_index=provenance.get("entry_side_index"), entry_tier=provenance.get("entry_tier"),
+                entry_target_return_pct=provenance.get("entry_target_return_pct"),
+            ))
+            state = str(crash.get("research_state") or "UNKNOWN")
+            previous = self._last_crash_shadow_record.get(lifecycle_id)
+            now = time.time()
+            # Retain every transition immediately, then a compact ten-second
+            # cadence.  This is enough for 15/30/60 second velocity features
+            # while avoiding another multi-GB raw-book-style journal stream.
+            if previous is None or previous[0] != state or now - previous[1] >= self._CRASH_SHADOW_MIN_INTERVAL_SEC:
+                self.ledger.journal.log_strategy_event(
+                    self.ledger.run_id, "OUTCOME_CRASH_CIRCUIT_SHADOW", crash,
+                )
+                self._last_crash_shadow_record[lifecycle_id] = (state, now)
         return True
 
     def _capture_holding_path(self, *, market: OutcomeMarketSpec, finding: object,
@@ -1483,6 +1548,20 @@ class OutcomeLiveExecutionRuntime:
                 "period": market.period, "coin": coin,
                 "entry_lifecycle_id": provenance.get("entry_lifecycle_id"),
                 "holding_age_sec": age,
+                # Exact full-depth evidence is duplicated beside the B5
+                # decision so a profit-lock report can audit its action
+                # without assuming the top BBO represents the whole holding.
+                "full_depth_execution": {
+                    "inventory": str(inventory), "fill_vwap": str(vwap),
+                    "marketable_exit_vwap": str(marketable_vwap) if marketable_vwap is not None else None,
+                    "marketable_exit_depth_shares": str(marketable_depth),
+                    "marketable_exit_full_inventory": marketable_vwap is not None,
+                    "taker_close_fee_rate": str(taker_fee) if taker_fee is not None else None,
+                    "marketable_net_exit_price": str(marketable_net) if marketable_net is not None else None,
+                    "marketable_net_exit_vs_entry_pct": (
+                        str(marketable_net / vwap - Decimal("1")) if marketable_net is not None else None
+                    ),
+                },
             })
             self.ledger.journal.log_strategy_event(
                 self.ledger.run_id, "OUTCOME_ACTIVE_HOLDING_CHALLENGER_SHADOW", challenger,
@@ -1491,6 +1570,10 @@ class OutcomeLiveExecutionRuntime:
                 self._update_holding_reversal(
                     market=market, coin=coin, side_index=side_index, vwap=vwap,
                     bid=bid, ask=ask, evidence=evidence, book_source="fresh_rest_book",
+                    holding_audit={
+                        **provenance, "holding_age_sec": age,
+                        "time_left_sec": market.time_to_expiry_sec(),
+                    },
                 )
         except (sqlite3.Error, ValueError, TypeError, KeyError, IndexError, json.JSONDecodeError):
             return

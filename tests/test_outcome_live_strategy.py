@@ -132,6 +132,24 @@ def test_trend_continuation_is_journalled_but_disabled_by_default(tmp_path):
     assert candidate["mark_60m_bps"] is not None
 
 
+def test_long_horizon_marks_remain_available_when_continuation_spot_is_not_persistent(tmp_path):
+    """B5 features must not be coupled to a continuation admission failure."""
+    db = TradeJournalDB(tmp_path / "strategy.db")
+    _trend_rows(db)
+    gate = OutcomeOiEntryGate(db.db_path, OutcomeLiveStrategyConfig(oi_max_age_sec=90))
+    decision = gate.evaluate(
+        # Spot is intentionally close to strike, so continuation remains
+        # ineligible even though the local mark history is available.
+        spot_price=Decimal("100.01"), strike_price=Decimal("100"),
+        now_ms=10_000_000 + 65 * 60 * 1000,
+    )
+    candidate = decision.evidence["trend_continuation"]
+    assert candidate["eligible"] is False
+    assert candidate["reason"] == "continuation_spot_not_persistent"
+    assert candidate["mark_15m_bps"] is not None
+    assert candidate["mark_60m_bps"] is not None
+
+
 def test_trend_continuation_canary_selects_only_a_persistent_small_pullback(tmp_path):
     db = TradeJournalDB(tmp_path / "strategy.db")
     _trend_rows(db)

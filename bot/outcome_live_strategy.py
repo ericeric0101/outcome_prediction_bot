@@ -144,31 +144,34 @@ class OutcomeOiEntryGate:
         explicit canary switch below permits it to become an entry decision.
         A restart resets the required 15-minute spot persistence, fail-closed.
         """
+        # Long-horizon mark returns are general market observations used by
+        # multiple read-only research lanes.  They must not disappear merely
+        # because this particular tick cannot qualify as a continuation
+        # entry (for example, spot has just crossed the strike).  Keep their
+        # calculation independent from continuation eligibility below.
+        prior_15m = self._at_or_before(rows, int(rows[0][1]) - 15 * 60 * 1000)
+        prior_60m = self._at_or_before(rows, int(rows[0][1]) - 60 * 60 * 1000)
+        try:
+            mark_15m = self._return_bps(mark_now, Decimal(str(prior_15m[3]))) if prior_15m is not None else None
+            mark_60m = self._return_bps(mark_now, Decimal(str(prior_60m[3]))) if prior_60m is not None else None
+        except (ValueError, ArithmeticError):
+            mark_15m, mark_60m = None, None
         side, persistence_ms = self._update_spot_trend(spot_strike_bps=spot_strike_bps, now_ms=now_ms)
         result: dict[str, Any] = {
             "eligible": False, "side_index": side,
             "spot_persistence_sec": round(persistence_ms / 1000, 3),
             "mark_5m_bps": str(mark_5m_bps), "reason": "continuation_spot_not_persistent",
+            "mark_15m_bps": str(mark_15m) if mark_15m is not None else None,
+            "mark_60m_bps": str(mark_60m) if mark_60m is not None else None,
         }
         if side not in (0, 1) or persistence_ms < 15 * 60 * 1000:
             self._continuation_episode_id = None
             return result
         direction = Decimal("1") if side == 0 else Decimal("-1")
-        prior_15m = self._at_or_before(rows, int(rows[0][1]) - 15 * 60 * 1000)
-        prior_60m = self._at_or_before(rows, int(rows[0][1]) - 60 * 60 * 1000)
         if prior_15m is None or prior_60m is None:
             self._continuation_episode_id = None
             result["reason"] = "continuation_long_horizon_unavailable"
             return result
-        try:
-            mark_15m = self._return_bps(mark_now, Decimal(str(prior_15m[3])))
-            mark_60m = self._return_bps(mark_now, Decimal(str(prior_60m[3])))
-        except (ValueError, ArithmeticError):
-            mark_15m, mark_60m = None, None
-        result.update({
-            "mark_15m_bps": str(mark_15m) if mark_15m is not None else None,
-            "mark_60m_bps": str(mark_60m) if mark_60m is not None else None,
-        })
         if mark_15m is None or mark_60m is None or (
             direction * mark_15m < self.config.mark_return_min_bps
             or direction * mark_60m < self.config.mark_return_min_bps

@@ -358,17 +358,35 @@ def run_integrated_hyperliquid_bot(
             )
             if requires_rest_resync or not (stream_ready_for_pricing and ws_yes and ws_no and ws_btc):
                 try:
+                    # A newly listed rollover coin can briefly return null
+                    # from /info before its first complete L2 snapshot exists.
+                    # Keep the resync gate closed in that case; never treat a
+                    # missing payload as an empty-but-verified order book.
+                    rest_books_verified = True
                     if ws_btc is None:
                         all_mids = client.get_all_mids_sync()
-                        btc_mark_str = all_mids.get("BTC", "0")
-                        btc_mark = float(btc_mark_str)
-                        if btc_mark > 0:
-                            pricing.update_btc_mark_price(btc_mark)
+                        if isinstance(all_mids, dict):
+                            btc_mark_str = all_mids.get("BTC", "0")
+                            btc_mark = float(btc_mark_str)
+                            if btc_mark > 0:
+                                pricing.update_btc_mark_price(btc_mark)
+                        else:
+                            rest_books_verified = False
                     if requires_rest_resync or ws_yes is None:
-                        pricing.update_l2_book(market.yes_coin, client.get_l2_book_sync(market.yes_coin))
+                        yes_book = client.get_l2_book_sync(market.yes_coin)
+                        if isinstance(yes_book, dict):
+                            pricing.update_l2_book(market.yes_coin, yes_book)
+                        else:
+                            rest_books_verified = False
                     if requires_rest_resync or ws_no is None:
-                        pricing.update_l2_book(market.no_coin, client.get_l2_book_sync(market.no_coin))
-                    rest_books_complete = requires_rest_resync
+                        no_book = client.get_l2_book_sync(market.no_coin)
+                        if isinstance(no_book, dict):
+                            pricing.update_l2_book(market.no_coin, no_book)
+                        else:
+                            rest_books_verified = False
+                    rest_books_complete = requires_rest_resync and rest_books_verified
+                    if not rest_books_verified:
+                        logger.debug("Pricing update deferred: rollover REST market data incomplete")
                 except Exception as e:
                     logger.debug(f"Pricing update note: {e}")
             loop_stages_ms["pricing_reads"] = round((time.monotonic() - stage_start) * 1000)
