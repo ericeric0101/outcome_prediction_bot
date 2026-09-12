@@ -175,7 +175,14 @@ class OutcomeWebSocketRecorder:
     def stop(self) -> None:
         self._stop.set()
         if self._thread:
-            self._thread.join(timeout=5)
+            try:
+                self._thread.join(timeout=5)
+            except KeyboardInterrupt:
+                # A second Ctrl-C may arrive while launcher is already in its
+                # finally cleanup.  Do not let it skip callback teardown or
+                # the remaining shutdown steps; the daemon thread has the
+                # stop event and will finish its async unsubscribe path.
+                pass
         self._unregister_callbacks()
 
     def mark_rest_resynced(self) -> None:

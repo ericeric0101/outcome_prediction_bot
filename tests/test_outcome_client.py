@@ -6,7 +6,7 @@ from eth_account import Account
 import httpx
 
 from bot.adapters.outcome_auth import OutcomeAuth
-from bot.adapters.outcome_client import OutcomeClient
+from bot.adapters.outcome_client import OutcomeClient, OutcomeInfoCooldownError
 
 
 def test_sync_info_retries_transient_502_then_returns_payload(monkeypatch):
@@ -82,6 +82,37 @@ def test_execution_client_can_fail_fast_without_retry_backoff(monkeypatch):
     with pytest.raises(httpx.HTTPStatusError):
         client.post_info_sync({"type": "l2Book"})
     assert calls == [1]
+
+
+def test_429_blocks_other_wallet_account_reads_without_sending_another_request(monkeypatch):
+    """A second client must share the first client's per-wallet cooldown."""
+    auth = OutcomeAuth(wallet_address="0x" + "c" * 40, is_testnet=True)
+    first = OutcomeClient(auth, info_max_retries=1)
+    second = OutcomeClient(auth, info_max_retries=1)
+    request = httpx.Request("POST", "https://example.test/info")
+    calls: list[str] = []
+
+    class FirstClient:
+        is_closed = False
+
+        def post(self, *_args, **_kwargs):
+            calls.append("first")
+            return httpx.Response(429, request=request, headers={"Retry-After": "3"})
+
+    class SecondClient:
+        is_closed = False
+
+        def post(self, *_args, **_kwargs):
+            calls.append("second")
+            return httpx.Response(200, request=request, json={"balances": []})
+
+    monkeypatch.setattr(first, "get_sync_client", lambda: FirstClient())
+    monkeypatch.setattr(second, "get_sync_client", lambda: SecondClient())
+    with pytest.raises(httpx.HTTPStatusError):
+        first.post_info_sync({"type": "spotClearinghouseState", "user": auth.wallet_address})
+    with pytest.raises(OutcomeInfoCooldownError):
+        second.post_info_sync({"type": "frontendOpenOrders", "user": auth.wallet_address, "dex": "ALL_DEXS"})
+    assert calls == ["first"]
 
 
 @pytest.mark.anyio

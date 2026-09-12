@@ -22,6 +22,16 @@
 7. **Outcome coin canonicalization。** inventory 來源 `+<asset>` 與 book/order 來源 `#<asset>` 先 canonicalize 為 `#<asset>` 後才做 risk/exposure/recovery 判斷；unknown malformed coin 仍 fail-closed。
 8. **唯一 live execution path 與可診斷 sidecar。** legacy `bot/execution/outcome_execution.py` 與其測試已刪除；唯一 mutation path 為 `OutcomeLiveExecutionRuntime → OutcomeExecutionGateway → official TypeScript SDK sidecar`。sidecar stderr 寫入 bounded rotating `logs/outcome_sdk_sidecar.stderr.log`（2 MiB + 一個 rollover），不再丟棄 crash diagnostics。Telegram polling/control code 已完全移除；沒有 `/pause` 或 `/flatten` 這類會誤稱為 kill switch 的控制面。
 
+### 2026-09-12 外部執行審查交叉驗證與修補
+
+本次將外部 code audit 與 `d4cbb64` 後的工作樹、唯一權威規格及實際 `logs/outcome_shadow.db` 交叉比對。結論不可把「有 price-protected IOC」誤寫成 guaranteed stop：DB 已累積 489 個 `OUTCOME_FAST_FAILURE_EXIT_DECISION`，其中 422 次因 `insufficient_full_inventory_depth_at_loss_cap`、67 次因 stale/missing REST L2 而 block；因此 S3/fast-failure 是有價差上限的退出**嘗試**，不是 -12%/-15% worst-loss guarantee。另有 3,201 筆 S3 decision、1,379 筆 exit lifecycle 與 51,321 筆 loop-timing rows，支持持續做 latency/DB retention 維運，但不構成「SQLite 已使交易錯誤」的證據。
+
+1. **SIGTERM graceful shutdown（已修）。** `launcher` 現在在主執行緒接收 SIGTERM 時只設定 shutdown event，不在 SDK mutation 中丟 exception；現行有界 tick 完成後進入既有 `cancel_resting_buys → account truth → cancel-confirm` cleanup，且只取消 bot-owned entry BUY、保留保護性 SELL。cleanup 中若第二次 Ctrl-C 剛好打斷 WS recorder 的 bounded thread join，recorder 仍會 unregister callbacks，讓後續 cleanup 繼續。SIGKILL、斷電或 OS crash 無法執行 cleanup，仍由 durable intent／重啟 reconciliation fail-closed 處理。
+2. **SDK ambiguous-submit fence（已修）。** official SDK 的 installed `PredictionOrderParams` 沒有已驗證的可提交 `cloid` 欄位，故不能宣稱 venue idempotency。execution transport timeout、broken pipe、invalid JSON 或 response-id mismatch 現改拋出含安全 request id 的 `OutcomeSdkAmbiguousExecutionError`；在精確 `OUTCOME_ORDER_INTENT` 已 `synchronous=FULL` 落盤後，runtime 寫入 `OUTCOME_ORDER_AMBIGUOUS_SUBMIT`，停止同一 market 的所有新 BUY。後續只可從 account truth 採納同 coin/price/shares 的 exact durable intent；採納後寫 resolution，下一 tick 才重新讀帳戶。未可證明時維持 blocked，絕不把 timeout 當 rejection 立即重送。
+3. **審查中不成立／屬已知限制的部分。** 支援的 `launcher --live` 在 typed `yes` 後會在 process 內固定 `OUTCOME_EXIT_REQUOTE_ENABLED=1`，不會因 `.env` 漏旗標而靜默退回舊 loss-band path；舊程式保留是測試/歷史技術債，不是正常 live fallback。loss-band 的 passive floor、S3 在深度不足時 block、`OutcomeLiveExecutionRuntime` 的 orchestration 集中以及 tick 內 SQLite read 都是已記錄限制：前兩者不得在未校準 crash/profit-lock evidence 下改成無條件 market stop，後兩者列為 production hardening/latency work，而非本輪以大型重構處理。
+
+本輪驗證：完整 Python regression **304 passed**，official SDK sidecar TypeScript build 通過。已加入 sidecar execution-timeout 的 fake-transport regression、handler restoration、second-Ctrl-C WS teardown 與 ambiguous durable fence；後續仍值得補 process-level SIGTERM（真實 child/venue fake）與 child-death/restart integration。
+
 **架構維護狀態。** `OutcomeLiveExecutionRuntime` 仍是 orchestration boundary，但不可再新增分散的 exchange mutation；本輪已抽出 canonical coin 與 single order-mutation modules，並把 entry/exit/requote/emergency/lifecycle 保持為獨立 components。完整目錄重整為 domain/risk/runtime packages 是非功能性技術債，必須在不改變上述 state-transition contract 的獨立變更中進行，不能作為繞過測試或修改 live strategy 的理由。
 
 ---

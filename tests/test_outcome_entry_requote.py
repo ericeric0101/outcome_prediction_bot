@@ -120,6 +120,21 @@ def test_entry_store_recovers_exact_durable_pre_submit_intent_after_crash(tmp_pa
     ) is None
 
 
+def test_ambiguous_submit_remains_a_market_wide_fence_until_account_truth_resolves_it(tmp_path):
+    journal = TradeJournalDB(tmp_path / "ambiguous.db")
+    store = OutcomeEntryLifecycleStore(journal, "run")
+    store.record_ambiguous_submit(
+        wallet="w", outcome_id=1356, coin="#13561", intent_id="intent-1",
+        intent_event_id=9, sidecar_request_id="request-1", command="place_limit_order",
+        detail="transport timeout",
+    )
+    pending = store.pending_ambiguous_submit(wallet="w", outcome_id=1356)
+    assert pending is not None
+    assert pending["coin"] == "#13561"
+    store.resolve_ambiguous_submit(intent_id="intent-1", order_id="venue-buy", reason="reconciled")
+    assert store.pending_ambiguous_submit(wallet="w", outcome_id=1356) is None
+
+
 def test_fast_cancel_cooldown_is_durable(tmp_path):
     journal = TradeJournalDB(tmp_path / "cooldown.db")
     store = OutcomeEntryLifecycleStore(journal, "run")

@@ -53,6 +53,21 @@ def test_ws_recorder_unregisters_callbacks_when_stopped():
     assert all(not callbacks for callbacks in client.callbacks.values())
 
 
+def test_ws_recorder_stop_completes_callback_teardown_after_second_ctrl_c():
+    class InterruptingThread:
+        def join(self, timeout):
+            assert timeout == 5
+            raise KeyboardInterrupt
+
+    client = CallbackClient()
+    recorder = OutcomeWebSocketRecorder(client, journal=None, run_id="stream-run")
+    recorder._register_callbacks()
+    recorder._thread = InterruptingThread()
+    recorder.stop()
+    assert recorder._stop.is_set()
+    assert all(not callbacks for callbacks in client.callbacks.values())
+
+
 def test_l2_callback_keeps_terminal_pricing_cache_fresh(tmp_path):
     pricing = OutcomePricingState(stale_timeout_sec=5)
     recorder = OutcomeWebSocketRecorder(

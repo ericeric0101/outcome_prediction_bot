@@ -19,6 +19,7 @@ from bot.lifecycle.outcome_lifecycle import OutcomeMarketSpec
 from bot.outcome_account_recovery import OutcomeAccountRecovery
 from bot.outcome_account_read_cache import OutcomeAccountReadCache
 from bot.outcome_execution_gateway import OutcomeExecutionGateway, whole_share_size
+from bot.outcome_sdk_sidecar import OutcomeSdkAmbiguousExecutionError
 from bot.outcome_maker_state_machine import MakerTickResult, OutcomeMakerStateMachine
 from bot.outcome_risk_gate import OutcomePreTradeRiskGate, OutcomeRiskLimits
 from bot.outcome_stream_health import OutcomeStreamHealth
@@ -2089,6 +2090,34 @@ class OutcomeLiveExecutionRuntime:
         if active:
             admission["account_gate"] = "existing_outcome_inventory_or_order"
             return LiveExecutionResult("blocked", "live strategy has existing Outcome inventory or order")
+        if self.entry_lifecycle_store is not None:
+            pending_ambiguous = self.entry_lifecycle_store.pending_ambiguous_submit(
+                wallet=self.recovery.wallet, outcome_id=market.outcome_id,
+            )
+            if pending_ambiguous is not None:
+                # An open order can become visible after the response timeout.
+                # Adopt only the exact durable intent, then make the next tick
+                # re-read account truth; never submit a replacement here.
+                try:
+                    open_orders = self.recovery.account.get_open_orders_sync(self.recovery.wallet)
+                    adopted = None
+                    for coin in (market.yes_coin, market.no_coin):
+                        candidate = self.entry_lifecycle_store.recover_or_adopt_audited_submit(
+                            wallet=self.recovery.wallet, outcome_id=market.outcome_id,
+                            coin=coin, open_orders=open_orders,
+                        )
+                        if candidate is not None:
+                            adopted = candidate
+                            break
+                except Exception:
+                    adopted = None
+                admission["ambiguous_submit_fence"] = {
+                    "blocked": True, "intent_id": pending_ambiguous.get("intent_id"),
+                    "recovered_order_id": adopted.order_id if adopted is not None else None,
+                }
+                if adopted is not None:
+                    return LiveExecutionResult("blocked", "ambiguous prior entry adopted; refreshing account truth before any new action", adopted.order_id)
+                return LiveExecutionResult("blocked", "ambiguous prior entry submission; reconciliation required before any new entry")
         if reduce_only:
             admission["reduce_only_gate"] = "new_entries_prohibited"
             return LiveExecutionResult("flat", "reduce-only: no live exposure after entry cancellation")
@@ -2368,13 +2397,31 @@ class OutcomeLiveExecutionRuntime:
         if intent_event_id is None:
             return LiveExecutionResult("blocked", "durable pre-submit entry intent unavailable")
         entry_audit["entry_intent_event_id"] = intent_event_id
-        result = self.machine.tick(
-            market=market, side_index=entry_side_index, entry_permitted=True,
-            entry_audit=entry_audit, entry_max_submit_price=entry_max_submit_price,
-            entry_min_submit_price=config.min_entry_price,
-            entry_requested_shares=Decimal(shares),
-            entry_max_notional=self.risk_gate.limits.max_entry_notional_usdc,
-        )
+        try:
+            result = self.machine.tick(
+                market=market, side_index=entry_side_index, entry_permitted=True,
+                entry_audit=entry_audit, entry_max_submit_price=entry_max_submit_price,
+                entry_min_submit_price=config.min_entry_price,
+                entry_requested_shares=Decimal(shares),
+                entry_max_notional=self.risk_gate.limits.max_entry_notional_usdc,
+            )
+        except OutcomeSdkAmbiguousExecutionError as exc:
+            # The durable intent is already committed.  Persist a separate
+            # unresolved state and fail closed until account truth proves what
+            # happened; a retry could create a second live BUY.
+            if self.entry_lifecycle_store is not None:
+                ambiguity_event_id = self.entry_lifecycle_store.record_ambiguous_submit(
+                    wallet=self.recovery.wallet, outcome_id=market.outcome_id,
+                    coin=str(admission["selected_coin"]), intent_id=intent_id,
+                    intent_event_id=int(intent_event_id), sidecar_request_id=exc.request_id,
+                    command=exc.command, detail=str(exc),
+                )
+                if ambiguity_event_id is None:
+                    # The initial intent is durable, but without a durable
+                    # ambiguity fence this process must not continue taking
+                    # decisions that could re-submit it.
+                    raise RuntimeError("ambiguous SDK submit could not persist reconciliation fence") from exc
+            return LiveExecutionResult("blocked", "ambiguous SDK entry submission; reconciliation required before retry")
         if result.state == "buy_placed":
             if reentry is not None and reentry.is_limited_reentry and self.loss_reentry_gate is not None:
                 # The token is consumed only after official SDK acceptance of

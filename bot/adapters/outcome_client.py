@@ -27,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import threading
 import time
 from decimal import Decimal
 from typing import Any, Callable, Coroutine, Dict, List, Optional, Union
@@ -45,10 +46,30 @@ from bot.adapters.outcome_auth import (
 )
 
 
+class OutcomeInfoCooldownError(RuntimeError):
+    """A shared /info cooldown blocks a non-emergency account read locally.
+
+    This is intentionally distinct from an HTTP error: no request was sent
+    while another client for the same wallet is backing off after a 429.
+    Callers must continue to fail closed rather than treating cached account
+    truth as current.
+    """
+
+
 class OutcomeClient:
     """
     Hyperliquid Outcome REST and WebSocket Client.
     """
+    # Account reconciliation, research capture, and settlement run with
+    # separate OutcomeClient instances.  A venue 429 must therefore be shared
+    # per (venue, wallet), otherwise those clients immediately create a retry
+    # storm against different /info endpoint types.
+    _info_cooldown_lock = threading.Lock()
+    _info_cooldowns: Dict[tuple[str, str], float] = {}
+    _ACCOUNT_INFO_TYPES = frozenset({
+        "clearinghouseState", "spotClearinghouseState", "frontendOpenOrders",
+        "openOrders", "userFills", "userFillsByTime", "userOutcome",
+    })
 
     def __init__(
         self,
@@ -111,17 +132,55 @@ class OutcomeClient:
         """Bounded exponential backoff for rate limits and transient upstream errors."""
         return min(8.0, float(2 ** (attempt - 1)))
 
+    def _cooldown_key(self) -> tuple[str, str]:
+        return self.base_url, self.wallet_address.lower()
+
+    @classmethod
+    def _retry_after_or_backoff(cls, response: httpx.Response, attempt: int) -> float:
+        try:
+            retry_after = float(response.headers.get("Retry-After", ""))
+        except (TypeError, ValueError):
+            retry_after = 0.0
+        return min(15.0, max(cls._info_retry_delay(attempt), retry_after))
+
+    def _record_info_cooldown(self, delay_sec: float) -> None:
+        deadline = time.monotonic() + max(0.0, float(delay_sec))
+        with self._info_cooldown_lock:
+            key = self._cooldown_key()
+            previous = self._info_cooldowns.get(key, 0.0)
+            self._info_cooldowns[key] = max(previous, deadline)
+
+    def _account_cooldown_remaining(self, payload: Dict[str, Any]) -> float:
+        if str(payload.get("type") or "") not in self._ACCOUNT_INFO_TYPES:
+            return 0.0
+        with self._info_cooldown_lock:
+            deadline = self._info_cooldowns.get(self._cooldown_key(), 0.0)
+        return max(0.0, deadline - time.monotonic())
+
+    def _raise_if_account_cooldown(self, payload: Dict[str, Any]) -> None:
+        remaining = self._account_cooldown_remaining(payload)
+        if remaining > 0:
+            raise OutcomeInfoCooldownError(
+                f"shared /info cooldown active for {payload.get('type')} ({remaining:.1f}s remaining); request not sent"
+            )
+
     async def post_info(self, payload: Dict[str, Any], max_retries: int | None = None) -> Any:
         """Raw POST request to /info with retry for 429, 5xx, and transport failures."""
         max_retries = self.info_max_retries if max_retries is None else max(1, int(max_retries))
         client = await self.get_async_client()
         for attempt in range(1, max_retries + 1):
             try:
+                # A retry that already waited for its own 429 backoff may
+                # proceed; competing fresh reads remain locally blocked.
+                if attempt == 1:
+                    self._raise_if_account_cooldown(payload)
                 resp = await client.post("/info", json=payload)
                 if resp.status_code == 429 or 500 <= resp.status_code <= 599:
+                    if resp.status_code == 429:
+                        self._record_info_cooldown(self._retry_after_or_backoff(resp, attempt))
                     if attempt == max_retries:
                         resp.raise_for_status()
-                    wait_sec = self._info_retry_delay(attempt)
+                    wait_sec = self._retry_after_or_backoff(resp, attempt)
                     logger.warning(
                         f"Hyperliquid /info transient HTTP {resp.status_code} for {payload.get('type')}; "
                         f"retrying in {wait_sec:.1f}s (attempt {attempt}/{max_retries})"
@@ -132,11 +191,15 @@ class OutcomeClient:
                 return resp.json()
             except httpx.HTTPStatusError as e:
                 if (e.response.status_code == 429 or 500 <= e.response.status_code <= 599) and attempt < max_retries:
-                    wait_sec = self._info_retry_delay(attempt)
+                    if e.response.status_code == 429:
+                        self._record_info_cooldown(self._retry_after_or_backoff(e.response, attempt))
+                    wait_sec = self._retry_after_or_backoff(e.response, attempt)
                     logger.warning(f"Hyperliquid /info HTTP {e.response.status_code}; retrying in {wait_sec:.1f}s...")
                     await asyncio.sleep(wait_sec)
                     continue
                 logger.error(f"OutcomeClient.post_info error for {payload.get('type')}: {e}")
+                raise
+            except OutcomeInfoCooldownError:
                 raise
             except Exception as e:
                 if attempt == max_retries:
@@ -150,11 +213,17 @@ class OutcomeClient:
         client = self.get_sync_client()
         for attempt in range(1, max_retries + 1):
             try:
+                # A retry that already waited for its own 429 backoff may
+                # proceed; competing fresh reads remain locally blocked.
+                if attempt == 1:
+                    self._raise_if_account_cooldown(payload)
                 resp = client.post("/info", json=payload)
                 if resp.status_code == 429 or 500 <= resp.status_code <= 599:
+                    if resp.status_code == 429:
+                        self._record_info_cooldown(self._retry_after_or_backoff(resp, attempt))
                     if attempt == max_retries:
                         resp.raise_for_status()
-                    wait_sec = self._info_retry_delay(attempt)
+                    wait_sec = self._retry_after_or_backoff(resp, attempt)
                     logger.warning(
                         f"Hyperliquid /info transient HTTP {resp.status_code} for {payload.get('type')}; "
                         f"retrying in {wait_sec:.1f}s (attempt {attempt}/{max_retries})"
@@ -165,11 +234,15 @@ class OutcomeClient:
                 return resp.json()
             except httpx.HTTPStatusError as e:
                 if (e.response.status_code == 429 or 500 <= e.response.status_code <= 599) and attempt < max_retries:
-                    wait_sec = self._info_retry_delay(attempt)
+                    if e.response.status_code == 429:
+                        self._record_info_cooldown(self._retry_after_or_backoff(e.response, attempt))
+                    wait_sec = self._retry_after_or_backoff(e.response, attempt)
                     logger.warning(f"Hyperliquid /info HTTP {e.response.status_code}; retrying in {wait_sec:.1f}s...")
                     time.sleep(wait_sec)
                     continue
                 logger.error(f"OutcomeClient.post_info_sync error for {payload.get('type')}: {e}")
+                raise
+            except OutcomeInfoCooldownError:
                 raise
             except Exception as e:
                 if attempt == max_retries:

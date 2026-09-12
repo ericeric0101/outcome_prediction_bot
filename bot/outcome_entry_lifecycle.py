@@ -31,6 +31,8 @@ class OutcomeEntryLifecycle:
 
 class OutcomeEntryLifecycleStore:
     EVENT = "OUTCOME_ENTRY_LIFECYCLE"
+    AMBIGUOUS_SUBMIT_EVENT = "OUTCOME_ORDER_AMBIGUOUS_SUBMIT"
+    AMBIGUITY_RESOLVED_EVENT = "OUTCOME_ORDER_AMBIGUITY_RESOLVED"
 
     def __init__(self, journal: TradeJournalDB, run_id: str) -> None:
         self.journal, self.run_id = journal, run_id
@@ -111,6 +113,61 @@ class OutcomeEntryLifecycleStore:
         except (TypeError, ValueError, sqlite3.Error, json.JSONDecodeError):
             return None
 
+    def pending_ambiguous_submit(self, *, wallet: str, outcome_id: int) -> dict[str, Any] | None:
+        """Return an unresolved buy submission whose venue ACK was lost.
+
+        This is intentionally market-wide rather than signal-side specific:
+        after a timed-out BUY, a new signal for the opposite coin must not
+        bypass the reconciliation fence while the original order may still be
+        propagating through the venue's account views.
+        """
+        try:
+            with sqlite3.connect(f"file:{self.journal.db_path}?mode=ro", uri=True) as conn:
+                row = conn.execute(
+                    """SELECT id, payload_json FROM strategy_events
+                       WHERE event_type=?
+                         AND json_extract(payload_json, '$.venue')='hyperliquid_outcome'
+                         AND json_extract(payload_json, '$.wallet')=?
+                         AND CAST(json_extract(payload_json, '$.outcome_id') AS INTEGER)=?
+                       ORDER BY id DESC LIMIT 1""",
+                    (self.AMBIGUOUS_SUBMIT_EVENT, wallet, int(outcome_id)),
+                ).fetchone()
+                if row is None:
+                    return None
+                event_id, raw = int(row[0]), row[1]
+                payload = json.loads(raw or "{}")
+                if not isinstance(payload, dict):
+                    return None
+                resolved = conn.execute(
+                    """SELECT 1 FROM strategy_events
+                       WHERE event_type=? AND id > ?
+                         AND json_extract(payload_json, '$.intent_id')=?
+                       LIMIT 1""",
+                    (self.AMBIGUITY_RESOLVED_EVENT, event_id, str(payload.get("intent_id") or "")),
+                ).fetchone()
+            return None if resolved else dict(payload)
+        except (sqlite3.Error, TypeError, ValueError, json.JSONDecodeError):
+            # Journal uncertainty is never an authority to submit a new risk.
+            return {"reason": "ambiguous_submit_journal_unreadable"}
+
+    def record_ambiguous_submit(
+        self, *, wallet: str, outcome_id: int, coin: str, intent_id: str,
+        intent_event_id: int, sidecar_request_id: str, command: str, detail: str,
+    ) -> int | None:
+        return self.journal.log_durable_strategy_event(self.run_id, self.AMBIGUOUS_SUBMIT_EVENT, {
+            "venue": "hyperliquid_outcome", "wallet": wallet,
+            "outcome_id": int(outcome_id), "coin": coin, "side": "BUY",
+            "intent_id": intent_id, "intent_event_id": int(intent_event_id),
+            "sidecar_request_id": sidecar_request_id, "command": command,
+            "detail": detail, "state": "RECONCILIATION_REQUIRED",
+        })
+
+    def resolve_ambiguous_submit(self, *, intent_id: str, order_id: str, reason: str) -> None:
+        self.journal.log_strategy_event(self.run_id, self.AMBIGUITY_RESOLVED_EVENT, {
+            "intent_id": intent_id, "order_id": order_id, "reason": reason,
+            "state": "RESOLVED_BY_ACCOUNT_TRUTH",
+        })
+
     def submit_audit(self, *, order_id: str, coin: str) -> dict[str, Any] | None:
         """Return the immutable audited entry context for one owned order."""
         try:
@@ -169,6 +226,7 @@ class OutcomeEntryLifecycleStore:
         order_id = str(order.get("oid") or "")
         if not order_id:
             return None
+        intent_id = ""
         try:
             with sqlite3.connect(self.journal.db_path) as conn:
                 row = conn.execute(
@@ -199,6 +257,7 @@ class OutcomeEntryLifecycleStore:
                 if not isinstance(audit, dict):
                     return None
                 expected_shares = Decimal(str(intent.get("shares", "0")))
+                intent_id = str(intent.get("intent_id") or "")
                 if Decimal(str(order.get("sz", "0"))) != expected_shares:
                     return None
                 payload = {"outcome_id": intent.get("outcome_id"), "coin": intent.get("coin")}
@@ -218,4 +277,9 @@ class OutcomeEntryLifecycleStore:
             return None
         lifecycle = OutcomeEntryLifecycle(wallet, outcome_id, coin, order_id, price, 0, "BUY_RESTING", time.time())
         self.record(lifecycle, reason="adopted_exact_audited_s0_submit_or_pre_submit_intent_after_restart")
+        if intent_id:
+            self.resolve_ambiguous_submit(
+                intent_id=intent_id, order_id=order_id,
+                reason="matching_open_buy_adopted_from_durable_intent",
+            )
         return lifecycle

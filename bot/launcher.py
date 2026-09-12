@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import os
+import signal
 import sys
 import threading
 import time
@@ -46,6 +47,31 @@ from monitoring.trade_journal_db import TradeJournalDB
 from bot.enums import MarketPhase
 from bot.runtime_env import load_runtime_env
 from bot.process_lock import ProcessLock
+
+
+def install_graceful_shutdown_handler(stop_event: threading.Event) -> tuple[object, object] | None:
+    """Request orderly shutdown on SIGTERM without interrupting a mutation.
+
+    The handler intentionally only sets an event.  Raising from a signal
+    handler can interrupt an in-flight SDK mutation between venue acceptance
+    and durable acknowledgement, which is strictly worse than waiting for the
+    current bounded tick to reach the existing cancel-and-confirm cleanup.
+    """
+    if threading.current_thread() is not threading.main_thread():
+        return None
+    previous = signal.getsignal(signal.SIGTERM)
+
+    def _request_shutdown(signum: int, _frame: object) -> None:
+        logger.warning("SIGTERM received; finishing the current bounded operation then cancelling owned entry BUYs.")
+        stop_event.set()
+
+    signal.signal(signal.SIGTERM, _request_shutdown)
+    return (signal.SIGTERM, previous)
+
+
+def restore_signal_handler(saved: tuple[object, object] | None) -> None:
+    if saved is not None and threading.current_thread() is threading.main_thread():
+        signal.signal(saved[0], saved[1])
 
 
 def resolve_hyperliquid_auth() -> Optional[OutcomeAuth]:
@@ -287,9 +313,11 @@ def run_integrated_hyperliquid_bot(
     last_log_time = 0.0
     last_slow_loop_warning_at = 0.0
     market_preferences, market_allow_fallback = resolve_daily_outcome_scope(os.environ)
+    shutdown_requested = threading.Event()
+    saved_sigterm_handler = install_graceful_shutdown_handler(shutdown_requested)
 
     try:
-        while True:
+        while not shutdown_requested.is_set():
             cycle_start = time.monotonic()
             loop_stages_ms: dict[str, int] = {}
 
@@ -307,7 +335,7 @@ def run_integrated_hyperliquid_bot(
                     logger.info(f"Outcome preferred market unavailable; using configured fallback period={selected_period}")
             except Exception as e:
                 logger.warning(f"Error fetching outcome metadata: {e}")
-                time.sleep(3.0)
+                shutdown_requested.wait(3.0)
                 continue
             loop_stages_ms["market_discovery"] = round((time.monotonic() - stage_start) * 1000)
 
@@ -315,7 +343,7 @@ def run_integrated_hyperliquid_bot(
                 if time.time() - last_log_time > 10:
                     logger.info("Waiting for active Outcome BTC prediction market...")
                     last_log_time = time.time()
-                time.sleep(2.0)
+                shutdown_requested.wait(2.0)
                 continue
 
             current_market = market
@@ -663,7 +691,7 @@ def run_integrated_hyperliquid_bot(
                 # REST confirmation and every mutation remain on this thread.
                 live_ws_recorder.wait_for_l2_update(wait_sec)
             else:
-                time.sleep(wait_sec)
+                shutdown_requested.wait(wait_sec)
 
     except KeyboardInterrupt:
         logger.info("Hyperliquid trading bot stopped by user.")
@@ -691,6 +719,7 @@ def run_integrated_hyperliquid_bot(
             live_ws_recorder.stop()
         if terminal_dash:
             terminal_dash.stop()
+        restore_signal_handler(saved_sigterm_handler)
         logger.info("Hyperliquid trading bot shutdown complete.")
 
 

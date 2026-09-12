@@ -21,6 +21,19 @@ class OutcomeSdkSidecarError(RuntimeError):
     pass
 
 
+class OutcomeSdkAmbiguousExecutionError(OutcomeSdkSidecarError):
+    """An execution request may have reached the venue but lacks an ACK.
+
+    Callers must reconcile account truth and must never treat this as a safe
+    rejection that can be retried immediately.
+    """
+
+    def __init__(self, *, command: str, request_id: str, detail: str) -> None:
+        self.command = command
+        self.request_id = request_id
+        super().__init__(f"ambiguous SDK execution {command} request_id={request_id}: {detail}")
+
+
 ReadOnlyCommand = Literal["health", "fetch_markets", "fetch_order_book", "fetch_settled_outcome", "fetch_account_snapshot"]
 ExecutionCommand = Literal["place_limit_order", "place_emergency_ioc_exit", "cancel_order", "merge_outcome"]
 SidecarCommand = ReadOnlyCommand | ExecutionCommand
@@ -128,6 +141,7 @@ class OutcomeSdkSidecarClient:
         request: dict[str, Any] = {"id": uuid.uuid4().hex, "command": command, "testnet": testnet}
         if payload is not None:
             request["payload"] = dict(payload)
+        execution_command = command in {"place_limit_order", "place_emergency_ioc_exit", "cancel_order", "merge_outcome"}
         with self._lock:
             started_at = time.monotonic()
             process = self._start(script)
@@ -143,15 +157,27 @@ class OutcomeSdkSidecarClient:
                 line = process.stdout.readline()
             except (BrokenPipeError, OSError, TimeoutError) as exc:
                 self._discard_unhealthy_process()
+                if execution_command:
+                    raise OutcomeSdkAmbiguousExecutionError(
+                        command=command, request_id=str(request["id"]), detail=f"transport failed: {exc}",
+                    ) from exc
                 raise OutcomeSdkSidecarError(f"SDK sidecar transport failed: {exc}") from exc
             elapsed_ms = round((time.monotonic() - started_at) * 1000, 3)
             try:
                 response = json.loads(line)
             except json.JSONDecodeError as exc:
                 self._discard_unhealthy_process()
+                if execution_command:
+                    raise OutcomeSdkAmbiguousExecutionError(
+                        command=command, request_id=str(request["id"]), detail="sidecar returned invalid JSON",
+                    ) from exc
                 raise OutcomeSdkSidecarError("SDK sidecar returned invalid JSON") from exc
             if response.get("id") != request["id"]:
                 self._discard_unhealthy_process()
+                if execution_command:
+                    raise OutcomeSdkAmbiguousExecutionError(
+                        command=command, request_id=str(request["id"]), detail="sidecar response id did not match request",
+                    )
                 raise OutcomeSdkSidecarError("SDK sidecar response id did not match request")
             self.last_request_timing = {
                 "command": command, "python_round_trip_ms": elapsed_ms,

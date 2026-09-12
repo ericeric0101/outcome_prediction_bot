@@ -965,6 +965,28 @@ class TradeJournalDB:
             logger.error(f"TradeJournalDB durable Outcome order intent failed: {e}")
             return None
 
+    def log_durable_strategy_event(self, run_id: str, event_type: str, payload: Dict[str, Any]) -> Optional[int]:
+        """Commit a safety-critical strategy state before returning control.
+
+        This is intentionally not general telemetry.  It exists for states
+        such as an ambiguous venue submission where losing the local fence
+        would permit duplicate financial exposure after a transport timeout.
+        """
+        started_at = time.monotonic()
+        try:
+            with self._connect() as conn:
+                conn.execute("PRAGMA synchronous=FULL")
+                cursor = conn.execute(
+                    "INSERT INTO strategy_events (ts, run_id, event_type, payload_json) VALUES (?, ?, ?, ?)",
+                    (_utc_now_iso(), run_id, event_type, _json_dumps(payload)),
+                )
+                conn.commit()
+                self.last_write_timing_ms["durable_strategy_event"] = round((time.monotonic() - started_at) * 1000, 3)
+                return int(cursor.lastrowid)
+        except Exception as e:
+            logger.error(f"TradeJournalDB durable strategy event {event_type} failed: {e}")
+            return None
+
     def record_outcome_p3_quote(
         self,
         *,
