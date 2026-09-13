@@ -933,6 +933,13 @@ def test_s3_young_protected_holding_skips_fee_and_l2_reads(monkeypatch, tmp_path
     )
     finding = type("Finding", (), {"coin": "#11530", "inventory": Decimal("13"), "sell_order_ids": ("old-sell",)})()
     assert runtime.holding_risk_service.maybe_emergency(market=market(), finding=finding) is None
+    with sqlite3.connect(journal.db_path) as conn:
+        payload = json.loads(conn.execute(
+            "SELECT payload_json FROM strategy_events WHERE event_type='OUTCOME_EXIT_SAFETY_GATE_DECISION'"
+        ).fetchone()[0])
+    assert payload["component"] == "OUTCOME_EMERGENCY_EXIT_DECISION"
+    assert payload["reason"] == "minimum_holding_time_not_reached"
+    assert payload["book_state"] == "not_reached"
 
 
 def test_s3_uses_exact_durable_fill_fallback_when_exchange_history_is_temporarily_empty(monkeypatch, tmp_path):

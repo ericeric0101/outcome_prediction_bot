@@ -59,6 +59,9 @@ class OutcomeHoldingSupervisor:
         )
         if result is not None:
             return result
+        # Entry preflight is not reached while inventory exists.  Preserve a
+        # separate durable alarm for that operationally more urgent case.
+        runtime.audit_safety_for_existing_holding(outcome_id=snapshot.market.outcome_id)
 
         # All research follows protection.  None of these observers can
         # authorize a mutation.

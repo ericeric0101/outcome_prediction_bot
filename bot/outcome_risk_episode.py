@@ -38,6 +38,7 @@ class OutcomeRiskEpisodeStore:
 
     def __init__(self, journal: TradeJournalDB, run_id: str, *, max_attempts: int = 2) -> None:
         self.journal, self.run_id, self.max_attempts = journal, run_id, max(1, max_attempts)
+        self._uncertain: set[tuple[str, int, str]] = set()
 
     @staticmethod
     def _parse(raw: object) -> dict[str, Any] | None:
@@ -48,23 +49,37 @@ class OutcomeRiskEpisodeStore:
         return value if isinstance(value, dict) else None
 
     def active(self, *, wallet: str, outcome_id: int, coin: str) -> RiskEpisode | None:
+        if (wallet, int(outcome_id), coin) in self._uncertain:
+            return RiskEpisode("journal_write_uncertain", wallet, int(outcome_id), coin, 0, "unknown", None, self.max_attempts, "OPEN")
         try:
             with sqlite3.connect(f"file:{self.journal.db_path}?mode=ro", uri=True) as conn:
                 row = conn.execute(
-                    """SELECT ts,payload_json FROM strategy_events WHERE event_type=?
+                    """SELECT id,ts,payload_json FROM strategy_events WHERE event_type=?
                        AND json_extract(payload_json,'$.wallet')=?
                        AND CAST(json_extract(payload_json,'$.outcome_id') AS INTEGER)=?
                        AND json_extract(payload_json,'$.coin')=? ORDER BY id DESC LIMIT 1""",
                     (EVENT, wallet, int(outcome_id), coin),
                 ).fetchone()
-            payload = self._parse(row[1]) if row else None
+                # If a process dies after an accepted/ambiguous mutation but
+                # before `record_attempt` returns, durable controller evidence
+                # still consumes this *same* episode on restart.
+                evidence = conn.execute(
+                    """SELECT COUNT(*) FROM strategy_events WHERE id>? AND
+                       ((event_type='OUTCOME_EXIT_LIFECYCLE' AND json_extract(payload_json,'$.state')='EMERGENCY_EXIT_SUBMITTED')
+                        OR event_type='OUTCOME_EXIT_ORDER_AMBIGUOUS_SUBMIT')
+                       AND json_extract(payload_json,'$.wallet')=?
+                       AND CAST(json_extract(payload_json,'$.outcome_id') AS INTEGER)=?
+                       AND json_extract(payload_json,'$.coin')=?""",
+                    (int(row[0]), wallet, int(outcome_id), coin),
+                ).fetchone() if row else (0,)
+            payload = self._parse(row[2]) if row else None
             if not payload or payload.get("state") != "OPEN":
                 return None
             return RiskEpisode(
                 episode_id=str(payload["episode_id"]), wallet=wallet, outcome_id=int(outcome_id), coin=coin,
                 opened_at=float(payload.get("opened_at") or 0), trigger_family=str(payload.get("trigger_family") or "unknown"),
                 peak_severity=str(payload.get("peak_severity")) if payload.get("peak_severity") is not None else None,
-                attempts=int(payload.get("attempts") or 0), state="OPEN",
+                attempts=max(int(payload.get("attempts") or 0), int(evidence[0] or 0)), state="OPEN",
             )
         except (KeyError, TypeError, ValueError, sqlite3.Error):
             # Journal ambiguity must never reopen a mutation budget.
@@ -94,7 +109,13 @@ class OutcomeRiskEpisodeStore:
             "trigger_family": episode.trigger_family, "peak_severity": episode.peak_severity,
             "attempts": next_attempts, "last_execution_state": execution_state,
         })
-        return RiskEpisode(**{**episode.__dict__, "attempts": next_attempts}) if event is not None else None
+        if event is None:
+            # Do not let a best-effort failure reopen an already-mutated risk
+            # budget inside this process.  Cross-restart reconciliation also
+            # falls back to the existing durable IOC/ambiguity evidence.
+            self._uncertain.add((episode.wallet, episode.outcome_id, episode.coin))
+            return None
+        return RiskEpisode(**{**episode.__dict__, "attempts": next_attempts})
 
     def close_recovered(self, *, wallet: str, outcome_id: int, coin: str, reason: str) -> bool:
         episode = self.active(wallet=wallet, outcome_id=outcome_id, coin=coin)

@@ -110,7 +110,10 @@ class OutcomeRuntimeSafety:
         if self._last_gate_state.get(key) == state:
             return
         self._last_gate_state[key] = state
-        self.journal.log_strategy_event(self.run_id, GATE_AUDIT_EVENT, {
+        # These transitions explain why an owned position did *not* receive a
+        # live safety action.  They must survive the same crash class we are
+        # investigating, rather than being best-effort loop telemetry.
+        self.journal.log_durable_strategy_event(self.run_id, GATE_AUDIT_EVENT, {
             "schema_version": 1, "component": component, "eligible": eligible,
             "reason": reason, "outcome_id": outcome_id, "lifecycle_id": lifecycle_id,
             "position_age_sec": position_age_sec, "current_executable_pnl": current_executable_pnl,
@@ -120,7 +123,10 @@ class OutcomeRuntimeSafety:
             "execution_submitted": False,
         })
 
-    def audit_not_ready(self, *, components: Iterable[SafetyComponent], outcome_id: int | None = None) -> None:
+    def audit_not_ready(
+        self, *, components: Iterable[SafetyComponent], outcome_id: int | None = None,
+        active_holding: bool = False,
+    ) -> None:
         missing = [item.name for item in components if item.safety_critical and not item.ready]
         if not missing or self.journal is None or not self.run_id:
             return
@@ -132,5 +138,6 @@ class OutcomeRuntimeSafety:
         self.journal.log_durable_strategy_event(self.run_id, NOT_READY_EVENT, {
             "schema_version": 1, "outcome_id": outcome_id,
             "missing_safety_critical_components": missing,
-            "action": "new_entry_blocked_existing_protection_unchanged",
+            "action": ("active_holding_exit_safety_attention_required" if active_holding
+                       else "new_entry_blocked_existing_protection_unchanged"),
         })

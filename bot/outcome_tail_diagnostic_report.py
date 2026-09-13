@@ -53,7 +53,7 @@ def report(db_path: str | Path, *, period: str = "1d") -> dict[str, Any]:
             "reversal_state", "top3_depth", "top3_bid_depth", "spread_bps", "executable_return_pct",
         ) if payload.get(key) is not None})
         state = str(payload.get("state") or payload.get("research_state") or "")
-        if state in {"RISK_COMPRESSION_SHADOW", "HARD_CAPITAL_PROTECTION_SHADOW", "RAPID_DRAWDOWN_RESEARCH"}:
+        if state in {"RISK_COMPRESSION_SHADOW", "SEVERE_DISLOCATION_RESEARCH", "RAPID_DRAWDOWN_RESEARCH"}:
             row.setdefault("first_risk_ts", ts)
             row.setdefault("first_risk_state", state)
     result["episodes"] = sorted(episodes.values(), key=lambda item: str(item["first_ts"]))

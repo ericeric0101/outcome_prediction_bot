@@ -1,6 +1,8 @@
 from decimal import Decimal
 
 from bot.outcome_exit_quote_planner import ExitQuoteAction, ExitQuoteInput, OutcomeExitQuotePlanner, OutcomeExitQuotePlannerConfig
+from bot.outcome_exit_lifecycle import OutcomeExitLifecycle, OutcomeExitLifecycleStore
+from monitoring.trade_journal_db import TradeJournalDB
 
 
 def _input(**changes):
@@ -73,3 +75,18 @@ def test_planner_never_proposes_a_crossing_sell():
     )
     assert plan.action is ExitQuoteAction.BLOCK
     assert plan.reason == "target_outside_outcome_bounds"
+
+
+def test_authorized_loss_band_is_durably_recoverable_for_later_s3(tmp_path):
+    """Pin the #2437 routing contract: E4 arms S3 only via durable state."""
+    plan = OutcomeExitQuotePlanner().plan(_input(
+        best_bid=Decimal("0.70"), best_ask=Decimal("0.71"), existing_price=Decimal("0.85"),
+        loss_band_authorized=True,
+    ))
+    assert plan.action is ExitQuoteAction.CANCEL_REPLACE and plan.exit_mode == "loss_band"
+    store = OutcomeExitLifecycleStore(TradeJournalDB(tmp_path / "journal.db"), "run")
+    lifecycle = OutcomeExitLifecycle("wallet", 99, "#990", "sell", Decimal("13"), plan.target_price, 1, "LOSS_BAND_RESTING")
+    store.record(lifecycle, reason=plan.reason)
+    recovered = store.recover(wallet="wallet", outcome_id=99, coin="#990")
+    assert recovered is not None and recovered.state == "LOSS_BAND_RESTING"
+    assert store.loss_band_first_seen_ts(wallet="wallet", outcome_id=99, coin="#990") is not None

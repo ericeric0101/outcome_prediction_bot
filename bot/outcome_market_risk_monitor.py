@@ -90,7 +90,9 @@ class OutcomeMarketRiskMonitor:
             and v30 is not None and v30 <= Decimal("-250")
             and d30 is not None and d30 <= Decimal("0.70")
         )
-        state = "HARD_CAPITAL_PROTECTION_SHADOW" if severe else (
+        # This fixed research bucket has not passed tail/winner validation;
+        # avoid naming it like a production protection authorization.
+        state = "SEVERE_DISLOCATION_RESEARCH" if severe else (
             "RISK_COMPRESSION_SHADOW" if dislocated else "NORMAL"
         )
         return {

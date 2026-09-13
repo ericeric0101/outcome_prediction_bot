@@ -19,5 +19,5 @@ def test_monitor_is_read_only_and_emits_shadow_risk_state():
     decision = monitor.observe(observation(31, ".7", "50"))
     assert decision["live_authority"] is False
     assert decision["execution_submitted"] is False
-    assert decision["state"] == "HARD_CAPITAL_PROTECTION_SHADOW"
+    assert decision["state"] == "SEVERE_DISLOCATION_RESEARCH"
     assert not hasattr(monitor, "gateway")

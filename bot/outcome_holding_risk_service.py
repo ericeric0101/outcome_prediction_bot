@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import time
 from decimal import Decimal
+from types import SimpleNamespace
 from typing import Any, Callable
 
 from bot.lifecycle.outcome_lifecycle import OutcomeMarketSpec
@@ -56,14 +57,20 @@ class OutcomeHoldingRiskService:
     def maybe_fast_failure(self, *, market: OutcomeMarketSpec, finding: object) -> LiveExecutionResult | None:
         if self.ledger is None or self.store is None or self.fast_controller is None:
             return None
-        if not tuple(getattr(finding, "sell_order_ids", ())):
-            return None
         coin = str(getattr(finding, "coin", ""))
         inventory = Decimal(str(getattr(finding, "inventory", "0")))
+        if not tuple(getattr(finding, "sell_order_ids", ())):
+            self._audit_early(component="OUTCOME_FAST_FAILURE_EXIT_DECISION", market=market, coin=coin, reason="no_owned_protective_sell", inventory=inventory)
+            return None
         lifecycle = self.store.recover(wallet=self.recovery.wallet, outcome_id=market.outcome_id, coin=coin)
-        if lifecycle is None or lifecycle.state == "EMERGENCY_EXIT_SUBMITTED":
+        if lifecycle is None:
+            self._audit_early(component="OUTCOME_FAST_FAILURE_EXIT_DECISION", market=market, coin=coin, reason="exit_lifecycle_unavailable", inventory=inventory)
+            return None
+        if lifecycle.state == "EMERGENCY_EXIT_SUBMITTED":
+            self._audit_early(component="OUTCOME_FAST_FAILURE_EXIT_DECISION", market=market, coin=coin, lifecycle=lifecycle, reason="emergency_exit_already_submitted", inventory=inventory)
             return None
         if self._attempt_budget_exhausted(market=market, coin=coin):
+            self._audit_early(component="OUTCOME_FAST_FAILURE_EXIT_DECISION", market=market, coin=coin, lifecycle=lifecycle, reason="attempt_budget_exhausted", inventory=inventory)
             return None
         fill_vwap = self.machine._fill_vwap_for_inventory(coin=coin, inventory=inventory)
         entry_age = self.official_holding_age(
@@ -72,8 +79,12 @@ class OutcomeHoldingRiskService:
         window = self.reversal_windows.get((market.outcome_id, coin), (0.0, 0.0, 0))
         cfg = self.fast_policy.config
         if entry_age is None or entry_age < cfg.min_holding_sec:
+            self._audit_early(component="OUTCOME_FAST_FAILURE_EXIT_DECISION", market=market, coin=coin, lifecycle=lifecycle, reason="minimum_holding_time_not_reached",
+                              inventory=inventory, holding_age_sec=entry_age, reversal_count=window[2])
             return None
         if window[2] < cfg.min_independent_reversal_observations or time.time() - window[0] < cfg.min_reversal_duration_sec:
+            self._audit_early(component="OUTCOME_FAST_FAILURE_EXIT_DECISION", market=market, coin=coin, lifecycle=lifecycle, reason="independent_reversal_observations_not_met",
+                              inventory=inventory, holding_age_sec=entry_age, reversal_count=window[2], reversal_duration_sec=time.time() - window[0] if window[0] else 0.0)
             return None
         side_index = 0 if coin == market.yes_coin else 1
         try:
@@ -103,12 +114,17 @@ class OutcomeHoldingRiskService:
     def maybe_emergency(self, *, market: OutcomeMarketSpec, finding: object) -> LiveExecutionResult | None:
         if self.ledger is None or self.store is None or self.emergency_controller is None:
             return None
-        if not tuple(getattr(finding, "sell_order_ids", ())):
-            return None
         coin = str(getattr(finding, "coin", ""))
         inventory = Decimal(str(getattr(finding, "inventory", "0")))
+        if not tuple(getattr(finding, "sell_order_ids", ())):
+            self._audit_early(component="OUTCOME_EMERGENCY_EXIT_DECISION", market=market, coin=coin, reason="no_owned_protective_sell", inventory=inventory)
+            return None
         lifecycle = self.store.recover(wallet=self.recovery.wallet, outcome_id=market.outcome_id, coin=coin)
-        if lifecycle is None or lifecycle.state == "EMERGENCY_EXIT_SUBMITTED":
+        if lifecycle is None:
+            self._audit_early(component="OUTCOME_EMERGENCY_EXIT_DECISION", market=market, coin=coin, reason="exit_lifecycle_unavailable", inventory=inventory)
+            return None
+        if lifecycle.state == "EMERGENCY_EXIT_SUBMITTED":
+            self._audit_early(component="OUTCOME_EMERGENCY_EXIT_DECISION", market=market, coin=coin, lifecycle=lifecycle, reason="emergency_exit_already_submitted", inventory=inventory)
             return None
         entry_age = self.live_entry_age(market=market, coin=coin)
         loss_since = self.store.loss_band_first_seen_ts(
@@ -117,12 +133,21 @@ class OutcomeHoldingRiskService:
         window = self.reversal_windows.get((market.outcome_id, coin), (0.0, 0.0, 0))
         cfg = self.emergency_policy.config
         if entry_age is None or entry_age < cfg.min_holding_sec:
+            self._audit_early(component="OUTCOME_EMERGENCY_EXIT_DECISION", market=market, coin=coin, lifecycle=lifecycle, reason="minimum_holding_time_not_reached",
+                              inventory=inventory, holding_age_sec=entry_age, reversal_count=window[2])
             return None
         if loss_since is None or time.time() - loss_since < cfg.min_loss_band_unfilled_sec:
+            self._audit_early(component="OUTCOME_EMERGENCY_EXIT_DECISION", market=market, coin=coin, lifecycle=lifecycle, reason="passive_loss_band_wait_not_elapsed",
+                              inventory=inventory, holding_age_sec=entry_age, reversal_count=window[2],
+                              loss_band_state="not_armed" if loss_since is None else "loss_band_waiting")
             return None
         if window[2] < cfg.min_independent_reversal_observations or time.time() - window[0] < cfg.min_reversal_duration_sec:
+            self._audit_early(component="OUTCOME_EMERGENCY_EXIT_DECISION", market=market, coin=coin, lifecycle=lifecycle, reason="independent_reversal_observations_not_met",
+                              inventory=inventory, holding_age_sec=entry_age, reversal_count=window[2], reversal_duration_sec=time.time() - window[0] if window[0] else 0.0)
             return None
         if self._attempt_budget_exhausted(market=market, coin=coin):
+            self._audit_early(component="OUTCOME_EMERGENCY_EXIT_DECISION", market=market, coin=coin, lifecycle=lifecycle, reason="attempt_budget_exhausted",
+                              inventory=inventory, holding_age_sec=entry_age, reversal_count=window[2])
             return None
         fill_vwap = self.machine._fill_vwap_for_inventory(coin=coin, inventory=inventory)
         side_index = 0 if coin == market.yes_coin else 1
@@ -204,7 +229,8 @@ class OutcomeHoldingRiskService:
         }:
             # A reconcile-required response may be an ambiguous ACK and must
             # conservatively consume exactly one attempt in this episode.
-            self.risk_episodes.record_attempt(episode, execution_state=result.state)
+            if self.risk_episodes.record_attempt(episode, execution_state=result.state) is None:
+                return LiveExecutionResult("reconcile_required", "risk_episode_attempt_persistence_failed", result.emergency_order_id or result.old_order_id)
         if result.state in {"emergency_exit_submitted", "emergency_exit_flat", "emergency_exit_residual"}:
             self.ledger.journal.log_order_event(
                 self.ledger.run_id, "ORDER_SUBMIT", venue_order_id=result.emergency_order_id,
@@ -226,3 +252,23 @@ class OutcomeHoldingRiskService:
             )
             return episode is not None and self.risk_episodes.exhausted(episode)
         return self.store.emergency_attempted(wallet=self.recovery.wallet, outcome_id=market.outcome_id, coin=coin)
+
+    def _audit_early(
+        self, *, component: str, market: OutcomeMarketSpec, coin: str, reason: str, inventory: Decimal,
+        lifecycle: object | None = None, holding_age_sec: float | None = None,
+        reversal_count: int = 0, reversal_duration_sec: float = 0.0,
+        loss_band_state: str | None = None,
+    ) -> None:
+        if self.gate_audit is None:
+            return
+        item = SimpleNamespace(
+            inventory=inventory, holding_age_sec=holding_age_sec,
+            reversal_independent_observations=reversal_count,
+            reversal_duration_sec=reversal_duration_sec,
+        )
+        self.gate_audit(
+            component=component, eligible=False, reason=reason,
+            market=market, lifecycle=lifecycle, item=item,
+            loss_band_state=loss_band_state or getattr(lifecycle, "state", None),
+            book_state="not_reached", executable_pnl=None,
+        )

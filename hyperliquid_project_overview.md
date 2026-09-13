@@ -1143,9 +1143,9 @@ E4/loss-band remains passive ALO repricing, not a guaranteed stop.  S3/fast-fail
 
 At startup, `OutcomeLiveExecutionRuntime` now writes one durable `OUTCOME_RUNTIME_STARTUP_MANIFEST`.  It records the runtime run id, git SHA/dirty state, optional non-secret deployment id, a **non-secret configuration hash**, and the loaded safety-component matrix (`enabled`, `authority`, `version`, `health`, `ready`, `safety_critical`).  Private keys, wallet values, tokens and URLs containing secret-like names are excluded from the fingerprint payload.
 
-Before a **flat** position may construct a new BUY, `OutcomeEntryExecutionService` checks every safety-critical component.  If a component such as account reconciliation, protective SELL ownership, entry/exit ambiguity fence, exit lifecycle/E4 controller, fast-failure/S3 controller, WS attachment, or portfolio guard is unavailable, new entry fails closed and a durable `OUTCOME_SAFETY_COMPONENT_NOT_READY` event is written.  It does not cancel an existing protective SELL or alter management of an existing holding.
+Before a **flat** position may construct a new BUY, `OutcomeEntryExecutionService` checks every safety-critical component.  If a component such as account reconciliation, protective SELL ownership, entry/exit ambiguity fence, exit lifecycle/E4 controller, fast-failure/S3 controller, WS attachment, or portfolio guard is unavailable, new entry fails closed and a durable `OUTCOME_SAFETY_COMPONENT_NOT_READY` event is written.  An existing holding is not cancelled by this condition; however, the holding supervisor now emits the same durable event with `active_holding_exit_safety_attention_required`, so missing exit-critical readiness cannot remain invisible merely because entry preflight is bypassed.
 
-`OUTCOME_EXIT_SAFETY_GATE_DECISION` is transition-only evidence for loss-band, fast-failure and S3 eligibility.  It captures the changed reason, position age, executable PnL, reversal state/count, loss-band state and book state without emitting a row on every tick.  It is audit telemetry, never a new authorization.
+`OUTCOME_EXIT_SAFETY_GATE_DECISION` is a **durable**, transition-only record for loss-band, fast-failure and S3 eligibility.  It captures planner results and all pre-plan exits (no owned protection, lifecycle unavailable, age, loss-band waiting/not armed, reversal count/duration, and attempt-budget exhaustion), with position age, executable PnL, reversal state/count, loss-band state and book state.  It is audit telemetry, never a new authorization.
 
 ### WS observations and parallel Market Risk Monitor — shadow only
 
@@ -1156,24 +1156,26 @@ Before a **flat** position may construct a new BUY, `OutcomeEntryExecutionServic
 ```text
 NORMAL
 RISK_COMPRESSION_SHADOW
-HARD_CAPITAL_PROTECTION_SHADOW
+SEVERE_DISLOCATION_RESEARCH
 ```
 
 with `would_compress_target`, `would_aggressively_reprice`, and `would_freeze_additional_exposure` as hypothetical actions.  Every output has `read_only=true`, `live_authority=false`, and `execution_submitted=false`.  The module imports no account client, SDK, gateway, controller, cancel primitive, or IOC primitive.  It writes `OUTCOME_MARKET_RISK_MONITOR_SHADOW` only on state transitions or the compact crash-shadow cadence.  It must remain parallel to thesis/reversal monitoring: market dislocation can be economically dangerous even before three-source directional reversal is confirmed, but it has no live action authority in this release.
 
+The current monitor is **BBO-based shadow evidence**, not full-inventory executable-loss evidence: WS does not supply a fresh full-depth walk on this hot path, so `full_inventory_executable_vwap` remains null unless separately available.  `SEVERE_DISLOCATION_RESEARCH` is a fixed research bucket, not a validated hard-capital candidate and must not be promoted from its name or individual tails.
+
 ### Exit latency, RiskEpisode and stress sizing
 
-`scripts/outcome_exit_latency_report.py --db logs/outcome_shadow.db` is a read-only chain report.  It reports only recorded risk decision/lifecycle milestones and explicitly compares p90 with the historical #2437 `-5% → -10%` window of about 11 seconds.  Missing milestones are reported as missing evidence; the report never fabricates a completed IOC/fill sequence.  Until a complete observed chain has a compatible p90, any Stage-2 capital-protection candidate is blocked.
+`scripts/outcome_exit_latency_report.py --db logs/outcome_shadow.db` is a read-only chain report.  It separately reports `decision → exchange ACK` and `decision → confirmed inventory reduction`; the latter is the comparator for the historical #2437 `-5% → -10%` window of about 11 seconds.  An account read with unchanged residual inventory is deliberately **not** counted as a reduction or successful exit.  Controller lifecycle events carry cancellation, fresh-book, planning, durable-intent, submit, ACK and account-inventory-confirmation timestamps.  Missing milestones are reported as missing evidence; the report never fabricates a completed IOC/fill sequence.  Until a complete observed chain has a compatible p90, any Stage-2 capital-protection candidate is blocked.
 
-`OutcomeRiskEpisodeStore` provides a durable, bounded episode record (`episode_id`, opened time, trigger family, severity, attempts and recovered close) for the **existing** fast-failure/S3 controller.  It is explicitly disabled by default with `OUTCOME_RISK_EPISODE_BUDGET_ENABLED=0`.  When enabled, an ambiguous/reconcile-required exit consumes one conservative attempt within the same episode; recovery (best executable bid within 2% of entry and no confirmed reversal) closes that episode, so a later new severe deterioration can receive a fresh bounded budget.  It never adds an IOC path or removes the existing full-depth/intent/reconciliation checks.
+`OutcomeRiskEpisodeStore` provides a durable, bounded episode record (`episode_id`, opened time, trigger family, severity, attempts and recovered close) for the **existing** fast-failure/S3 controller.  It is explicitly disabled by default with `OUTCOME_RISK_EPISODE_BUDGET_ENABLED=0`.  When enabled, an ambiguous/reconcile-required exit consumes one conservative attempt within the same episode; recovery (best executable bid within 2% of entry and no confirmed reversal) closes that episode, so a later new severe deterioration can receive a fresh bounded budget.  If the post-mutation episode-attempt write fails, the in-process budget becomes uncertain/exhausted and the result is reconciliation-required; restart reads durable accepted-IOC/ambiguous evidence after episode open so the same mutation cannot silently regain a budget.  It never adds an IOC path or removes the existing full-depth/intent/reconciliation checks.
 
-`OutcomeStressExitabilitySizer` is also disabled by default (`OUTCOME_STRESS_EXITABILITY_ENABLED=0`).  If deliberately enabled, it applies explicit 10%/15% visible-depth haircuts and sets:
+`OutcomeStressExitabilitySizer` is also disabled by default (`OUTCOME_STRESS_EXITABILITY_ENABLED=0`).  If deliberately enabled, it calculates entry-price `-10%` and `-15%` floors (optionally raised by a conservative spread-widening buffer), counts only valid full-depth L2 bids at or above **each** floor using the shared emergency depth-walk primitive, then applies explicit depth haircuts and sets:
 
 ```text
 submitted_shares = min(desired_shares, existing_capacity_safe_shares, stress_safe_shares)
 ```
 
-It can only reduce size; an invalid policy, missing/insufficient depth, or stress-safe size below the official venue minimum rejects the entry.  It is an entry-size safety ceiling, **not** a forecast that future liquidity will exist at either stressed price.  The audit preserves desired, existing capacity-safe, stress-safe and submitted shares.
+It can only reduce size; an invalid policy, missing/insufficient depth, or stress-safe size below the official venue minimum rejects the entry.  It is an entry-size safety ceiling, **not** a forecast that future liquidity will exist at either stressed price.  Depth below the stressed price floor is explicitly excluded.  The audit preserves desired, existing capacity-safe, each price-capped full-depth value, stress-safe and submitted shares.
 
 ### Diagnostic and promotion contract
 

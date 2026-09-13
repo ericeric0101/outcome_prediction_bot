@@ -118,6 +118,27 @@ def _ceil_to_tick(value: Decimal, tick: Decimal) -> Decimal:
     return (value / tick).to_integral_value(rounding=ROUND_CEILING) * tick
 
 
+def executable_shares_at_or_above(
+    bids: tuple[tuple[Decimal, Decimal], ...], *, minimum_price: Decimal,
+) -> Decimal:
+    """Use the same strict full-depth boundary as the emergency planner.
+
+    This helper deliberately counts only valid bids at or above a specified
+    price cap.  It is shared by entry stress sizing so that total book depth
+    below the permissible loss cap can never be mistaken for exit capacity.
+    """
+    if not Decimal("0") < minimum_price < Decimal("1"):
+        return Decimal("0")
+    capacity = Decimal("0")
+    for price, size in bids:
+        if not Decimal("0") < price < Decimal("1") or size <= 0:
+            return Decimal("0")
+        if price < minimum_price:
+            break
+        capacity += size
+    return capacity
+
+
 class OutcomeEmergencyExitPolicy:
     def __init__(self, config: OutcomeEmergencyExitConfig | None = None) -> None:
         self.config = config or OutcomeEmergencyExitConfig()
@@ -345,13 +366,22 @@ class OutcomeEmergencyExitController:
             # burning its only emergency budget at submit time.
             self._invalidate_account_reads()
             residual = _inventory(self.account.get_spot_clearinghouse_state_sync(self.wallet), lifecycle.coin)
+            timing["inventory_confirmed_ts"] = time.time()
+            # An account read is evidence that reconciliation ran, not by
+            # itself evidence that the IOC reduced risk.  Preserve the
+            # distinction for latency reports and any future promotion gate.
+            inventory_reduced = residual < after_inventory
             if residual <= 0:
+                timing["complete_fill_ts"] = timing["inventory_confirmed_ts"]
                 closed = OutcomeExitLifecycle(
                     self.wallet, market.outcome_id, lifecycle.coin, emergency_order_id,
                     Decimal("0"), fresh_plan.limit_price, lifecycle.replacement_count, "CLOSED",
                 )
                 self.store.record(closed, reason="emergency_ioc_inventory_flat_confirmed", extra={
                     "requested_shares": str(after_inventory), "remaining_inventory": "0",
+                    "inventory_reduced": inventory_reduced,
+                    "inventory_flat": True,
+                    "execution_timing": timing,
                     "emergency_attempt": self.store.emergency_attempt_count(
                         wallet=self.wallet, outcome_id=market.outcome_id, coin=lifecycle.coin,
                     ),
@@ -363,6 +393,9 @@ class OutcomeEmergencyExitController:
             )
             self.store.record(residual_lifecycle, reason="emergency_ioc_residual_inventory_requires_protection", extra={
                 "requested_shares": str(after_inventory), "remaining_inventory": str(residual),
+                "inventory_reduced": inventory_reduced,
+                "inventory_flat": False,
+                "execution_timing": timing,
                 "emergency_attempt": self.store.emergency_attempt_count(
                     wallet=self.wallet, outcome_id=market.outcome_id, coin=lifecycle.coin,
                 ),

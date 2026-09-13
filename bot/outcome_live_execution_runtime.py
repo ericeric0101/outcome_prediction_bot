@@ -283,16 +283,26 @@ class OutcomeLiveExecutionRuntime:
             return False, "safety_components_not_ready:" + ",".join(missing)
         return True, "ready"
 
+    def audit_safety_for_existing_holding(self, *, outcome_id: int) -> None:
+        """Raise durable attention when an owned position loses exit safety."""
+        self.runtime_safety.audit_not_ready(
+            components=self.safety_components(), outcome_id=outcome_id, active_holding=True,
+        )
+
     def _audit_exit_safety_gate(
         self, *, component: str, eligible: bool, reason: str, market: OutcomeMarketSpec,
         lifecycle: object, item: object, loss_band_state: str | None,
         book_state: str | None, executable_pnl: str | None,
     ) -> None:
+        try:
+            position_age_sec = float(getattr(item, "holding_age_sec", None))
+        except (TypeError, ValueError):
+            position_age_sec = None
         self.runtime_safety.audit_gate(
             component=component, eligible=eligible, reason=reason,
             outcome_id=market.outcome_id,
             lifecycle_id=str(getattr(lifecycle, "order_id", "")) or None,
-            position_age_sec=float(getattr(item, "holding_age_sec", 0.0)),
+            position_age_sec=position_age_sec,
             current_executable_pnl=executable_pnl,
             reversal_state=(
                 "confirmed" if int(getattr(item, "reversal_independent_observations", 0)) >= 3
@@ -1688,7 +1698,7 @@ class OutcomeLiveExecutionRuntime:
             safe_shares = min(Decimal(desired_shares), quality.safe_max_shares or Decimal("0"))
             stress = self.stress_exitability_sizer.evaluate(
                 bid_levels=book.get("bids", ()), desired_shares=safe_shares,
-                venue_minimum_shares=Decimal(min_opening_shares),
+                venue_minimum_shares=Decimal(min_opening_shares), entry_price=price,
             )
             # The stress policy is intentionally a ceiling: it never turns a
             # rejected/too-small capacity into a larger order.
