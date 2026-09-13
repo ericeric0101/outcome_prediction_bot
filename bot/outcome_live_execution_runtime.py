@@ -11,6 +11,7 @@ import os
 import time
 from datetime import datetime
 from decimal import Decimal, ROUND_FLOOR
+from pathlib import Path
 
 from bot.adapters.outcome_client import OutcomeClient
 from bot.lifecycle.outcome_lifecycle import OutcomeMarketSpec
@@ -55,6 +56,8 @@ from bot.outcome_emergency_exit import (
 from bot.outcome_efficiency_shadow import OutcomeConfidenceEntryShadow, OutcomeQueueAwarePricingShadow
 from bot.outcome_active_shadow import OutcomeActiveChallengerShadow
 from bot.outcome_crash_circuit_shadow import OutcomeCrashCircuitObservation, OutcomeCrashCircuitShadow
+from bot.outcome_market_risk_monitor import OutcomeMarketRiskMonitor, OutcomeMarketRiskObservation
+from bot.outcome_stress_exitability import OutcomeStressExitabilitySizer
 from bot.outcome_runtime_supervisors import (
     OutcomeEntrySupervisor,
     OutcomeHoldingSupervisor,
@@ -67,6 +70,8 @@ from bot.outcome_entry_execution_service import OutcomeEntryExecutionService
 from bot.outcome_holding_execution_service import OutcomeHoldingExecutionService
 from bot.outcome_holding_risk_service import OutcomeHoldingRiskService
 from bot.outcome_exit_requote_service import OutcomeExitRequoteService
+from bot.outcome_runtime_safety import OutcomeRuntimeSafety, SafetyComponent
+from bot.outcome_risk_episode import OutcomeRiskEpisodeStore
 
 
 class OutcomeLiveExecutionRuntime:
@@ -91,6 +96,11 @@ class OutcomeLiveExecutionRuntime:
         ))
         self.stream_health = stream_health
         self.ledger = ledger
+        self.runtime_safety = OutcomeRuntimeSafety(
+            journal=ledger.journal if ledger else None,
+            run_id=ledger.run_id if ledger else None,
+            repo_root=Path(__file__).resolve().parent.parent,
+        )
         self.research_gate = research_gate or OutcomeResearchGate()
         if exit_planner is None:
             exit_planner = OutcomeExitQuotePlanner(OutcomeExitQuotePlannerConfig())
@@ -116,10 +126,18 @@ class OutcomeLiveExecutionRuntime:
         self.reversal_classifier = OutcomeReversalClassifier()
         self.loss_reentry_gate = OutcomeLossReentryGate(ledger.journal, ledger.run_id) if ledger else None
         self.tier_b_execution_gate = OutcomeTierBExecutionGate(ledger.journal.db_path) if ledger else None
+        # Disabled by default.  When explicitly enabled it can only lower the
+        # current entry-size ceiling using visible bid depth haircuts.
+        self.stress_exitability_sizer = OutcomeStressExitabilitySizer()
         self.wide_spread_candidate_tracker = (
             OutcomeWideSpreadCandidateTracker(journal=ledger.journal, run_id=ledger.run_id) if ledger else None
         )
         self.portfolio_guard = OutcomePortfolioGuard(ledger.journal.db_path) if ledger else None
+        self.risk_episode_store = (
+            OutcomeRiskEpisodeStore(ledger.journal, ledger.run_id)
+            if ledger is not None and os.environ.get("OUTCOME_RISK_EPISODE_BUDGET_ENABLED", "0").strip() == "1"
+            else None
+        )
         # This observer is deliberately shadow-only.  It has no reference to
         # an execution controller and cannot alter S0/S2/S3 authority.
         self.market_regime_shadow = OutcomeMarketRegimeShadow()
@@ -131,6 +149,7 @@ class OutcomeLiveExecutionRuntime:
         # This records fast WS crash features for later calibration.  It is
         # deliberately separate from S3 / fast-failure authority.
         self.crash_circuit_shadow = OutcomeCrashCircuitShadow()
+        self.market_risk_monitor = OutcomeMarketRiskMonitor()
         self.emergency_exit_policy = OutcomeEmergencyExitPolicy()
         self.emergency_exit_controller = (
             OutcomeEmergencyExitController(
@@ -167,6 +186,7 @@ class OutcomeLiveExecutionRuntime:
         self._last_toxic_shadow_record: dict[tuple[int, str], tuple[str, float]] = {}
         self._last_efficiency_shadow_record: dict[tuple[str, int, int], tuple[str, float]] = {}
         self._last_crash_shadow_record: dict[str, tuple[str, float]] = {}
+        self._last_market_risk_record: dict[str, tuple[str, float]] = {}
         self._last_fill_sync_at = float("-inf")
         self.journal_view = OutcomeRuntimeJournalView(ledger.journal.db_path if ledger else None)
         # These narrow services own decision ordering.  Atomic execution and
@@ -181,6 +201,7 @@ class OutcomeLiveExecutionRuntime:
             controller=self.entry_requote_controller, ledger=self.ledger,
             loss_reentry_gate=self.loss_reentry_gate, record_result=self._record,
             fast_risk_decision=self._entry_fast_risk_decision,
+            safety_preflight=self.safety_ready_for_new_entry,
         )
         self.exit_recovery_service = OutcomeExitRecoveryService(
             recovery=self.recovery, store=self.exit_lifecycle_store,
@@ -207,6 +228,8 @@ class OutcomeLiveExecutionRuntime:
             fresh_book=self._fresh_book_once,
             official_holding_age=self._official_holding_age_sec,
             live_entry_age=self._live_entry_age_sec,
+            gate_audit=self._audit_exit_safety_gate,
+            risk_episodes=self.risk_episode_store,
         )
         self.exit_requote_service = OutcomeExitRequoteService(
             recovery=self.recovery, machine=self.machine,
@@ -222,8 +245,78 @@ class OutcomeLiveExecutionRuntime:
             strategy_exit_tier=self._strategy_exit_tier,
             enabled=self.exit_requote_enabled,
             canary_enabled=self.exit_requote_canary_enabled,
+            gate_audit=self._audit_exit_requote_gate,
         )
         self._current_tick_snapshot: OutcomeRuntimeTickSnapshot | None = None
+
+    def safety_components(self, *, settlement_ready: bool | None = None) -> tuple[SafetyComponent, ...]:
+        """Report loaded components from runtime truth, never config intent."""
+        exit_ready = self.exit_lifecycle_store is not None and self.exit_requote_controller is not None
+        return (
+            SafetyComponent("account_reconciliation", self.recovery is not None, "safety_critical", "v1", "ready" if self.recovery else "missing", self.recovery is not None, True),
+            SafetyComponent("protective_sell", self.holding_execution_service is not None, "safety_critical", "v1", "ready" if self.holding_execution_service else "missing", self.holding_execution_service is not None, True),
+            SafetyComponent("entry_ambiguity_fence", self.entry_lifecycle_store is not None, "safety_critical", "v1", "ready" if self.entry_lifecycle_store else "missing", self.entry_lifecycle_store is not None, True),
+            SafetyComponent("exit_ambiguity_fence", self.exit_lifecycle_store is not None, "safety_critical", "v1", "ready" if self.exit_lifecycle_store else "missing", self.exit_lifecycle_store is not None, True),
+            SafetyComponent("exit_lifecycle", self.exit_lifecycle_store is not None, "safety_critical", "v1", "ready" if self.exit_lifecycle_store else "missing", self.exit_lifecycle_store is not None, True),
+            SafetyComponent("exit_requote", self.exit_requote_enabled(), "live_exit_authorization", "e4", "ready" if exit_ready else "missing", exit_ready, True),
+            SafetyComponent("loss_band", self.exit_requote_enabled(), "live_exit_authorization", "e4", "ready" if exit_ready else "missing", exit_ready, True),
+            SafetyComponent("fast_failure", self.fast_failure_exit_controller is not None, "live_exit_authorization", "v1", "ready" if self.fast_failure_exit_controller else "missing", self.fast_failure_exit_controller is not None, True),
+            SafetyComponent("s3_emergency", self.emergency_exit_controller is not None, "live_exit_authorization", "s3", "ready" if self.emergency_exit_controller else "missing", self.emergency_exit_controller is not None, True),
+            SafetyComponent("reversal_monitor", self.reversal_classifier is not None, "strategy_input", "v1", "ready" if self.reversal_classifier else "missing", self.reversal_classifier is not None),
+            SafetyComponent("crash_shadow", self.crash_circuit_shadow is not None, "read_only", "v1", "ready" if self.crash_circuit_shadow else "missing", self.crash_circuit_shadow is not None),
+            SafetyComponent("holding_path", self.holding_path_recorder is not None, "read_only", "v3", "ready" if self.holding_path_recorder else "missing", self.holding_path_recorder is not None),
+            SafetyComponent("ws_stream_health", self.stream_health is not None, "safety_critical", "v1", "attached" if self.stream_health else "not_attached", self.stream_health is not None, True),
+            SafetyComponent("portfolio_guard", self.portfolio_guard is not None, "safety_critical", "f5", "ready" if self.portfolio_guard else "missing", self.portfolio_guard is not None, True),
+            SafetyComponent("risk_episode_budget", self.risk_episode_store is not None, "live_exit_authorization", "v1", "enabled" if self.risk_episode_store else "disabled", True),
+            SafetyComponent("settlement_worker", settlement_ready is not None, "read_only", "v1", "ready" if settlement_ready else "external_or_missing", bool(settlement_ready)),
+            SafetyComponent("market_risk_monitor", self.market_risk_monitor is not None, "read_only", "v1", "ready" if self.market_risk_monitor else "missing", self.market_risk_monitor is not None),
+        )
+
+    def write_startup_manifest(self, *, settlement_ready: bool | None = None) -> bool:
+        return self.runtime_safety.write_startup_manifest(self.safety_components(settlement_ready=settlement_ready))
+
+    def safety_ready_for_new_entry(self, *, outcome_id: int | None = None) -> tuple[bool, str]:
+        components = self.safety_components()
+        missing = [item.name for item in components if item.safety_critical and not item.ready]
+        if missing:
+            self.runtime_safety.audit_not_ready(components=components, outcome_id=outcome_id)
+            return False, "safety_components_not_ready:" + ",".join(missing)
+        return True, "ready"
+
+    def _audit_exit_safety_gate(
+        self, *, component: str, eligible: bool, reason: str, market: OutcomeMarketSpec,
+        lifecycle: object, item: object, loss_band_state: str | None,
+        book_state: str | None, executable_pnl: str | None,
+    ) -> None:
+        self.runtime_safety.audit_gate(
+            component=component, eligible=eligible, reason=reason,
+            outcome_id=market.outcome_id,
+            lifecycle_id=str(getattr(lifecycle, "order_id", "")) or None,
+            position_age_sec=float(getattr(item, "holding_age_sec", 0.0)),
+            current_executable_pnl=executable_pnl,
+            reversal_state=(
+                "confirmed" if int(getattr(item, "reversal_independent_observations", 0)) >= 3
+                else "not_confirmed"
+            ),
+            independent_confirmation_count=int(getattr(item, "reversal_independent_observations", 0)),
+            loss_band_state=loss_band_state, book_state=book_state,
+        )
+
+    def _audit_exit_requote_gate(self, **payload: object) -> None:
+        market = payload.pop("market")
+        assert isinstance(market, OutcomeMarketSpec)
+        lifecycle = payload.pop("lifecycle")
+        self.runtime_safety.audit_gate(
+            component=str(payload.pop("component")), eligible=bool(payload.pop("eligible")),
+            reason=str(payload.pop("reason")), outcome_id=market.outcome_id,
+            lifecycle_id=str(getattr(lifecycle, "order_id", "")) or None,
+            position_age_sec=payload.pop("position_age_sec", None),
+            current_executable_pnl=payload.pop("executable_pnl", None),
+            reversal_state=payload.pop("reversal_state", None),
+            independent_confirmation_count=payload.pop("independent_confirmation_count", None),
+            loss_band_state=payload.pop("loss_band_state", None),
+            book_state=payload.pop("book_state", None),
+        )
 
     def set_open_orders_stream(self, stream: object | None) -> None:
         """Attach the launcher's cross-validated user-order observation."""
@@ -988,6 +1081,20 @@ class OutcomeLiveExecutionRuntime:
             market=market, coin=coin, side_index=side_index, vwap=vwap,
             bid=bid, ask=ask, evidence=evidence, book_source="fresh_ws_bbo", holding_audit=holding_audit,
         )
+        # An enabled episode budget closes only after a durable recovery fact:
+        # the executable best bid has returned within 2% of entry and the
+        # thesis monitor is no longer confirmed adverse.  This never creates
+        # an order; it merely lets a later, genuinely separate deterioration
+        # receive its own bounded existing-controller budget.
+        if (
+            self.risk_episode_store is not None
+            and bid / vwap - Decimal("1") >= Decimal("-0.02")
+            and reversal_state != "REVERSAL_CONFIRMED"
+        ):
+            self.risk_episode_store.close_recovered(
+                wallet=self.recovery.wallet, outcome_id=market.outcome_id, coin=coin,
+                reason="ws_executable_bid_recovered_with_no_confirmed_reversal",
+            )
         if lifecycle_id and self.ledger is not None:
             def _evidence_decimal(name: str) -> Decimal | None:
                 try:
@@ -1023,6 +1130,27 @@ class OutcomeLiveExecutionRuntime:
                     self.ledger.run_id, "OUTCOME_CRASH_CIRCUIT_SHADOW", crash,
                 )
                 self._last_crash_shadow_record[lifecycle_id] = (state, now)
+            # Parallel market-risk monitor: it only turns WS observations into
+            # a prepared/shadow authorization.  It deliberately does not
+            # receive the gateway or any mutation primitive.
+            monitor = self.market_risk_monitor.observe(OutcomeMarketRiskObservation(
+                lifecycle_id=lifecycle_id, outcome_id=market.outcome_id, coin=coin, period=market.period,
+                timestamp=now, entry_price=vwap, position_size=inventory, best_bid=bid, best_ask=ask,
+                top1_depth=Decimal(str(book_top.get("top1_bid_depth", book_top["top3_bid_depth"]))),
+                top3_depth=Decimal(str(book_top["top3_bid_depth"])), side_index=side_index,
+                time_left_sec=market.time_to_expiry_sec(), entry_time_left_sec=provenance.get("entry_time_left_sec"),
+                spot_strike_bps=_evidence_decimal("spot_strike_bps"), mark_return_bps=_evidence_decimal("mark_return_bps"),
+                oi_return_bps=_evidence_decimal("oi_return_bps"), oi_age_ms=oi_age_ms,
+                reversal_state=reversal_state,
+                independent_confirmation_count=self._emergency_reversal_windows.get((market.outcome_id, coin), (0.0, 0.0, 0))[2],
+            ))
+            monitor_state = str(monitor["state"])
+            prior_monitor = self._last_market_risk_record.get(lifecycle_id)
+            if prior_monitor is None or prior_monitor[0] != monitor_state or now - prior_monitor[1] >= self._CRASH_SHADOW_MIN_INTERVAL_SEC:
+                self.ledger.journal.log_strategy_event(
+                    self.ledger.run_id, "OUTCOME_MARKET_RISK_MONITOR_SHADOW", monitor,
+                )
+                self._last_market_risk_record[lifecycle_id] = (monitor_state, now)
         return True
 
     def _capture_holding_path(self, *, market: OutcomeMarketSpec, finding: object,
@@ -1558,6 +1686,13 @@ class OutcomeLiveExecutionRuntime:
                 admission["entry_execution_gate"] = {"allowed": False, "reason": "entry_execution_gate_unavailable"}
                 return LiveExecutionResult("blocked", "entry execution-quality gate unavailable")
             safe_shares = min(Decimal(desired_shares), quality.safe_max_shares or Decimal("0"))
+            stress = self.stress_exitability_sizer.evaluate(
+                bid_levels=book.get("bids", ()), desired_shares=safe_shares,
+                venue_minimum_shares=Decimal(min_opening_shares),
+            )
+            # The stress policy is intentionally a ceiling: it never turns a
+            # rejected/too-small capacity into a larger order.
+            safe_shares = min(safe_shares, stress.stress_safe_shares)
             # Do not let whole_share_size round inadequate capacity up to the
             # venue minimum.  Capacity is a ceiling, never a hint.
             shares = int(safe_shares) if safe_shares >= min_opening_shares else 0
@@ -1573,6 +1708,7 @@ class OutcomeLiveExecutionRuntime:
                 "entry_policy_sample_count": quality.policy.sample_count,
                 "entry_policy_source": quality.policy.source,
                 "entry_decision_bid": str(quality.decision_bid) if quality.decision_bid is not None else None,
+                "entry_stress_exitability": stress.audit,
             })
             admission["entry_execution_gate"] = {"allowed": quality.allowed, "reason": quality.reason, **execution_audit}
             if not quality.allowed or quality.max_submit_bid is None:
@@ -1581,6 +1717,8 @@ class OutcomeLiveExecutionRuntime:
                     quality=quality, entry_tier=entry_tier, requested_shares=desired_shares, admission=admission,
                 )
                 return LiveExecutionResult("flat", f"live strategy no entry: {quality.reason}")
+            if not stress.allowed:
+                return LiveExecutionResult("flat", f"live strategy no entry: {stress.reason}")
             if shares < min_opening_shares:
                 return LiveExecutionResult("flat", "live strategy no entry: entry_safe_capacity_below_venue_minimum")
             entry_max_submit_price = quality.max_submit_bid

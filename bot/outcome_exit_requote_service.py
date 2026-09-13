@@ -29,6 +29,7 @@ class OutcomeExitRequoteService:
         persisted_maker_fee: Callable[..., Decimal | None],
         strategy_exit_tier: Callable[..., tuple[Decimal, Decimal | None] | None],
         enabled: Callable[[], bool], canary_enabled: Callable[[], bool],
+        gate_audit: Callable[..., None] | None = None,
     ) -> None:
         self.recovery = recovery
         self.machine = machine
@@ -47,6 +48,7 @@ class OutcomeExitRequoteService:
         self.strategy_exit_tier = strategy_exit_tier
         self.enabled = enabled
         self.canary_enabled = canary_enabled
+        self.gate_audit = gate_audit
 
     def maybe_requote(self, *, market: OutcomeMarketSpec, finding: object) -> LiveExecutionResult | None:
         if not self.enabled() or self.store is None or self.controller is None:
@@ -145,6 +147,16 @@ class OutcomeExitRequoteService:
             last_requote_ts=lifecycle.updated_at_ts, replacement_count=lifecycle.replacement_count,
             loss_band_authorized=loss_band_authorized,
         ))
+        if self.gate_audit is not None:
+            self.gate_audit(
+                component="loss_band", eligible=plan.exit_mode == "loss_band",
+                reason=plan.reason, market=market, lifecycle=lifecycle,
+                position_age_sec=(None if lifecycle.updated_at_ts is None else max(0.0, time.time() - lifecycle.updated_at_ts)),
+                executable_pnl=str(bid / vwap - Decimal("1")),
+                reversal_state=str(reversal.state),
+                independent_confirmation_count=self.opposite_observation_counts.get((market.outcome_id, coin), 0),
+                book_state="fresh", loss_band_state=lifecycle.state,
+            )
         if plan.action is ExitQuoteAction.KEEP:
             if plan.exit_mode == "loss_band" and lifecycle.state == "LOSS_BAND_RESTING":
                 self.store.record(

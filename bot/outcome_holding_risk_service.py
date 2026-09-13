@@ -18,6 +18,7 @@ from bot.outcome_execution_ledger import OutcomeExecutionLedger
 from bot.outcome_exit_lifecycle import OutcomeExitLifecycleStore
 from bot.outcome_maker_state_machine import OutcomeMakerStateMachine
 from bot.outcome_runtime_types import LiveExecutionResult
+from bot.outcome_risk_episode import OutcomeRiskEpisodeStore, RiskEpisode
 
 
 class OutcomeHoldingRiskService:
@@ -34,6 +35,8 @@ class OutcomeHoldingRiskService:
         fresh_book: Callable[..., dict[str, object]],
         official_holding_age: Callable[..., float | None],
         live_entry_age: Callable[..., float | None],
+        gate_audit: Callable[..., None] | None = None,
+        risk_episodes: OutcomeRiskEpisodeStore | None = None,
     ) -> None:
         self.recovery = recovery
         self.machine = machine
@@ -47,6 +50,8 @@ class OutcomeHoldingRiskService:
         self.fresh_book = fresh_book
         self.official_holding_age = official_holding_age
         self.live_entry_age = live_entry_age
+        self.gate_audit = gate_audit
+        self.risk_episodes = risk_episodes
 
     def maybe_fast_failure(self, *, market: OutcomeMarketSpec, finding: object) -> LiveExecutionResult | None:
         if self.ledger is None or self.store is None or self.fast_controller is None:
@@ -58,7 +63,7 @@ class OutcomeHoldingRiskService:
         lifecycle = self.store.recover(wallet=self.recovery.wallet, outcome_id=market.outcome_id, coin=coin)
         if lifecycle is None or lifecycle.state == "EMERGENCY_EXIT_SUBMITTED":
             return None
-        if self.store.emergency_attempted(wallet=self.recovery.wallet, outcome_id=market.outcome_id, coin=coin):
+        if self._attempt_budget_exhausted(market=market, coin=coin):
             return None
         fill_vwap = self.machine._fill_vwap_for_inventory(coin=coin, inventory=inventory)
         entry_age = self.official_holding_age(
@@ -85,6 +90,7 @@ class OutcomeHoldingRiskService:
             loss_band_unfilled_sec=None, reversal_independent_observations=window[2],
             reversal_duration_sec=(time.time() - window[0]) if window[0] > 0 else 0.0,
             already_attempted=False,
+            risk_detected_ts=time.time(),
         )
         return self._plan_record_execute(
             market=market, coin=coin, side_index=side_index, lifecycle=lifecycle, item=item,
@@ -116,7 +122,7 @@ class OutcomeHoldingRiskService:
             return None
         if window[2] < cfg.min_independent_reversal_observations or time.time() - window[0] < cfg.min_reversal_duration_sec:
             return None
-        if self.store.emergency_attempted(wallet=self.recovery.wallet, outcome_id=market.outcome_id, coin=coin):
+        if self._attempt_budget_exhausted(market=market, coin=coin):
             return None
         fill_vwap = self.machine._fill_vwap_for_inventory(coin=coin, inventory=inventory)
         side_index = 0 if coin == market.yes_coin else 1
@@ -136,6 +142,7 @@ class OutcomeHoldingRiskService:
             reversal_independent_observations=window[2],
             reversal_duration_sec=(time.time() - window[0]) if window[0] > 0 else 0.0,
             already_attempted=False,
+            risk_detected_ts=time.time(),
         )
         return self._plan_record_execute(
             market=market, coin=coin, side_index=side_index, lifecycle=lifecycle, item=item,
@@ -152,6 +159,14 @@ class OutcomeHoldingRiskService:
     ) -> LiveExecutionResult | None:
         assert self.ledger is not None
         plan = policy.plan(item)
+        if self.gate_audit is not None:
+            self.gate_audit(
+                component=decision_event, eligible=plan.action is EmergencyExitAction.EXECUTE,
+                reason=plan.reason, market=market, lifecycle=lifecycle, item=item,
+                loss_band_state=getattr(lifecycle, "state", None),
+                book_state=("fresh" if item.book_age_sec is not None and item.book_age_sec <= policy.config.max_book_age_sec else "stale_or_missing"),
+                executable_pnl=str(plan.net_return_pct) if plan.net_return_pct is not None else None,
+            )
         payload: dict[str, object] = {
             "venue": "hyperliquid_outcome", "outcome_id": market.outcome_id, "period": market.period,
             "coin": coin, "lifecycle_order_id": lifecycle.order_id, "action": plan.action,
@@ -170,9 +185,26 @@ class OutcomeHoldingRiskService:
         self.ledger.journal.log_strategy_event(self.ledger.run_id, decision_event, payload)
         if plan.action is not EmergencyExitAction.EXECUTE:
             return None
+        episode: RiskEpisode | None = None
+        if self.risk_episodes is not None:
+            episode = self.risk_episodes.open_or_resume(
+                wallet=self.recovery.wallet, outcome_id=market.outcome_id, coin=coin,
+                trigger_family=execution_type,
+                severity=str(plan.net_return_pct) if plan.net_return_pct is not None else None,
+            )
+            if episode is None:
+                return LiveExecutionResult("blocked", "risk_episode_durable_open_failed")
+            if self.risk_episodes.exhausted(episode):
+                return LiveExecutionResult("blocked", "risk_episode_attempt_budget_exhausted")
         result = controller.execute(
             market=market, side_index=side_index, lifecycle=lifecycle, item=item, plan=plan,
         )
+        if episode is not None and result.state in {
+            "emergency_exit_submitted", "emergency_exit_flat", "emergency_exit_residual", "reconcile_required",
+        }:
+            # A reconcile-required response may be an ambiguous ACK and must
+            # conservatively consume exactly one attempt in this episode.
+            self.risk_episodes.record_attempt(episode, execution_state=result.state)
         if result.state in {"emergency_exit_submitted", "emergency_exit_flat", "emergency_exit_residual"}:
             self.ledger.journal.log_order_event(
                 self.ledger.run_id, "ORDER_SUBMIT", venue_order_id=result.emergency_order_id,
@@ -186,3 +218,11 @@ class OutcomeHoldingRiskService:
             fills = self.recovery.account.get_user_fills_sync(self.recovery.wallet)
             self.ledger.sync_fills(fills=fills, market_key=f"outcome:{market.outcome_id}", period=market.period)
         return LiveExecutionResult(result.state, result.detail, result.emergency_order_id or result.old_order_id)
+
+    def _attempt_budget_exhausted(self, *, market: OutcomeMarketSpec, coin: str) -> bool:
+        if self.risk_episodes is not None:
+            episode = self.risk_episodes.active(
+                wallet=self.recovery.wallet, outcome_id=market.outcome_id, coin=coin,
+            )
+            return episode is not None and self.risk_episodes.exhausted(episode)
+        return self.store.emergency_attempted(wallet=self.recovery.wallet, outcome_id=market.outcome_id, coin=coin)

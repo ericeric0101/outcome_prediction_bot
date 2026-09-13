@@ -74,6 +74,9 @@ class OutcomeEmergencyExitInput:
     reversal_independent_observations: int
     reversal_duration_sec: float
     already_attempted: bool = False
+    # Set by the holding-risk service at the observed decision boundary.  It
+    # is telemetry only and never changes policy eligibility.
+    risk_detected_ts: float | None = None
 
 
 @dataclass(frozen=True)
@@ -223,6 +226,7 @@ class OutcomeEmergencyExitController:
             return EmergencyExitExecutionResult("blocked", "emergency_exit_already_in_flight", lifecycle.order_id)
         self._in_flight.add(key)
         try:
+            timing: dict[str, float] = {"risk_detected_ts": item.risk_detected_ts or time.time()}
             before_orders = self.account.get_open_orders_sync(self.wallet)
             before_inventory = _inventory(self.account.get_spot_clearinghouse_state_sync(self.wallet), lifecycle.coin)
             owned = self.store.reconcile_owned_sell(
@@ -231,16 +235,22 @@ class OutcomeEmergencyExitController:
             )
             if owned is None or owned.order_id != lifecycle.order_id or before_inventory != item.inventory:
                 return EmergencyExitExecutionResult("reconcile_required", "emergency_owned_sell_or_inventory_not_verified", lifecycle.order_id)
+            timing["cancel_requested_ts"] = time.time()
             self.store.record(lifecycle, reason=plan.reason, extra={
                 "state": "EMERGENCY_CANCEL_SUBMITTED", "limit_price": str(plan.limit_price),
                 "planned_net_return_pct": str(plan.net_return_pct),
                 "planned_executable_vwap": str(plan.executable_vwap),
+                "execution_timing": timing,
             })
             cancelled = cancel_and_confirm(account=self.account, gateway=self.gateway, wallet=self.wallet,
                                            market=market, side_index=side_index, order_id=lifecycle.order_id)
             if not cancelled.confirmed:
                 self.store.record(lifecycle, reason=f"emergency_{cancelled.reason}", extra={"state": "RECONCILE_REQUIRED"})
                 return EmergencyExitExecutionResult("reconcile_required", cancelled.reason, lifecycle.order_id)
+            timing["cancel_confirmed_ts"] = time.time()
+            self.store.record(lifecycle, reason="emergency_cancel_confirmed", extra={
+                "state": "EMERGENCY_CANCEL_SUBMITTED", "execution_timing": timing,
+            })
             after_inventory = _inventory(self.account.get_spot_clearinghouse_state_sync(self.wallet), lifecycle.coin)
             if after_inventory <= 0:
                 self.store.record(lifecycle, reason="emergency_inventory_flat_during_cancel", extra={"state": "RECONCILE_REQUIRED"})
@@ -253,6 +263,8 @@ class OutcomeEmergencyExitController:
                 bids = parse_bid_levels(book)
                 fresh_item = replace(item, bids=bids or (), book_age_sec=book_age_sec(book, now_ms=int(time.time() * 1000)))
                 fresh_plan = self.policy.plan(fresh_item)
+                timing["fresh_book_ready_ts"] = time.time()
+                timing["ioc_plan_ready_ts"] = timing["fresh_book_ready_ts"]
             except Exception as exc:
                 self.store.record(lifecycle, reason=f"emergency_l2_exception:{type(exc).__name__}", extra={"state": "RECONCILE_REQUIRED"})
                 return EmergencyExitExecutionResult("reconcile_required", "emergency_fresh_l2_unavailable", lifecycle.order_id)
@@ -268,13 +280,20 @@ class OutcomeEmergencyExitController:
                     "planned_executable_vwap": str(fresh_plan.executable_vwap),
                     "planned_net_return_pct": str(fresh_plan.net_return_pct),
                     "policy": self.policy.config.policy_name,
+                    "execution_timing": timing,
                 },
             )
             if intent is None:
                 self.store.record(lifecycle, reason="durable_emergency_intent_unavailable", extra={"state": "RECONCILE_REQUIRED"})
                 return EmergencyExitExecutionResult("reconcile_required", "durable emergency intent unavailable", lifecycle.order_id)
             intent_id, intent_event_id = intent
+            timing["durable_intent_committed_ts"] = time.time()
+            self.store.record(lifecycle, reason="durable_emergency_intent_committed", extra={
+                "state": "EMERGENCY_CANCEL_SUBMITTED", "exit_intent_id": intent_id,
+                "execution_timing": timing,
+            })
             try:
+                timing["ioc_submit_ts"] = time.time()
                 result = self.gateway.place_price_protected_ioc_exit(
                     market=market, side_index=side_index, limit_price=fresh_plan.limit_price,
                     requested_shares=after_inventory,
@@ -299,6 +318,7 @@ class OutcomeEmergencyExitController:
                 self.store.record(lifecycle, reason=f"emergency_ioc_exception:{type(exc).__name__}", extra={"state": "RECONCILE_REQUIRED"})
                 return EmergencyExitExecutionResult("reconcile_required", "emergency_ioc_submission_failed", lifecycle.order_id)
             self._invalidate_account_reads()
+            timing["ack_ts"] = time.time()
             emergency_order_id = str(result.get("orderId") or "")
             if not emergency_order_id:
                 self.store.record(lifecycle, reason="emergency_ioc_missing_order_id", extra={"state": "RECONCILE_REQUIRED"})
@@ -312,6 +332,7 @@ class OutcomeEmergencyExitController:
                 "limit_price": str(fresh_plan.limit_price), "planned_executable_vwap": str(fresh_plan.executable_vwap),
                 "planned_net_return_pct": str(fresh_plan.net_return_pct), "order_type": "price_protected_fak_ioc",
                 "exit_intent_id": intent_id,
+                "execution_timing": timing,
             }, durable=True) is None:
                 raise RuntimeError("acknowledged emergency IOC ownership could not persist durably")
             if not self.store.finalize_submit_intent(

@@ -279,6 +279,17 @@ def run_integrated_hyperliquid_bot(
         )
         settlement_worker.start()
 
+    # A durable manifest makes a later incident reconstruction independent of
+    # terminal history: it states exactly which safety components this process
+    # loaded, their authority, and a non-secret configuration fingerprint.
+    if not live_execution.write_startup_manifest(settlement_ready=settlement_worker is not None):
+        logger.error("Unable to persist runtime safety startup manifest; live startup aborted fail-closed.")
+        if research_worker is not None:
+            research_worker.stop()
+        if settlement_worker is not None:
+            settlement_worker.stop()
+        raise RuntimeError("durable runtime safety startup manifest unavailable")
+
     dashboard_state = DashboardState(
         strike_price=0.0,
         spot_price=0.0,

@@ -41,6 +41,7 @@ class OutcomeEntryExecutionService:
         loss_reentry_gate: OutcomeLossReentryGate | None = None,
         record_result: Callable[..., LiveExecutionResult] | None = None,
         fast_risk_decision: Callable[..., tuple[bool, str, dict[str, object]]] | None = None,
+        safety_preflight: Callable[..., tuple[bool, str]] | None = None,
     ) -> None:
         self.recovery = recovery
         self.gateway = gateway
@@ -52,6 +53,7 @@ class OutcomeEntryExecutionService:
         self.loss_reentry_gate = loss_reentry_gate
         self.record_result = record_result
         self.fast_risk_decision = fast_risk_decision
+        self.safety_preflight = safety_preflight
 
     def preflight(
         self, *, snapshot: OutcomeRuntimeTickSnapshot,
@@ -64,6 +66,12 @@ class OutcomeEntryExecutionService:
         if snapshot.active:
             admission["account_gate"] = "existing_outcome_inventory_or_order"
             return LiveExecutionResult("blocked", "live strategy has existing Outcome inventory or order")
+
+        if self.safety_preflight is not None:
+            ready, reason = self.safety_preflight(outcome_id=snapshot.market.outcome_id)
+            admission["safety_readiness"] = {"ready": ready, "reason": reason}
+            if not ready:
+                return LiveExecutionResult("blocked", f"live strategy safety readiness: {reason}")
 
         if self.store is not None:
             pending = self.store.pending_ambiguous_submit(

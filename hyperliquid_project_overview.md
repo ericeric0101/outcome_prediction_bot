@@ -1128,3 +1128,63 @@ flowchart TD
 ---
 
 > **架構維護承諾**：本專案嚴格維持單一權威文件原則。所有量化邏輯調整、費率變更或執行策略更新，必須同步修訂本文件與對應單元測試。
+
+---
+
+## 2026-09-13 — Tail-risk foundation, runtime manifest, and parallel market-risk shadow (current)
+
+### Phase 0 verification — no duplicate execution implementation
+
+The active exit path already uses one durable ownership contract for all three SELL classes: first protective ALO SELL, E4 cancel-confirm-rebook replacement, and S3/fast-failure price-protected IOC.  A replacement or IOC records durable intent before the SDK mutation; ambiguous SDK acknowledgement creates an account-truth fence; only a matching owned SELL may later be adopted.  Therefore this phase did **not** add a second exit state machine.  The relevant characterization remains in `tests/test_outcome_exit_lifecycle.py` and runtime/lifecycle regression tests.
+
+E4/loss-band remains passive ALO repricing, not a guaranteed stop.  S3/fast-failure remains the only existing IOC authority, with its current full-depth, durable-intent, ambiguity-fence, and account-reconciliation contracts intact.  Nothing in the following Market Risk Monitor bypasses that boundary.
+
+### Runtime safety startup evidence and fail-closed new-entry readiness
+
+At startup, `OutcomeLiveExecutionRuntime` now writes one durable `OUTCOME_RUNTIME_STARTUP_MANIFEST`.  It records the runtime run id, git SHA/dirty state, optional non-secret deployment id, a **non-secret configuration hash**, and the loaded safety-component matrix (`enabled`, `authority`, `version`, `health`, `ready`, `safety_critical`).  Private keys, wallet values, tokens and URLs containing secret-like names are excluded from the fingerprint payload.
+
+Before a **flat** position may construct a new BUY, `OutcomeEntryExecutionService` checks every safety-critical component.  If a component such as account reconciliation, protective SELL ownership, entry/exit ambiguity fence, exit lifecycle/E4 controller, fast-failure/S3 controller, WS attachment, or portfolio guard is unavailable, new entry fails closed and a durable `OUTCOME_SAFETY_COMPONENT_NOT_READY` event is written.  It does not cancel an existing protective SELL or alter management of an existing holding.
+
+`OUTCOME_EXIT_SAFETY_GATE_DECISION` is transition-only evidence for loss-band, fast-failure and S3 eligibility.  It captures the changed reason, position age, executable PnL, reversal state/count, loss-band state and book state without emitting a row on every tick.  It is audit telemetry, never a new authorization.
+
+### WS observations and parallel Market Risk Monitor — shadow only
+
+`OutcomeStreamHealth.fresh_book_top()` now exposes top-1 as well as top-3 bid depth from healthy in-memory WS L2.  The hot path does not add REST reads for this observer.
+
+`bot/outcome_market_risk_monitor.py` takes only an owned lifecycle, immutable entry facts, healthy WS BBO/depth, time-left and existing thesis/reversal evidence.  It yields one of:
+
+```text
+NORMAL
+RISK_COMPRESSION_SHADOW
+HARD_CAPITAL_PROTECTION_SHADOW
+```
+
+with `would_compress_target`, `would_aggressively_reprice`, and `would_freeze_additional_exposure` as hypothetical actions.  Every output has `read_only=true`, `live_authority=false`, and `execution_submitted=false`.  The module imports no account client, SDK, gateway, controller, cancel primitive, or IOC primitive.  It writes `OUTCOME_MARKET_RISK_MONITOR_SHADOW` only on state transitions or the compact crash-shadow cadence.  It must remain parallel to thesis/reversal monitoring: market dislocation can be economically dangerous even before three-source directional reversal is confirmed, but it has no live action authority in this release.
+
+### Exit latency, RiskEpisode and stress sizing
+
+`scripts/outcome_exit_latency_report.py --db logs/outcome_shadow.db` is a read-only chain report.  It reports only recorded risk decision/lifecycle milestones and explicitly compares p90 with the historical #2437 `-5% → -10%` window of about 11 seconds.  Missing milestones are reported as missing evidence; the report never fabricates a completed IOC/fill sequence.  Until a complete observed chain has a compatible p90, any Stage-2 capital-protection candidate is blocked.
+
+`OutcomeRiskEpisodeStore` provides a durable, bounded episode record (`episode_id`, opened time, trigger family, severity, attempts and recovered close) for the **existing** fast-failure/S3 controller.  It is explicitly disabled by default with `OUTCOME_RISK_EPISODE_BUDGET_ENABLED=0`.  When enabled, an ambiguous/reconcile-required exit consumes one conservative attempt within the same episode; recovery (best executable bid within 2% of entry and no confirmed reversal) closes that episode, so a later new severe deterioration can receive a fresh bounded budget.  It never adds an IOC path or removes the existing full-depth/intent/reconciliation checks.
+
+`OutcomeStressExitabilitySizer` is also disabled by default (`OUTCOME_STRESS_EXITABILITY_ENABLED=0`).  If deliberately enabled, it applies explicit 10%/15% visible-depth haircuts and sets:
+
+```text
+submitted_shares = min(desired_shares, existing_capacity_safe_shares, stress_safe_shares)
+```
+
+It can only reduce size; an invalid policy, missing/insufficient depth, or stress-safe size below the official venue minimum rejects the entry.  It is an entry-size safety ceiling, **not** a forecast that future liquidity will exist at either stressed price.  The audit preserves desired, existing capacity-safe, stress-safe and submitted shares.
+
+### Diagnostic and promotion contract
+
+`scripts/outcome_tail_diagnostic_report.py --db logs/outcome_shadow.db` is a multivariate, read-only diagnostic joining lifecycle-bound holding paths, crash shadow and market-risk monitor evidence.  It intentionally does not optimize a threshold, train ML, or promote an individual tail observation.
+
+Stage 1 remains the read-only risk-compression shadow.  Stage 2 remains shadow/backtest only and may not be made live merely because a state appears.  A future candidate must pass all of the following before a separately authorized canary is even proposed:
+
+1. Tail rescue at the actual trigger time with full inventory executable inside its cap.
+2. Known recover-winner preservation, including #2639; a candidate that hard-exits it fails.
+3. At least 15–20 **independent daily markets**, not snapshot rows.
+4. Positive net counterfactual value after fees/slippage, material tail capital-hour reduction, and acceptable false-exit cost.
+5. Observed exit latency compatible with the risk window, plus verified ambiguity/recovery behavior.
+
+No OI gate, Tier A/B definition, 125bps entry-spread ceiling, `$20` cap, fair-value promotion, dynamic IOC entry, or live hard-invalidation trigger was changed by this foundation work.
