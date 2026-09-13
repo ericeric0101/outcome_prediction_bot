@@ -1,7 +1,7 @@
 # Hyperliquid Outcome (HIP-4) BTC Daily Prediction Market Trading Bot — Current Authority
 
-> **權威架構版本 (Authority Version)**：2.2.7 (Outcome-only, durable settlement evidence)
-> **建立與審計日期**：2026-08-23；最近修訂：2026-09-10
+> **權威架構版本 (Authority Version)**：2.3.0 (Outcome-only, typed execution-domain services)
+> **建立與審計日期**：2026-08-23；最近修訂：2026-09-13
 > **目標系統**：Hyperliquid HyperCore L1 原生預測市場 — Outcome (HIP-4 協議標準)  
 > **單一權威聲明**：本文件取代原 `project_overview.md`，為系統唯一的設計、架構、量化模型與執行權威規範。
 
@@ -14,11 +14,11 @@
 下列為現行 live path 的規格；本節優先於任何較早的 migration history 或舊模組名稱。
 
 1. **`REDUCE_ONLY` 仍完整管理既有倉位。** 到期 tail 禁止所有新 BUY，但會先以 account truth 找到並 `cancel → invalidate cache → re-read open orders → confirm absent` 每個 bot-owned BUY remainder；隨後仍執行已持倉的 protective SELL、TP/loss-band rebook、reversal 觀測及受限 emergency exit。資料 stale 不得阻擋這些減風險動作；無法確認取消時進入 `RECONCILE_REQUIRED`，絕不假裝已取消。
-2. **所有 execution lanes 共用取消確認原語。** `bot/outcome_order_mutation.py:cancel_and_confirm` 是 entry rebook、exit rebook、maker partial-fill cleanup、emergency、rollover、reduce-only 與 graceful shutdown 的唯一取消語意。SDK transport acknowledgement 或 local cache 移除都不是取消證據；只有 fresh `frontendOpenOrders` 不再出現 oid 才可進行下一個 mutation。
+2. **所有 execution lanes 共用取消確認原語。** `bot/outcome_order_mutation.py:cancel_and_confirm` 是 entry rebook、exit rebook、maker partial-fill cleanup、emergency、rollover、reduce-only 與 graceful shutdown 的唯一取消語意。SDK transport acknowledgement 或 local cache 移除都不是取消證據；穩態監看可讀取同連線內已經 REST 完全交叉驗證的 user-specific `openOrders` WS full snapshot，但每次 cancel 前與 cancel 後都強制繞過快取讀取 fresh `frontendOpenOrders`，只有後者不再出現 oid 才可進行下一個 mutation。
 3. **TP 目標只可縮窄。** volatility-derived initial target 進入 1h／2h holding tiers 時採 `min(current_target, tier_cap)`；低波動的 +1–2% target 永遠不可被時間 tier 擴大為 +3%。
 4. **Emergency IOC 不是保證止損。** 它是 verified inventory、fresh full-depth、fee-inclusive loss cap 下的一次 price-protected FAK/IOC 嘗試。IOC 後必須立刻以 account inventory 對帳：flat 才記 `CLOSED`；partial/zero fill 則記 `EMERGENCY_RESIDUAL`、回到 protective passive lifecycle，並最多保留 **兩次** confirmed IOC attempts。深度不足於 loss cap 時仍會 block，故二元合約的最壞結算損失不受 -12% IOC limit 保證。
 5. **Live preflight fail-closed。** live mode 必須同時證明可選 daily market 的雙側 L2 與 BTC mark，並通過 official SDK sidecar health；任何 API exception、缺 book 或 sidecar 不可用均返回 false，不能輸出可交易的 `PASSED`。
-6. **Crash window 以 durable pre-submit intent 收斂。** 新 BUY 在 SDK mutation 前以 SQLite `synchronous=FULL` 寫入 exact wallet/outcome/coin/price/shares/policy audit 的 `OUTCOME_ORDER_INTENT`；寫入失敗即不送單。重啟時只可將一張同 coin、同 price、同 shares 的 open BUY 採納為該 intent。官方 SDK 尚未在本 repo 驗證 client order id/idempotency key，故這是 restart recovery safety fence，不得宣稱能消除多 host 同 wallet 的 submit race；同 wallet live writer 仍只能一個。
+6. **Crash window 以 durable pre-submit intent 收斂。** BUY 與所有 SELL mutation（首次 protective ALO、cancel-confirm replacement ALO、price-protected IOC）都必須在 SDK mutation 前以 SQLite `synchronous=FULL` 寫入 exact wallet/outcome/coin/side/price/shares/order-kind 的 `OUTCOME_ORDER_INTENT`；寫入失敗即不送單。SELL intent 必須由 durable acknowledged/rejected finalization 或 account-truth resolution 關閉；因此即使 process 在寫 ambiguity event 前已 crash，單獨留下的 unresolved intent 也會形成 fence。ACK 不明時另寫 durable ambiguity evidence，後續只可由 fresh account truth 採納唯一且同 coin/side/price/remaining-shares 的 resting order，或在 visibility fence 後由 order absence + inventory 證據解除。ambiguous IOC 保守計入 bounded attempt budget；未解除前不得再做 exit mutation。官方 SDK 尚未在本 repo 驗證 client order id/idempotency key，故這是 restart recovery safety fence，不得宣稱能消除多 host 同 wallet 的 submit race；同 wallet live writer 仍只能一個。
 7. **Outcome coin canonicalization。** inventory 來源 `+<asset>` 與 book/order 來源 `#<asset>` 先 canonicalize 為 `#<asset>` 後才做 risk/exposure/recovery 判斷；unknown malformed coin 仍 fail-closed。
 8. **唯一 live execution path 與可診斷 sidecar。** legacy `bot/execution/outcome_execution.py` 與其測試已刪除；唯一 mutation path 為 `OutcomeLiveExecutionRuntime → OutcomeExecutionGateway → official TypeScript SDK sidecar`。sidecar stderr 寫入 bounded rotating `logs/outcome_sdk_sidecar.stderr.log`（2 MiB + 一個 rollover），不再丟棄 crash diagnostics。Telegram polling/control code 已完全移除；沒有 `/pause` 或 `/flatten` 這類會誤稱為 kill switch 的控制面。
 
@@ -33,6 +33,31 @@
 本輪驗證：完整 Python regression **304 passed**，official SDK sidecar TypeScript build 通過。已加入 sidecar execution-timeout 的 fake-transport regression、handler restoration、second-Ctrl-C WS teardown 與 ambiguous durable fence；後續仍值得補 process-level SIGTERM（真實 child/venue fake）與 child-death/restart integration。
 
 **架構維護狀態。** `OutcomeLiveExecutionRuntime` 仍是 orchestration boundary，但不可再新增分散的 exchange mutation；本輪已抽出 canonical coin 與 single order-mutation modules，並把 entry/exit/requote/emergency/lifecycle 保持為獨立 components。完整目錄重整為 domain/risk/runtime packages 是非功能性技術債，必須在不改變上述 state-transition contract 的獨立變更中進行，不能作為繞過測試或修改 live strategy 的理由。
+
+### 2026-09-13 exit ambiguity audit disposition
+
+本輪重新逐條 trace 最新 live path，並查詢 `logs/outcome_shadow.db`。資料庫尚無 `OUTCOME_ORDER_AMBIGUOUS_SUBMIT`、`OUTCOME_EXIT_ORDER_AMBIGUOUS_SUBMIT` 或 resolution 歷史列，因此目前沒有證據顯示主網已發生此事故；但 transport timeout 發生在 venue mutation 之後、ACK 之前，單靠歷史上尚未觀察到不能證明安全，故以下屬 code-path 可證實的 preventive fix。
+
+1. **Exit ambiguity gap：接受並已修。** audit 正確指出 replacement ALO 與 emergency IOC 原本把 `OutcomeSdkAmbiguousExecutionError` 落入 generic exception；進一步 trace 也發現首次 protective ALO 有同一缺口。三條 SELL path 現在都採 `durable intent → venue mutation → durable acknowledged ownership/finalization`。ACK 遺失會寫 `OUTCOME_EXIT_ORDER_AMBIGUOUS_SUBMIT`；若恰好在 intent 後、ambiguity event 前 crash，unfinalized intent 本身仍是 fence。runtime 在任何後續 holding/requote/IOC 前先強制 account reconciliation，未解決即整條 exit mutation lane fail-closed。resting ALO 只可由 exact price、coin、side 與 reconciled remaining inventory 唯一匹配後採納並補寫 canonical submit/lifecycle；IOC 或已成交 ALO 只可由 inventory 減少證明執行，無 order/無 fill 則至少等 15 秒 visibility fence 才解除。若出現不相符的其他 SELL，系統不會把它冒認為 bot-owned order，仍維持人工 reconciliation。
+2. **兩套 exit state machine：風險描述合理，但「`.env` 漏旗標會讓正式 live 靜默回退」不成立。** 支援的 `launcher --live` 在進入 live 前固定設定 `OUTCOME_EXIT_REQUOTE_ENABLED=1`；因此正式路徑不由 `.env` 任意選擇舊／新 controller。maker 內保留的 one-shot branch仍是 generic/calibration 相容層與 regression surface，不是 live fallback。日後可以刪除，但必須先把 calibration contract 遷到唯一 controller；在沒有等價測試前直接移除反而可能破壞既有持倉保護。文件與 runtime 必須持續禁止新增第二個可由部署設定切換的 mutation authority。
+3. **God object：原 audit 對 2,329 行 runtime 的判讀正確；所列下一階段已於 2026-09-13 執行。** immutable tick/result types、exit reconciliation/ambiguity、entry preflight/resting-BUY 管理與新 BUY mutation、首次 protective SELL/persisted exit、fast-failure/S3，以及 E4/E5 passive requote 均已有 typed domain service；supervisor 不再 callback 至 runtime 內的上述 mutation helpers。詳見下方 F4.1。初始 BUY 的 sizing/admission policy 計算及 mutation-free research/holding feature capture 仍在 facade，故不得宣稱 god object 已完全消失。
+4. **同步 SQLite hot path：接受為 residual structural debt，不接受「已證明造成目前財務錯誤」。** per-tick memoization 只消除同 tick 重複 read；decision-critical recovery、loss re-entry、portfolio guard 與 durable ownership仍會同步讀 journal。現有 index、WAL、tick-scoped view，以及 user-specific open-order WS 已減少讀取與 REST 壓力，但不是完整移除。資料庫的 loop-timing rows只證明應持續量測，未建立 SQLite read 與漏單／錯單的因果。後續安全方向是建立每 tick immutable journal/account read model，讓普通 policy read 使用同一 snapshot；`synchronous=FULL` pre-mutation intent、ambiguity fence、ownership/fill reconciliation不可改成非同步 best-effort write。
+5. **Shared 429 cooldown：audit 判讀正確，且現行版本已再收斂。** cooldown 以 venue+wallet class-level 共享並尊重 `Retry-After`；穩態 `frontendOpenOrders` 已改為 REST cross-validated user-specific WS full snapshot，REST 保留 mutation 前後與週期 reconciliation。這不是取消 venue rate limit，也不得把 public `api-ui` 或未文件化 stream 當 account truth。
+
+**本輪 safety scope。** 本次只修 execution ambiguity 與其 durable audit，不改 signal、spread、size、profit target、loss cap、IOC 授權條件或 live ML authority。針對 initial protective/replacement/IOC ambiguity、intent-only crash fence、exact adoption、manual-order refusal、attempt accounting 與既有 execution paths 的 Python regression 已納入後續完整 suite；截至 F4.1 為 **333 passed**。official sidecar TypeScript build 與 `git diff --check` 同步通過。
+
+### F4.1 — typed execution-domain ownership（2026-09-13）
+
+此階段延續 F4 的 characterization-first 拆分，沒有修改任何 signal、spread、entry price、shares、target、loss threshold、ALO/IOC 權限或 portfolio limit。`OutcomeLiveExecutionRuntime` 由 audit 時的 **2,329 行降為 1,752 行**；行數只作結果佐證，真正驗收條件是每個 mutation/recovery contract 只有一個 owner：
+
+1. `outcome_runtime_types.py` 定義 frozen `OutcomeRuntimeTickSnapshot` 與共用 `LiveExecutionResult`，避免 supervisor 與 facade 各自解讀可變 tick state。
+2. `OutcomeExitRecoveryService` 獨立擁有 SELL lifecycle reconciliation、exact adoption、inventory-based IOC resolution 與 unresolved ambiguity barrier；runtime 已刪除舊的同名邏輯。
+3. `OutcomeEntryExecutionService` 擁有 fail-closed entry preflight、ambiguous BUY adoption/fence、resting BUY 的 ownership recovery/fast-risk/interval requote/fresh-book cancel-confirm，以及新 BUY 的 `durable intent → SDK mutation → ambiguity finalization → accepted-order audit`。facade 只產生已通過 sizing、risk、portfolio 與 policy gate 的 prepared submission；下一個策略可以替換其 decision policy，但不得繞過 execution service 的 durable contract。
+4. `OutcomeHoldingExecutionService` 擁有 partial/full entry fill 後的 BUY remainder cancel-confirm、第一張 protective ALO SELL，以及 persisted generic/P3 exit dispatch。
+5. `OutcomeHoldingRiskService` 是 fast-failure 與 S3 的唯一 policy-to-controller owner，保留先做本地 age/reversal gate、再讀 fee/L2、最後一次 price-protected IOC 與 official-fill reconciliation的既有語義；runtime 內的重複實作已刪除。
+6. `OutcomeExitRequoteService` 是 E4/E5 passive protective SELL 的唯一 owner，包含 WS-BBO/REST fallback、thesis-aware loss-band 授權、單次 canary 與 cancel-confirm-rebook。stream-health 以動態 provider 注入，避免 runtime 後續替換 health instance 時 service 持有 stale reference。
+
+supervisor 目前仍負責不可交換的順序：`protect → read-only holding observations → fast-failure → S3 → resting-BUY management`，stream gate 後再 `passive requote → persisted exit`。剩餘 structural debt 是初始 BUY 的 pure policy/sizing 組裝與 mutation-free feature capture；它們不得直接新增 exchange mutation。完整 Python regression **333 passed**；後續策略 milestone 應直接產生 prepared decision 並依賴上述 service port，而不是向 1,752 行 facade 加入另一套 exit/entry state machine。
 
 ---
 
@@ -531,7 +556,13 @@ X3 是離線建構，沒有網路或交易呼叫；同一 schema/source snapshot
 
 **Execution cadence 語意（校正 2026-09-05）：** launcher 正常 live 外層的目標 refresh interval 是 **1.5 秒**；WebSocket 收到的 L2 更新由獨立 async loop 即時寫入 cache，並非每 2–4 分鐘才接收。然而它不是每 1.5 秒保證完成一個 live decision：同一主 loop 中的 account reconciliation、fills、fees、REST book、official settlement/payout evidence 與 SDK retry 都是同步呼叫，任何慢呼叫會拉長該次 loop。故 terminal 相隔 2–4 分鐘的 `[LIVE OUTCOME RUNTIME]` 不是純 log 節流，而是當時的 strategy invocation 確實被阻塞；WS cache 可仍持續更新，但新 entry／一般 reprice 只能在主 loop 回來後送出。本修正把最危急的「已成交 BUY 殘單 → 初始 protective SELL」變成單一 invocation 內的連續 cancel-confirm-fresh-book-sell，不再依賴下一個 loop。此處的 **fresh-book tick** 不代表固定等待秒數：指 cancel confirmation 後立刻完成的一次新的 REST L2 fetch，延遲為該次 API round-trip，而不是既定 2–4 分鐘或 P3 約 7.6 秒 research cadence。
 
-**/info 429 cadence repair（2026-09-12）：** 實盤 log 證明 L2 coalesced wake-up 會讓完整主決策在約 0.3–0.8 秒重複執行，並在 flat 時每輪讀 `userFills`；加上 research/settlement workers 後觸發 `/info` 429。WS 仍即時更新 public cache，但主策略恢復為最短 **1.5 秒** cadence，不因每一筆 L2 update 立刻重跑 account recovery。flat 且無 owned entry lifecycle 時，official fills 最多每 15 秒讀一次；已有 inventory、retiring exposure 或 owned-entry visibility fence 則每輪照常讀取，不能犧牲 duplicate-fill safety。venue 429 的 shared cooldown 現涵蓋所有 `/info` type（含 L2/meta），以 venue base URL 為 scope；cooldown 期間不送任何新 read、當輪 fail-closed。429/cooldown terminal 訊息最多每 30 秒一則，真正非 429 exception 才保留 ERROR。這不是放寬任何市場資料或 execution gate；fresh REST book 在 mutation/cancel-confirm 路徑仍不可替換為 WS cache。
+**/info 429 cadence repair（2026-09-12；22:39 follow-up）：** 實盤 log 證明 L2 coalesced wake-up 會讓完整主決策在約 0.3–0.8 秒重複執行，並在 flat 時每輪讀 `userFills`；加上 research/settlement workers 後觸發 `/info` 429。第一版雖恢復 1.5 秒策略 cadence與 shared 1 秒 cooldown，但 22:39 的主網證據顯示 stable resting SELL 仍每輪下載 `spotClearinghouseState + frontendOpenOrders + userFills`。依官方 IP rate weights，三者最低為 `2 + 20 + 20 = 42`，光 live lane 即約 1,680 weight/min，確定超過 1,200/min ceiling；故第一版只能短暫止住 retry storm，不能消除根因。
+
+第二版保留每 1.5 秒 balances/open-orders reconciliation，但高權重 `userFills` 在 healthy `buy_resting`／`protected_inventory`／flat 狀態改為 30 秒 cadence；一旦出現 `unprotected_inventory`、conflicting/orphan order，或 durable owned submit 從 account snapshot 消失，當輪仍強制 fresh fills，不延遲 protective SELL 或 ambiguous-submit fence。research fill ingestion 同步由 15 秒改為 30 秒；settlement/payout worker 由 30 秒改為 60 秒，兩者都是事後 audit/accounting cadence，不具有交易 mutation 權限。venue 429 若沒有 `Retry-After`，所有同 process clients 共用 2/4/8/15 秒遞增 cooldown；連續 60 秒無新 429 才重置 strike。raw HTTP 429 由 client 每 30 秒至多輸出一則 WARNING，launcher 不再重複印成 ERROR；真正非 429 exception 仍保留 ERROR。WS public cache、fresh REST mutation book、cancel-confirm 與 mutation 後 account readback 全部不變。
+
+**第三版 user-order WS 穩態監控（2026-09-12；本次實作）。** `OutcomeClient` 在既有單一重連 WS 上新增 wallet-specific `{type: "openOrders", user, dex: "ALL_DEXS"}` subscription；`OutcomeWebSocketRecorder` 將 full snapshots 只保存在記憶體，不複製進 multi-GB journal。新 `OutcomeOpenOrdersStreamCache` 預設不可信：同一 connection generation 內必須先收到 WS snapshot，且與 fresh `frontendOpenOrders` 的 `oid/coin/side/size/limitPx` 集合完全相同後，`OutcomeAccountReadCache` 才可在穩態 tick 讀 WS。啟動、disconnect/reconnect、snapshot mismatch、60 秒週期到期及任何 submit/cancel/IOC mutation 都清除信任並強制回到 REST；新的 ALO submit 前亦強制 REST 並在發現新出現 order 時 fail closed。cancel primitive 則在 mutation 前與後各保留 REST truth，沒有 preflight order 時不盲目 cancel。account timing audit 新增 `ws_hits`，可由 `OUTCOME_RUNTIME_TIMING.account_read_timing.get_open_orders_sync` 區分穩態 WS 與真實 network calls。以 1.5 秒決策 cadence 計算，healthy account lane 的理論最低值由第二版約 **920 weight/min**（spot 80 + open orders 800 + fills 40）降至約 **140 weight/min**（spot 80 + 60 秒 open-order reconciliation 20 + 30 秒 fills 40）；此估算不含 market discovery、research、settlement、重連與 mutation burst，也不是 venue latency 保證。
+
+第三版 regression 覆蓋 connection-generation fence、首次 REST equality、後續 full-snapshot 更新、60 秒 expiry、wallet/malformed/mismatch rejection、mutation/reconnect invalidation、WS 不落 raw journal、cancel 前後 forced REST 及 submit 前新出現 order block；完整 Python suite **325 passed**、`compileall`、`git diff --check` 與 official SDK sidecar TypeScript build 均通過。首次 live 重啟後仍須由 timing audit 確認 `ws_hits` 持續增加且 429/REST network calls 降低；fixture 成功不是主網 WS delivery 或 rate-limit 改善的替代證據。
 
 **F4 — live runtime god-object decomposition（六項完成；2026-09-12）：** 本次是保持交易語意的結構重構，不改 entry signal、$20 sizing、ALO/IOC 權限、S3/fast-failure threshold、spread gate 或 portfolio guard。`OutcomeLiveExecutionRuntime` 仍是唯一 live facade 與 exchange-mutation owner，但 `_tick_live_strategy` 不再自行交錯所有研究、持倉與 entry precedence；新增 `bot/outcome_runtime_supervisors.py` 與 `bot/outcome_runtime_journal_view.py` 建立以下正式邊界：
 
@@ -579,7 +610,7 @@ X3 是離線建構，沒有網路或交易呼叫；同一 schema/source snapshot
 2. **holding-path 降為固定 5 秒 research cadence。** `OUTCOME_HOLDING_PATH_OBSERVATION` 是低頻風控研究資料，不是下單觸發；正常 managed holding 最多每 5 秒寫一次，而不是每個 1.5 秒策略 turn 都讀 REST/寫 journal。該固定常數不暴露為 `.env` 參數。
 3. **S3 local-first preflight。** 未達 2 小時 holding、20 分鐘 passive loss-band、三個獨立 reversal observations／2 分鐘 duration，或已使用 emergency token 時，S3 直接 KEEP；不得再讀 taker fee 或 L2。只有所有本地必要門檻都成立才取得 fee、共用 L2，且真正 IOC controller 仍於 cancel confirm 後 fresh-REST revalidate。
 4. **healthy WS 只可快速 KEEP。** WS recorder 現把 healthy active coin 的 top BBO 暫存於 stream health；當它足以讓 ordinary exit planner 判定 KEEP 時，可避免第二次相同 REST fetch。WS 缺值、stale、resync、任何 `CANCEL_REPLACE`／`BLOCK` 或 S3 執行一律回到 REST；WS 永不直接授權 cancel、rebook 或 IOC。
-5. **account/lifecycle 與告警語意。** recovery、lifecycle reconciliation 與 fill sync 在同一 invocation 繼續使用既有 `OutcomeAccountReadCache`，相同 open-orders/spot/fills 不重讀；所有 submit/cancel/IOC 後立即 invalidate，下一個確認一定取 exchange truth。跨 tick 不快取帳戶真相，故外部 fill 仍會在下輪被看見。每個 >3 秒 turn 仍完整寫 `OUTCOME_LOOP_TIMING` 供 DB 稽核；terminal 的 identical slow-loop warning 改為最多每 30 秒一次摘要，避免掩蓋真正 state transition。這不改策略、不降低 stale/fill-race 防護，也不表示 venue latency 已被保證改善。
+5. **account/lifecycle 與告警語意。** recovery、lifecycle reconciliation 與 fill sync 在同一 invocation 繼續使用既有 `OutcomeAccountReadCache`，相同 open-orders/spot/fills 不重讀；所有 submit/cancel/IOC 後立即 invalidate。自 2026-09-12 起，只有同一連線內經 fresh REST 完全交叉驗證、未逾 60 秒且未經 mutation 的 user-specific `openOrders` full snapshot 可跨 tick 作穩態 order monitoring；balances、fills 及所有 mutation 前後確認仍取 REST/exchange truth，故外部 order 變動可由 WS 即時看到，外部 inventory/fill 則仍由既有 REST cadence 對帳。每個 >3 秒 turn 仍完整寫 `OUTCOME_LOOP_TIMING` 供 DB 稽核；terminal 的 identical slow-loop warning 改為最多每 30 秒一次摘要，避免掩蓋真正 state transition。這不改策略、不降低 stale/fill-race 防護，也不表示 venue latency 已被保證改善。
 
 **F6 verification。** 新增 healthy WS BBO 只能提供 KEEP hint、managed sell 不因 KEEP 再讀第二張 REST book、以及 young S3 candidate 不讀 fee/L2 的 regression；保留 S3 cancel-confirm-fresh-book-IOC、exit controller、WS health、account cache 與 runtime 全部既有測試。完整 Python suite **509 passed**、`py_compile` 與 `git diff --check` 通過。
 
@@ -1018,8 +1049,15 @@ flowchart TD
 ├── bot/
 │   ├── launcher.py                         # 唯一 live 入口與 typed confirmation
 │   ├── outcome_live_execution_runtime.py   # live facade / atomic execution ports
+│   ├── outcome_open_orders_stream.py        # REST-cross-validated user openOrders WS cache
 │   ├── outcome_runtime_supervisors.py       # entry / holding / research ordering
+│   ├── outcome_runtime_types.py             # immutable tick/result contracts
 │   ├── outcome_runtime_journal_view.py      # per-tick read-only SQLite view
+│   ├── outcome_entry_execution_service.py   # entry preflight / resting-BUY ownership and requote
+│   ├── outcome_exit_recovery_service.py     # SELL ambiguity reconciliation / fail-closed fence
+│   ├── outcome_holding_execution_service.py # fill cleanup / first protective and persisted SELL
+│   ├── outcome_holding_risk_service.py      # fast-failure / S3 bounded IOC dispatch
+│   ├── outcome_exit_requote_service.py      # E4/E5 passive protective SELL repricing
 │   ├── outcome_maker_state_machine.py      # ALO buy/sell state transitions
 │   ├── outcome_execution_gateway.py        # 唯一 SDK mutation boundary
 │   ├── outcome_settlement_worker.py        # 獨立唯讀 settlement/payout evidence worker

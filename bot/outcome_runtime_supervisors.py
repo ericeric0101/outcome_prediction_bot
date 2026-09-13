@@ -7,25 +7,11 @@ research, holding and entry concerns from growing one monolithic tick method.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Any
 
 from bot.lifecycle.outcome_lifecycle import OutcomeMarketSpec
 from bot.outcome_live_strategy import OutcomeLiveStrategyConfig
-
-
-@dataclass(frozen=True)
-class OutcomeRuntimeTickSnapshot:
-    """Immutable authoritative facts shared by one strategy decision."""
-
-    market: OutcomeMarketSpec
-    report: Any
-    active: tuple[Any, ...]
-    pending_owned_entry: bool
-    entry_side_index: int | None
-    entry_reason: str
-    reduce_only: bool
-    observed_monotonic: float
+from bot.outcome_runtime_types import OutcomeRuntimeTickSnapshot
 
 
 class OutcomeResearchSupervisor:
@@ -68,7 +54,7 @@ class OutcomeHoldingSupervisor:
         if len(snapshot.active) != 1:
             return None
         finding = snapshot.active[0]
-        result = runtime._cancel_filled_entry_and_place_protection(
+        result = runtime.holding_execution_service.protect_after_fill(
             market=snapshot.market, finding=finding,
         )
         if result is not None:
@@ -90,17 +76,15 @@ class OutcomeHoldingSupervisor:
             )
             self._last_path_capture_at[holding_key] = now
 
-        result = runtime._maybe_fast_failure_exit(market=snapshot.market, finding=finding)
+        result = runtime.holding_risk_service.maybe_fast_failure(market=snapshot.market, finding=finding)
         if result is not None:
             return result
-        result = runtime._maybe_emergency_exit(market=snapshot.market, finding=finding)
+        result = runtime.holding_risk_service.maybe_emergency(market=snapshot.market, finding=finding)
         if result is not None:
             return result
         if not snapshot.reduce_only:
-            return runtime._maybe_requote_entry_buy(
-                market=snapshot.market, finding=finding,
-                entry_side_index=snapshot.entry_side_index,
-                entry_reason=snapshot.entry_reason, config=config,
+            return runtime.entry_execution_service.manage_resting_buy(
+                snapshot=snapshot, config=config,
             )
         return None
 
@@ -108,10 +92,12 @@ class OutcomeHoldingSupervisor:
         if len(snapshot.active) != 1:
             return None
         finding = snapshot.active[0]
-        result = runtime._maybe_requote_p3_exit(market=snapshot.market, finding=finding)
+        result = runtime.exit_requote_service.maybe_requote(market=snapshot.market, finding=finding)
         if result is not None:
             return result
-        return runtime._advance_persisted_p3_exit(market=snapshot.market, finding=finding)
+        return runtime.holding_execution_service.advance_persisted_exit(
+            market=snapshot.market, finding=finding,
+        )
 
 
 class OutcomeEntrySupervisor:
@@ -121,61 +107,6 @@ class OutcomeEntrySupervisor:
         self, runtime: Any, *, snapshot: OutcomeRuntimeTickSnapshot,
         admission: dict[str, object], config: OutcomeLiveStrategyConfig,
     ) -> Any | None:
-        if not bool(getattr(snapshot.report, "safe_for_new_entry", False)):
-            return runtime._result("blocked", f"account recovery blocked live strategy: {getattr(snapshot.report, 'reason', 'unknown')}")
-        if snapshot.active:
-            admission["account_gate"] = "existing_outcome_inventory_or_order"
-            return runtime._result("blocked", "live strategy has existing Outcome inventory or order")
-
-        store = runtime.entry_lifecycle_store
-        if store is not None:
-            pending = store.pending_ambiguous_submit(
-                wallet=runtime.recovery.wallet, outcome_id=snapshot.market.outcome_id,
-            )
-            if pending is not None:
-                try:
-                    open_orders = runtime.recovery.account.get_open_orders_sync(runtime.recovery.wallet)
-                    adopted = None
-                    for coin in (snapshot.market.yes_coin, snapshot.market.no_coin):
-                        candidate = store.recover_or_adopt_audited_submit(
-                            wallet=runtime.recovery.wallet, outcome_id=snapshot.market.outcome_id,
-                            coin=coin, open_orders=open_orders,
-                        )
-                        if candidate is not None:
-                            adopted = candidate
-                            break
-                except Exception:
-                    adopted = None
-                admission["ambiguous_submit_fence"] = {
-                    "blocked": True, "intent_id": pending.get("intent_id"),
-                    "recovered_order_id": adopted.order_id if adopted is not None else None,
-                }
-                if adopted is not None:
-                    return runtime._result(
-                        "blocked", "ambiguous prior entry adopted; refreshing account truth before any new action",
-                        adopted.order_id,
-                    )
-                return runtime._result(
-                    "blocked", "ambiguous prior entry submission; reconciliation required before any new entry",
-                )
-        if snapshot.reduce_only:
-            admission["reduce_only_gate"] = "new_entries_prohibited"
-            return runtime._result("flat", "reduce-only: no live exposure after entry cancellation")
-        if snapshot.entry_side_index not in (0, 1):
-            admission["signal_gate"] = "no_directional_signal"
-            return runtime._result("flat", f"live strategy no entry: {snapshot.entry_reason}")
-
-        admission["selected_side_index"] = snapshot.entry_side_index
-        admission["selected_coin"] = runtime.machine.gateway.outcome_coin(snapshot.market, snapshot.entry_side_index)
-        if store is not None:
-            cooldown = store.fast_rebook_cooldown_remaining(
-                wallet=runtime.recovery.wallet, outcome_id=snapshot.market.outcome_id,
-                coin=str(admission["selected_coin"]),
-                cooldown_sec=runtime.entry_planner.config.fast_rebook_cooldown_sec,
-            )
-            admission["entry_fast_rebook_cooldown_remaining_sec"] = round(cooldown, 3)
-            if cooldown > 0:
-                return runtime._result(
-                    "flat", f"live strategy no entry: fast_risk_rebook_cooldown ({cooldown:.1f}s remaining)",
-                )
-        return None
+        return runtime.entry_execution_service.preflight(
+            snapshot=snapshot, admission=admission, config=config,
+        )

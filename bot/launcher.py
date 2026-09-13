@@ -11,6 +11,8 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import httpx
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
@@ -273,7 +275,7 @@ def run_integrated_hyperliquid_bot(
             account=OutcomeClient(auth, timeout_sec=10.0, info_max_retries=3),
             settlement_adapter=OutcomeSettlementAdapter(),
             pnl_reconciler=OutcomePnLReconciler(live_journal, f"outcome-pnl-{uuid.uuid4().hex[:10]}"),
-            journal=live_journal,
+            journal=live_journal, interval_sec=60.0,
         )
         settlement_worker.start()
 
@@ -365,6 +367,7 @@ def run_integrated_hyperliquid_bot(
                             client, live_journal, f"outcome-live-ws-{uuid.uuid4().hex[:10]}",
                             pricing_state=pricing,
                         )
+                        live_execution.set_open_orders_stream(live_ws_recorder.open_orders_cache)
                     live_ws_recorder.start(outcome_id=market.outcome_id, yes_coin=market.yes_coin, no_coin=market.no_coin)
                     live_execution.stream_health = live_ws_recorder.health
                 except Exception as e:
@@ -514,6 +517,14 @@ def run_integrated_hyperliquid_bot(
                         if time.time() - last_info_cooldown_warning_at >= 30.0:
                             last_info_cooldown_warning_at = time.time()
                             logger.warning(f"Outcome live runtime rate-limited fail-closed: {e}")
+                    except httpx.HTTPStatusError as e:
+                        # OutcomeClient already emits one throttled warning
+                        # and establishes the shared cooldown for a real 429.
+                        # Repeating it here as ERROR on every bounded tick
+                        # made a correctly fail-closed transient look like an
+                        # unhandled runtime failure.
+                        if e.response.status_code != 429:
+                            logger.error(f"Outcome live runtime failed closed: {e}")
                     except Exception as e:
                         logger.error(f"Outcome live runtime failed closed: {e}")
                     finally:

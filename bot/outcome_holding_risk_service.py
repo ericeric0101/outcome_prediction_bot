@@ -1,0 +1,188 @@
+"""Bounded taker-exit lanes for an already protected Outcome holding."""
+from __future__ import annotations
+
+import time
+from decimal import Decimal
+from typing import Any, Callable
+
+from bot.lifecycle.outcome_lifecycle import OutcomeMarketSpec
+from bot.outcome_emergency_exit import (
+    EmergencyExitAction,
+    OutcomeEmergencyExitController,
+    OutcomeEmergencyExitInput,
+    OutcomeEmergencyExitPolicy,
+    book_age_sec as emergency_book_age_sec,
+    parse_bid_levels,
+)
+from bot.outcome_execution_ledger import OutcomeExecutionLedger
+from bot.outcome_exit_lifecycle import OutcomeExitLifecycleStore
+from bot.outcome_maker_state_machine import OutcomeMakerStateMachine
+from bot.outcome_runtime_types import LiveExecutionResult
+
+
+class OutcomeHoldingRiskService:
+    """Own fast-failure and S3 policy-to-controller dispatch."""
+
+    def __init__(
+        self, *, recovery: Any, machine: OutcomeMakerStateMachine,
+        store: OutcomeExitLifecycleStore | None, ledger: OutcomeExecutionLedger | None,
+        fast_policy: OutcomeEmergencyExitPolicy,
+        fast_controller: OutcomeEmergencyExitController | None,
+        emergency_policy: OutcomeEmergencyExitPolicy,
+        emergency_controller: OutcomeEmergencyExitController | None,
+        reversal_windows: dict[tuple[int, str], tuple[float, float, int]],
+        fresh_book: Callable[..., dict[str, object]],
+        official_holding_age: Callable[..., float | None],
+        live_entry_age: Callable[..., float | None],
+    ) -> None:
+        self.recovery = recovery
+        self.machine = machine
+        self.store = store
+        self.ledger = ledger
+        self.fast_policy = fast_policy
+        self.fast_controller = fast_controller
+        self.emergency_policy = emergency_policy
+        self.emergency_controller = emergency_controller
+        self.reversal_windows = reversal_windows
+        self.fresh_book = fresh_book
+        self.official_holding_age = official_holding_age
+        self.live_entry_age = live_entry_age
+
+    def maybe_fast_failure(self, *, market: OutcomeMarketSpec, finding: object) -> LiveExecutionResult | None:
+        if self.ledger is None or self.store is None or self.fast_controller is None:
+            return None
+        if not tuple(getattr(finding, "sell_order_ids", ())):
+            return None
+        coin = str(getattr(finding, "coin", ""))
+        inventory = Decimal(str(getattr(finding, "inventory", "0")))
+        lifecycle = self.store.recover(wallet=self.recovery.wallet, outcome_id=market.outcome_id, coin=coin)
+        if lifecycle is None or lifecycle.state == "EMERGENCY_EXIT_SUBMITTED":
+            return None
+        if self.store.emergency_attempted(wallet=self.recovery.wallet, outcome_id=market.outcome_id, coin=coin):
+            return None
+        fill_vwap = self.machine._fill_vwap_for_inventory(coin=coin, inventory=inventory)
+        entry_age = self.official_holding_age(
+            market=market, coin=coin, inventory=inventory, fill_vwap=fill_vwap,
+        )
+        window = self.reversal_windows.get((market.outcome_id, coin), (0.0, 0.0, 0))
+        cfg = self.fast_policy.config
+        if entry_age is None or entry_age < cfg.min_holding_sec:
+            return None
+        if window[2] < cfg.min_independent_reversal_observations or time.time() - window[0] < cfg.min_reversal_duration_sec:
+            return None
+        side_index = 0 if coin == market.yes_coin else 1
+        try:
+            fees = self.recovery.account.get_user_fees_sync(self.recovery.wallet)
+            taker_fee = Decimal(str(fees["userSpotCrossRate"]))
+            book = self.fresh_book(market=market, side_index=side_index)
+            bids = parse_bid_levels(book)
+            book_age = emergency_book_age_sec(book, now_ms=int(time.time() * 1000))
+        except (KeyError, TypeError, ValueError, ArithmeticError):
+            bids, book_age, taker_fee = None, None, None
+        item = OutcomeEmergencyExitInput(
+            inventory=inventory, fill_vwap=fill_vwap, taker_close_fee_rate=taker_fee,
+            bids=bids or (), book_age_sec=book_age, holding_age_sec=entry_age,
+            loss_band_unfilled_sec=None, reversal_independent_observations=window[2],
+            reversal_duration_sec=(time.time() - window[0]) if window[0] > 0 else 0.0,
+            already_attempted=False,
+        )
+        return self._plan_record_execute(
+            market=market, coin=coin, side_index=side_index, lifecycle=lifecycle, item=item,
+            policy=self.fast_policy, controller=self.fast_controller,
+            decision_event="OUTCOME_FAST_FAILURE_EXIT_DECISION",
+            execution_type="fast_failure_price_protected_fak_ioc",
+            holding_age_basis="official_fill_timestamp_ms",
+        )
+
+    def maybe_emergency(self, *, market: OutcomeMarketSpec, finding: object) -> LiveExecutionResult | None:
+        if self.ledger is None or self.store is None or self.emergency_controller is None:
+            return None
+        if not tuple(getattr(finding, "sell_order_ids", ())):
+            return None
+        coin = str(getattr(finding, "coin", ""))
+        inventory = Decimal(str(getattr(finding, "inventory", "0")))
+        lifecycle = self.store.recover(wallet=self.recovery.wallet, outcome_id=market.outcome_id, coin=coin)
+        if lifecycle is None or lifecycle.state == "EMERGENCY_EXIT_SUBMITTED":
+            return None
+        entry_age = self.live_entry_age(market=market, coin=coin)
+        loss_since = self.store.loss_band_first_seen_ts(
+            wallet=self.recovery.wallet, outcome_id=market.outcome_id, coin=coin,
+        )
+        window = self.reversal_windows.get((market.outcome_id, coin), (0.0, 0.0, 0))
+        cfg = self.emergency_policy.config
+        if entry_age is None or entry_age < cfg.min_holding_sec:
+            return None
+        if loss_since is None or time.time() - loss_since < cfg.min_loss_band_unfilled_sec:
+            return None
+        if window[2] < cfg.min_independent_reversal_observations or time.time() - window[0] < cfg.min_reversal_duration_sec:
+            return None
+        if self.store.emergency_attempted(wallet=self.recovery.wallet, outcome_id=market.outcome_id, coin=coin):
+            return None
+        fill_vwap = self.machine._fill_vwap_for_inventory(coin=coin, inventory=inventory)
+        side_index = 0 if coin == market.yes_coin else 1
+        try:
+            fees = self.recovery.account.get_user_fees_sync(self.recovery.wallet)
+            taker_fee = Decimal(str(fees["userSpotCrossRate"]))
+            book = self.fresh_book(market=market, side_index=side_index)
+            bids = parse_bid_levels(book)
+            book_age = emergency_book_age_sec(book, now_ms=int(time.time() * 1000))
+        except (KeyError, TypeError, ValueError, ArithmeticError):
+            bids, book_age, taker_fee = None, None, None
+        item = OutcomeEmergencyExitInput(
+            inventory=inventory, fill_vwap=fill_vwap, taker_close_fee_rate=taker_fee,
+            bids=bids or (), book_age_sec=book_age,
+            holding_age_sec=entry_age if entry_age is not None else -1.0,
+            loss_band_unfilled_sec=(time.time() - loss_since) if loss_since is not None else None,
+            reversal_independent_observations=window[2],
+            reversal_duration_sec=(time.time() - window[0]) if window[0] > 0 else 0.0,
+            already_attempted=False,
+        )
+        return self._plan_record_execute(
+            market=market, coin=coin, side_index=side_index, lifecycle=lifecycle, item=item,
+            policy=self.emergency_policy, controller=self.emergency_controller,
+            decision_event="OUTCOME_EMERGENCY_EXIT_DECISION",
+            execution_type="s3_price_protected_fak_ioc", holding_age_basis=None,
+        )
+
+    def _plan_record_execute(
+        self, *, market: OutcomeMarketSpec, coin: str, side_index: int, lifecycle: Any,
+        item: OutcomeEmergencyExitInput, policy: OutcomeEmergencyExitPolicy,
+        controller: OutcomeEmergencyExitController, decision_event: str,
+        execution_type: str, holding_age_basis: str | None,
+    ) -> LiveExecutionResult | None:
+        assert self.ledger is not None
+        plan = policy.plan(item)
+        payload: dict[str, object] = {
+            "venue": "hyperliquid_outcome", "outcome_id": market.outcome_id, "period": market.period,
+            "coin": coin, "lifecycle_order_id": lifecycle.order_id, "action": plan.action,
+            "reason": plan.reason, "inventory": str(item.inventory),
+            "holding_age_sec": item.holding_age_sec,
+            "loss_band_unfilled_sec": item.loss_band_unfilled_sec,
+            "independent_reversal_observations": item.reversal_independent_observations,
+            "reversal_duration_sec": item.reversal_duration_sec, "book_age_sec": item.book_age_sec,
+            "limit_price": str(plan.limit_price) if plan.limit_price is not None else None,
+            "executable_vwap": str(plan.executable_vwap) if plan.executable_vwap is not None else None,
+            "net_return_pct": str(plan.net_return_pct) if plan.net_return_pct is not None else None,
+            "execution_submitted": False,
+        }
+        if holding_age_basis is not None:
+            payload["holding_age_basis"] = holding_age_basis
+        self.ledger.journal.log_strategy_event(self.ledger.run_id, decision_event, payload)
+        if plan.action is not EmergencyExitAction.EXECUTE:
+            return None
+        result = controller.execute(
+            market=market, side_index=side_index, lifecycle=lifecycle, item=item, plan=plan,
+        )
+        if result.state in {"emergency_exit_submitted", "emergency_exit_flat", "emergency_exit_residual"}:
+            self.ledger.journal.log_order_event(
+                self.ledger.run_id, "ORDER_SUBMIT", venue_order_id=result.emergency_order_id,
+                side="SELL", status="IOC_SUBMITTED", instrument_id=coin, reason=result.detail,
+                payload={
+                    "venue": "hyperliquid_outcome", "outcome_id": market.outcome_id, "coin": coin,
+                    "execution_type": execution_type, "old_order_id": result.old_order_id,
+                    "limit_price": str(plan.limit_price), "planned_net_return_pct": str(plan.net_return_pct),
+                },
+            )
+            fills = self.recovery.account.get_user_fills_sync(self.recovery.wallet)
+            self.ledger.sync_fills(fills=fills, market_key=f"outcome:{market.outcome_id}", period=market.period)
+        return LiveExecutionResult(result.state, result.detail, result.emergency_order_id or result.old_order_id)

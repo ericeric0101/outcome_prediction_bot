@@ -45,13 +45,19 @@ def test_holding_supervisor_protects_before_observation_and_short_circuits_exit(
     fast_result = object()
     runtime = SimpleNamespace(
         _REVERSAL_RISK_MIN_INTERVAL_SEC=5.0, _HOLDING_PATH_MIN_INTERVAL_SEC=30.0,
-        _cancel_filled_entry_and_place_protection=lambda **_: calls.append("protect") or None,
+        holding_execution_service=SimpleNamespace(
+            protect_after_fill=lambda **_: calls.append("protect") or None,
+        ),
         _observe_toxic_fill_shadow=lambda **_: calls.append("toxic"),
         _observe_holding_reversal_ws=lambda **_: calls.append("reversal") or True,
         _capture_holding_path=lambda **_: calls.append("holding"),
-        _maybe_fast_failure_exit=lambda **_: calls.append("fast_failure") or fast_result,
-        _maybe_emergency_exit=lambda **_: calls.append("s3") or None,
-        _maybe_requote_entry_buy=lambda **_: calls.append("entry_requote") or None,
+        holding_risk_service=SimpleNamespace(
+            maybe_fast_failure=lambda **_: calls.append("fast_failure") or fast_result,
+            maybe_emergency=lambda **_: calls.append("s3") or None,
+        ),
+        entry_execution_service=SimpleNamespace(
+            manage_resting_buy=lambda **_: calls.append("entry_requote") or None,
+        ),
     )
     result = OutcomeHoldingSupervisor().manage_before_stream_gate(
         runtime, snapshot=_snapshot(active=(finding,)), config=OutcomeLiveStrategyConfig(),
@@ -64,7 +70,9 @@ def test_holding_supervisor_does_not_observe_until_protection_is_resolved():
     calls = []
     protection_result = object()
     runtime = SimpleNamespace(
-        _cancel_filled_entry_and_place_protection=lambda **_: calls.append("protect") or protection_result,
+        holding_execution_service=SimpleNamespace(
+            protect_after_fill=lambda **_: calls.append("protect") or protection_result,
+        ),
     )
     result = OutcomeHoldingSupervisor().manage_before_stream_gate(
         runtime, snapshot=_snapshot(active=(SimpleNamespace(coin="#7"),)),
@@ -75,9 +83,11 @@ def test_holding_supervisor_does_not_observe_until_protection_is_resolved():
 
 
 def test_entry_supervisor_fails_closed_before_signal_or_order_construction():
+    calls = []
     runtime = SimpleNamespace(
-        _result=lambda state, detail, order_id=None: (state, detail, order_id),
-        entry_lifecycle_store=None,
+        entry_execution_service=SimpleNamespace(
+            preflight=lambda **_: calls.append("entry_service") or ("blocked", "account recovery unsafe", None),
+        ),
     )
     admission = {}
     result = OutcomeEntrySupervisor().preflight(
@@ -86,14 +96,19 @@ def test_entry_supervisor_fails_closed_before_signal_or_order_construction():
     )
     assert result[0] == "blocked"
     assert "account recovery" in result[1]
+    assert calls == ["entry_service"]
 
 
 def test_post_stream_holding_order_is_requote_then_persisted_exit():
     calls = []
     persisted = object()
     runtime = SimpleNamespace(
-        _maybe_requote_p3_exit=lambda **_: calls.append("requote") or None,
-        _advance_persisted_p3_exit=lambda **_: calls.append("persisted") or persisted,
+        exit_requote_service=SimpleNamespace(
+            maybe_requote=lambda **_: calls.append("requote") or None,
+        ),
+        holding_execution_service=SimpleNamespace(
+            advance_persisted_exit=lambda **_: calls.append("persisted") or persisted,
+        ),
     )
     result = OutcomeHoldingSupervisor().manage_after_stream_gate(
         runtime, snapshot=_snapshot(active=(SimpleNamespace(coin="#7"),)),

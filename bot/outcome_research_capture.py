@@ -36,7 +36,7 @@ class OutcomeResearchCapture:
 
     def __init__(self, *, client: Any, wallet_address: str, journal: TradeJournalDB, run_id: str | None = None,
                  interval_sec: float | None = None, heartbeat_sec: float | None = None, gap_alert_sec: float | None = None,
-                 account_sync_interval_sec: float = 15.0, fee_refresh_sec: float = 300.0,
+                 account_sync_interval_sec: float = 30.0, fee_refresh_sec: float = 300.0,
                  account_sync_async: bool = True) -> None:
         self.client, self.wallet_address, self.journal = client, wallet_address, journal
         self.run_id = run_id or f"outcome-research-{uuid.uuid4().hex[:10]}"

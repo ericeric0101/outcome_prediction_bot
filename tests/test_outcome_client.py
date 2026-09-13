@@ -1,5 +1,6 @@
 """Unit tests for bot/adapters/outcome_client.py."""
 
+import asyncio
 from decimal import Decimal
 import pytest
 from eth_account import Account
@@ -7,6 +8,16 @@ import httpx
 
 from bot.adapters.outcome_auth import OutcomeAuth
 from bot.adapters.outcome_client import OutcomeClient, OutcomeInfoCooldownError
+
+
+def test_open_orders_ws_subscription_is_user_scoped_and_all_dexes():
+    client = OutcomeClient(OutcomeAuth(wallet_address="0x" + "a" * 40, is_testnet=True))
+    asyncio.run(client.subscribe_open_orders())
+    assert client._subscriptions["openOrders:" + client.wallet_address.lower()] == {
+        "type": "openOrders", "user": client.wallet_address.lower(), "dex": "ALL_DEXS",
+    }
+    asyncio.run(client.unsubscribe_open_orders())
+    assert not client._subscriptions
 
 
 def test_sync_info_retries_transient_502_then_returns_payload(monkeypatch):
@@ -117,6 +128,21 @@ def test_429_blocks_all_other_info_reads_without_sending_another_request(monkeyp
     finally:
         with OutcomeClient._info_cooldown_lock:
             OutcomeClient._info_cooldowns.clear()
+            OutcomeClient._info_429_strikes.clear()
+
+
+def test_repeated_429s_expand_shared_cooldown(monkeypatch):
+    auth = OutcomeAuth(wallet_address="0x" + "d" * 40, is_testnet=True)
+    client = OutcomeClient(auth, info_max_retries=1)
+    clock = iter((100.0, 101.0))
+    monkeypatch.setattr("bot.adapters.outcome_client.time.monotonic", lambda: next(clock))
+    try:
+        assert client._record_info_cooldown(1.0) == 2.0
+        assert client._record_info_cooldown(1.0) == 4.0
+    finally:
+        with OutcomeClient._info_cooldown_lock:
+            OutcomeClient._info_cooldowns.clear()
+            OutcomeClient._info_429_strikes.clear()
 
 
 @pytest.mark.anyio

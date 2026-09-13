@@ -15,6 +15,7 @@ from bot.lifecycle.outcome_lifecycle import OutcomeMarketSpec
 from bot.outcome_exit_lifecycle import OutcomeExitLifecycle, OutcomeExitLifecycleStore
 from bot.outcome_exit_quote_planner import ExitQuoteAction, ExitQuotePlan
 from bot.outcome_order_mutation import cancel_and_confirm
+from bot.outcome_sdk_sidecar import OutcomeSdkAmbiguousExecutionError
 
 
 class ExitAccountReader(Protocol):
@@ -98,13 +99,41 @@ class OutcomeExitRequoteController:
             if not Decimal("0") < price < Decimal("1") or price <= bid:
                 self.store.record(lifecycle, reason="replacement_would_cross_or_bound", extra={"state": "RECONCILE_REQUIRED"})
                 return ExitRequoteResult("reconcile_required", "replacement_not_passive_after_rebook", lifecycle.order_id)
+            state = "LOSS_BAND_RESTING" if plan.exit_mode == "loss_band" else "SELL_RESTING"
+            context = replacement_context or {}
+            intent = self.store.record_submit_intent(
+                wallet=self.wallet, outcome_id=market.outcome_id, coin=lifecycle.coin,
+                order_kind="exit_replacement_alo", price=price, shares=inventory_after_cancel,
+                old_order_id=lifecycle.order_id, replacement_count=lifecycle.replacement_count + 1,
+                intended_state=state, context=context,
+            )
+            if intent is None:
+                self.store.record(lifecycle, reason="durable_replacement_intent_unavailable", extra={"state": "RECONCILE_REQUIRED"})
+                return ExitRequoteResult("reconcile_required", "durable replacement intent unavailable", lifecycle.order_id)
+            intent_id, intent_event_id = intent
             try:
                 result = self.gateway.place_alo(market=market, side_index=side_index, is_buy=False, price=price,
                                                 requested_shares=inventory_after_cancel, reduce_only=True)
                 submit_timing = getattr(self.gateway, "last_sidecar_timing", None)
                 if isinstance(submit_timing, dict):
                     timing["submit"] = dict(submit_timing)
+            except OutcomeSdkAmbiguousExecutionError as exc:
+                ambiguity_id = self.store.record_ambiguous_submit(
+                    wallet=self.wallet, outcome_id=market.outcome_id, coin=lifecycle.coin,
+                    intent_id=intent_id, intent_event_id=intent_event_id,
+                    order_kind="exit_replacement_alo", price=price, shares=inventory_after_cancel,
+                    old_order_id=lifecycle.order_id, replacement_count=lifecycle.replacement_count + 1,
+                    intended_state=state, sidecar_request_id=exc.request_id,
+                    command=exc.command, detail=str(exc),
+                )
+                if ambiguity_id is None:
+                    raise RuntimeError("ambiguous exit replacement could not persist reconciliation fence") from exc
+                return ExitRequoteResult("reconcile_required", "ambiguous exit replacement; account-truth reconciliation required", lifecycle.order_id)
             except Exception as exc:
+                self.store.finalize_submit_intent(
+                    intent_id=intent_id, order_id=None,
+                    reason=f"safe_sdk_rejection:{type(exc).__name__}",
+                )
                 self.store.record(lifecycle, reason=f"replacement_exception:{type(exc).__name__}", extra={"state": "RECONCILE_REQUIRED"})
                 return ExitRequoteResult("reconcile_required", "replacement_submission_failed", lifecycle.order_id)
             self._invalidate_account_reads()
@@ -112,10 +141,8 @@ class OutcomeExitRequoteController:
             if not new_id:
                 self.store.record(lifecycle, reason="replacement_missing_order_id", extra={"state": "RECONCILE_REQUIRED"})
                 return ExitRequoteResult("reconcile_required", "replacement_unconfirmed", lifecycle.order_id)
-            state = "LOSS_BAND_RESTING" if plan.exit_mode == "loss_band" else "SELL_RESTING"
             new_lifecycle = OutcomeExitLifecycle(self.wallet, market.outcome_id, lifecycle.coin, new_id,
                                                   inventory_after_cancel, price, lifecycle.replacement_count + 1, state)
-            context = replacement_context or {}
             trigger_bbo = context.get("trigger_bbo")
             if not isinstance(trigger_bbo, dict):
                 trigger_bbo = {"best_bid": None, "best_ask": None}
@@ -125,10 +152,19 @@ class OutcomeExitRequoteController:
             self.store.record_replacement_submit(
                 new_lifecycle, old_order_id=lifecycle.order_id, trigger_bbo=trigger_bbo,
                 loss_threshold=plan.floor_price, current_signal=current_signal,
-                plan_reason=plan.reason, execution_timing=timing,
+                plan_reason=plan.reason, execution_timing=timing, intent_id=intent_id,
             )
-            self.store.record(new_lifecycle, reason=plan.reason, extra={"old_order_id": lifecycle.order_id,
-                              "best_bid": str(bid), "best_ask": str(ask), "exit_mode": plan.exit_mode or "unknown"})
+            if self.store.record(
+                new_lifecycle, reason=plan.reason,
+                extra={"old_order_id": lifecycle.order_id, "best_bid": str(bid), "best_ask": str(ask),
+                       "exit_mode": plan.exit_mode or "unknown", "exit_intent_id": intent_id},
+                durable=True,
+            ) is None:
+                raise RuntimeError("acknowledged exit replacement ownership could not persist durably")
+            if not self.store.finalize_submit_intent(
+                intent_id=intent_id, order_id=new_id, reason="sdk_acknowledged_replacement",
+            ):
+                raise RuntimeError("acknowledged exit replacement intent could not finalize durably")
             return ExitRequoteResult("sell_resting", "cancel_confirmed_rebooked_alo_replacement", lifecycle.order_id, new_id)
         finally:
             self._in_flight.discard(key)

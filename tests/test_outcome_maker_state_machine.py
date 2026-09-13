@@ -2,6 +2,8 @@ from decimal import Decimal
 
 from bot.lifecycle.outcome_lifecycle import OutcomeMarketSpec
 from bot.outcome_maker_state_machine import OutcomeMakerStateMachine
+from bot.outcome_exit_lifecycle import OutcomeExitLifecycleStore
+from bot.outcome_sdk_sidecar import OutcomeSdkAmbiguousExecutionError
 from monitoring.trade_journal_db import TradeJournalDB
 
 
@@ -29,6 +31,26 @@ def test_tick_places_one_buy_without_waiting():
     result = OutcomeMakerStateMachine(account=Account(), gateway=gateway, wallet="w").tick(market=market(), side_index=0, entry_permitted=True)
     assert result.state == "buy_placed"
     assert [kind for kind, _ in gateway.calls] == ["place"]
+
+
+def test_tick_forces_rest_immediately_before_submit_and_blocks_newly_visible_order():
+    class LaggingAccount(Account):
+        def __init__(self):
+            super().__init__()
+            self.forced_reads = 0
+
+        def force_open_orders_reconciliation_sync(self, _wallet):
+            self.forced_reads += 1
+            return [{"oid": "already-there", "coin": "#11530", "side": "B", "sz": "10"}]
+
+    account, gateway = LaggingAccount(), Gateway()
+    result = OutcomeMakerStateMachine(account=account, gateway=gateway, wallet="w").tick(
+        market=market(), side_index=0, entry_permitted=True,
+    )
+    assert result.state == "blocked"
+    assert "pre-submit REST" in result.detail
+    assert account.forced_reads == 1
+    assert gateway.calls == []
 
 
 def test_entry_submit_rechecks_minimum_price_after_fresh_book_read():
@@ -162,3 +184,33 @@ def test_tick_observes_existing_order_without_second_submission():
     result = OutcomeMakerStateMachine(account=Account("0", [{"coin": "#11530", "side": "B", "oid": 7, "sz": "13"}]), gateway=gateway, wallet="w").tick(market=market(), side_index=0, entry_permitted=True)
     assert result.state == "buy_resting"
     assert not gateway.calls
+
+
+def test_initial_protective_sell_ambiguity_is_durably_fenced(tmp_path):
+    class AmbiguousGateway(Gateway):
+        def place_alo(self, **kwargs):
+            self.calls.append(("place", kwargs))
+            raise OutcomeSdkAmbiguousExecutionError(
+                command="place_limit_order", request_id="protect-1", detail="response timeout",
+            )
+
+    journal = TradeJournalDB(tmp_path / "journal.db")
+    store = OutcomeExitLifecycleStore(journal, "run")
+    gateway = AmbiguousGateway()
+    account = Account("0")
+    account.get_spot_clearinghouse_state_sync = lambda _: {
+        "balances": [{"coin": "+11530", "total": "13", "entryNtl": "10"}],
+    }
+    account.get_user_fills_sync = lambda _: [
+        {"coin": "#11530", "side": "B", "px": "0.80", "sz": "13", "time": 1},
+    ]
+    result = OutcomeMakerStateMachine(
+        account=account, gateway=gateway, wallet="w", journal=journal,
+        exit_lifecycle_store=store,
+    ).tick(
+        market=market(), side_index=0, entry_permitted=False,
+        minimum_return_pct=Decimal("0.05"), maker_close_fee_rate=Decimal("0.0004"),
+    )
+    assert result.state == "blocked" and "ambiguous protective SELL" in result.detail
+    pending = store.pending_ambiguous_submit(wallet="w", outcome_id=1153, coin="#11530")
+    assert pending is not None and pending["order_kind"] == "initial_protective_alo"

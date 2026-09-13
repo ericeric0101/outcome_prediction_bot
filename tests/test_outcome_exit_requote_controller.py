@@ -6,6 +6,7 @@ from bot.lifecycle.outcome_lifecycle import OutcomeMarketSpec
 from bot.outcome_exit_lifecycle import OutcomeExitLifecycle, OutcomeExitLifecycleStore
 from bot.outcome_exit_quote_planner import ExitQuoteAction, ExitQuotePlan
 from bot.outcome_exit_requote_controller import OutcomeExitRequoteController
+from bot.outcome_sdk_sidecar import OutcomeSdkAmbiguousExecutionError
 from monitoring.trade_journal_db import TradeJournalDB
 
 
@@ -99,6 +100,7 @@ def test_controller_blocks_partial_fill_race_and_replacement_reject(tmp_path):
     controller, lifecycle, gateway, _, _ = _setup(tmp_path / "second", place_raises=True)
     result = controller.execute(market=market(), side_index=0, lifecycle=lifecycle, plan=_plan())
     assert result.detail == "replacement_submission_failed"
+    assert controller.store.pending_ambiguous_submit(wallet="w", outcome_id=1153, coin="#11530") is None
 
 
 def test_controller_fails_closed_on_unusable_rebook(tmp_path):
@@ -106,3 +108,24 @@ def test_controller_fails_closed_on_unusable_rebook(tmp_path):
     result = controller.execute(market=market(), side_index=0, lifecycle=lifecycle, plan=_plan())
     assert result.detail == "book_unusable_after_cancel"
     assert [name for name, _ in gateway.calls] == ["cancel", "book"]
+
+
+def test_controller_persists_intent_and_fence_on_ambiguous_replacement(tmp_path):
+    controller, lifecycle, gateway, store, _ = _setup(tmp_path)
+    def ambiguous(**kwargs):
+        gateway.calls.append(("place", kwargs))
+        with sqlite3.connect(store.journal.db_path) as conn:
+            durable_intents = conn.execute(
+                "SELECT COUNT(*) FROM strategy_events WHERE event_type='OUTCOME_ORDER_INTENT'"
+            ).fetchone()[0]
+        assert durable_intents == 1
+        raise OutcomeSdkAmbiguousExecutionError(
+            command="place_limit_order", request_id="request-9", detail="response timeout",
+        )
+    gateway.place_alo = ambiguous
+    result = controller.execute(market=market(), side_index=0, lifecycle=lifecycle, plan=_plan())
+    assert result.state == "reconcile_required"
+    assert "ambiguous" in result.detail
+    pending = store.pending_ambiguous_submit(wallet="w", outcome_id=1153, coin="#11530")
+    assert pending is not None
+    assert pending["sidecar_request_id"] == "request-9"

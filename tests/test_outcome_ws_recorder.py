@@ -10,6 +10,7 @@ from monitoring.trade_journal_db import TradeJournalDB
 class CallbackClient:
     def __init__(self):
         self.callbacks = {}
+        self.wallet_address = "0x" + "a" * 40
 
     def register_callback(self, channel, callback):
         self.callbacks.setdefault(channel, []).append(callback)
@@ -51,6 +52,22 @@ def test_ws_recorder_unregisters_callbacks_when_stopped():
     recorder._register_callbacks()
     recorder._unregister_callbacks()
     assert all(not callbacks for callbacks in client.callbacks.values())
+
+
+def test_ws_recorder_routes_user_order_snapshot_to_memory_not_journal(tmp_path):
+    client = CallbackClient()
+    db = tmp_path / "stream.db"
+    recorder = OutcomeWebSocketRecorder(client, TradeJournalDB(db), "stream-run")
+    recorder._on_lifecycle({"event": "connected", "received_at_ms": 123})
+    order = {"oid": 7, "coin": "#1", "side": "B", "sz": "10", "limitPx": "0.6"}
+    recorder._on_open_orders({"channel": "openOrders", "data": {
+        "user": client.wallet_address, "dex": "ALL_DEXS", "orders": [order],
+    }})
+    assert recorder.open_orders_cache.mark_rest_verified(client.wallet_address, [order], now=10)
+    assert recorder.open_orders_cache.trusted_orders(client.wallet_address, now=11) == [order]
+    with sqlite3.connect(db) as conn:
+        event_types = [row[0] for row in conn.execute("SELECT event_type FROM strategy_events")]
+    assert event_types == ["OUTCOME_WS_LIFECYCLE"]
 
 
 def test_ws_recorder_stop_completes_callback_teardown_after_second_ctrl_c():

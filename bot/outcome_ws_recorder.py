@@ -9,6 +9,7 @@ from typing import Any, Mapping, Optional
 from monitoring.trade_journal_db import TradeJournalDB
 from bot.lifecycle.outcome_lifecycle import OutcomeMarketSpec
 from bot.outcome_stream_health import OutcomeStreamHealth
+from bot.outcome_open_orders_stream import OutcomeOpenOrdersStreamCache
 
 
 class OutcomeWebSocketRecorder:
@@ -30,6 +31,7 @@ class OutcomeWebSocketRecorder:
         self._l2_update = threading.Event()
         self.resync_required = threading.Event()
         self.health = OutcomeStreamHealth()
+        self.open_orders_cache = OutcomeOpenOrdersStreamCache(str(getattr(client, "wallet_address", "")))
         self._registered = False
 
     @staticmethod
@@ -64,6 +66,7 @@ class OutcomeWebSocketRecorder:
     def _on_lifecycle(self, payload: Mapping[str, Any]) -> None:
         self._record("OUTCOME_WS_LIFECYCLE", payload)
         self.health.on_lifecycle(str(payload.get("event", "")))
+        self.open_orders_cache.on_lifecycle(str(payload.get("event", "")))
         if payload.get("event") in {"connected", "disconnected"}:
             self.resync_required.set()
 
@@ -117,6 +120,11 @@ class OutcomeWebSocketRecorder:
     def _on_trades(self, payload: Mapping[str, Any]) -> None:
         self._record("OUTCOME_WS_TRADES", payload)
 
+    def _on_open_orders(self, payload: Mapping[str, Any]) -> None:
+        # Keep account truth in memory only.  Durable order/fill audit remains
+        # owned by execution ledger and official REST/SDK confirmation.
+        self.open_orders_cache.on_message(payload)
+
     def start(self, *, outcome_id: int, yes_coin: str, no_coin: str) -> None:
         if self._thread and self._thread.is_alive():
             if self._market_id == outcome_id:
@@ -139,6 +147,7 @@ class OutcomeWebSocketRecorder:
         self.client.register_callback("l2Book", self._on_l2)
         self.client.register_callback("allMids", self._on_mids)
         self.client.register_callback("trades", self._on_trades)
+        self.client.register_callback("openOrders", self._on_open_orders)
         self._registered = True
 
     def _unregister_callbacks(self) -> None:
@@ -147,6 +156,7 @@ class OutcomeWebSocketRecorder:
         for channel, callback in (
             ("__lifecycle__", self._on_lifecycle), ("l2Book", self._on_l2),
             ("allMids", self._on_mids), ("trades", self._on_trades),
+            ("openOrders", self._on_open_orders),
         ):
             unregister = getattr(self.client, "unregister_callback", None)
             if unregister:
@@ -158,6 +168,7 @@ class OutcomeWebSocketRecorder:
 
     async def _serve(self) -> None:
         await self.client.subscribe_all_mids()
+        await self.client.subscribe_open_orders()
         for coin in self._coins:
             await self.client.subscribe_l2_book(coin)
             await self.client.subscribe_trades(coin)
@@ -167,6 +178,7 @@ class OutcomeWebSocketRecorder:
                 await asyncio.sleep(0)
         finally:
             await self.client.stop_ws()
+            await self.client.unsubscribe_open_orders()
             await self.client.unsubscribe_all_mids()
             for coin in self._coins:
                 await self.client.unsubscribe_l2_book(coin)

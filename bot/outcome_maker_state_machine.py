@@ -16,6 +16,9 @@ from bot.outcome_order_mutation import cancel_and_confirm
 
 if TYPE_CHECKING:
     from monitoring.trade_journal_db import TradeJournalDB
+    from bot.outcome_exit_lifecycle import OutcomeExitLifecycleStore
+
+from bot.outcome_sdk_sidecar import OutcomeSdkAmbiguousExecutionError
 
 
 class AccountReader(Protocol):
@@ -36,16 +39,25 @@ class OutcomeMakerStateMachine:
     """Venue state machine; strategy decides only whether entry is permitted."""
 
     def __init__(self, *, account: AccountReader, gateway: OutcomeExecutionGateway, wallet: str,
-                 journal: "TradeJournalDB | None" = None) -> None:
+                 journal: "TradeJournalDB | None" = None,
+                 exit_lifecycle_store: "OutcomeExitLifecycleStore | None" = None) -> None:
         self.account = account
         self.gateway = gateway
         self.wallet = wallet
         self.journal = journal
+        self.exit_lifecycle_store = exit_lifecycle_store
 
     def _invalidate_account_reads(self) -> None:
         invalidate = getattr(self.account, "invalidate", None)
         if callable(invalidate):
             invalidate()
+
+    def _fresh_orders_before_submit(self) -> list[dict[str, Any]]:
+        """Require REST account truth immediately before creating exposure."""
+        force = getattr(self.account, "force_open_orders_reconciliation_sync", None)
+        if callable(force):
+            return force(self.wallet)
+        return self.account.get_open_orders_sync(self.wallet)
 
     @staticmethod
     def _coin_position(state: dict[str, Any], coin: str) -> tuple[Decimal, Decimal]:
@@ -254,16 +266,56 @@ class OutcomeMakerStateMachine:
                 "loss_reprice_floor": str(loss_floor) if loss_floor is not None else "unavailable",
                 "exit_mode": "loss_band" if loss_triggered else "take_profit",
             })
-            result = self.gateway.place_alo(
-                market=market,
-                side_index=side_index,
-                is_buy=False,
-                price=requested_price,
-                requested_shares=inventory,
-                # ``inventory`` came from this tick's wallet reconciliation;
-                # allow the official SDK's documented residual-close exception.
-                reduce_only=True,
-            )
+            if any(order.get("coin") == coin for order in self._fresh_orders_before_submit()):
+                return MakerTickResult(
+                    "blocked", "pre-submit REST found an existing order; reconciliation required", audit=audit,
+                )
+            intent: tuple[str, int] | None = None
+            if self.exit_lifecycle_store is not None:
+                intent = self.exit_lifecycle_store.record_submit_intent(
+                    wallet=self.wallet, outcome_id=market.outcome_id, coin=coin,
+                    order_kind="initial_protective_alo", price=requested_price, shares=inventory,
+                    old_order_id=None, replacement_count=0, intended_state="SELL_RESTING",
+                    context={"pricing_basis": audit.get("pricing_basis"), "exit_mode": audit.get("exit_mode")},
+                )
+                if intent is None:
+                    return MakerTickResult("blocked", "durable protective SELL intent unavailable", audit=audit)
+                audit["exit_intent_id"], audit["exit_intent_event_id"] = intent
+            try:
+                result = self.gateway.place_alo(
+                    market=market,
+                    side_index=side_index,
+                    is_buy=False,
+                    price=requested_price,
+                    requested_shares=inventory,
+                    # ``inventory`` came from this tick's wallet reconciliation;
+                    # allow the official SDK's documented residual-close exception.
+                    reduce_only=True,
+                )
+            except OutcomeSdkAmbiguousExecutionError as exc:
+                if self.exit_lifecycle_store is None or intent is None:
+                    raise
+                intent_id, intent_event_id = intent
+                ambiguity_id = self.exit_lifecycle_store.record_ambiguous_submit(
+                    wallet=self.wallet, outcome_id=market.outcome_id, coin=coin,
+                    intent_id=intent_id, intent_event_id=intent_event_id,
+                    order_kind="initial_protective_alo", price=requested_price, shares=inventory,
+                    old_order_id=None, replacement_count=0, intended_state="SELL_RESTING",
+                    sidecar_request_id=exc.request_id, command=exc.command, detail=str(exc),
+                )
+                if ambiguity_id is None:
+                    raise RuntimeError("ambiguous protective SELL could not persist reconciliation fence") from exc
+                audit["exit_ambiguity_event_id"] = ambiguity_id
+                return MakerTickResult(
+                    "blocked", "ambiguous protective SELL; account-truth reconciliation required", audit=audit,
+                )
+            except Exception as exc:
+                if self.exit_lifecycle_store is not None and intent is not None:
+                    self.exit_lifecycle_store.finalize_submit_intent(
+                        intent_id=intent[0], order_id=None,
+                        reason=f"safe_sdk_rejection:{type(exc).__name__}",
+                    )
+                raise
             self._invalidate_account_reads()
             timing = getattr(self.gateway, "last_sidecar_timing", None)
             if isinstance(timing, dict):
@@ -306,6 +358,10 @@ class OutcomeMakerStateMachine:
                 ) if decision_bid is not None and Decimal(str(decision_bid)) > 0 else None,
             })
             return MakerTickResult("flat", "entry submit price drift exceeds calibrated ceiling", audit=audit)
+        if any(order.get("coin") == coin for order in self._fresh_orders_before_submit()):
+            return MakerTickResult(
+                "blocked", "pre-submit REST found an existing order; reconciliation required", audit=dict(entry_audit or {}),
+            )
         result = self.gateway.place_alo(
             market=market, side_index=side_index, is_buy=True, price=bid,
             requested_shares=requested_shares,

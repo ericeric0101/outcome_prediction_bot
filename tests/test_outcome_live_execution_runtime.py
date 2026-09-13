@@ -2,6 +2,7 @@ from decimal import Decimal
 import json
 import sqlite3
 import time
+from types import SimpleNamespace
 
 from bot.lifecycle.outcome_lifecycle import OutcomeMarketSpec
 from bot.outcome_live_execution_runtime import OutcomeLiveExecutionRuntime
@@ -55,6 +56,24 @@ def test_runtime_blocks_cross_side_existing_exposure(monkeypatch):
     monkeypatch.setenv("OUTCOME_SDK_EXECUTION_ENABLED", "1")
     runtime = OutcomeLiveExecutionRuntime(account=Account(orders=[{"coin": "#11531", "side": "B", "oid": 7, "sz": "13"}]), wallet="w", gateway=Gateway(), stream_health=healthy_stream())
     assert runtime.tick(market=market(), side_index=0, entry_permitted=True).state == "blocked"
+
+
+def test_high_weight_fill_sync_is_cadenced_but_unsafe_inventory_is_immediate():
+    runtime = OutcomeLiveExecutionRuntime(account=Account(), wallet="w", gateway=Gateway())
+    runtime._last_fill_sync_at = 100.0
+    assert runtime._should_sync_fills(
+        active=[SimpleNamespace(state="buy_resting")], pending_owned_entry=False, now=101.5,
+    ) is False
+    assert runtime._should_sync_fills(
+        active=[SimpleNamespace(state="protected_inventory")], pending_owned_entry=False, now=129.9,
+    ) is False
+    assert runtime._should_sync_fills(
+        active=[SimpleNamespace(state="protected_inventory")], pending_owned_entry=False, now=130.0,
+    ) is True
+    assert runtime._should_sync_fills(
+        active=[SimpleNamespace(state="unprotected_inventory")], pending_owned_entry=False, now=101.5,
+    ) is True
+    assert runtime._should_sync_fills(active=[], pending_owned_entry=True, now=101.5) is True
 
 
 def test_runtime_reduce_only_cancels_owned_buys(monkeypatch):
@@ -645,7 +664,7 @@ def test_s0_initial_protective_sell_keeps_five_percent_target_with_e4_enabled(mo
         ledger=OutcomeExecutionLedger(journal, "run"),
     )
     finding = type("Finding", (), {"coin": "#11530"})()
-    result = runtime._advance_persisted_p3_exit(market=market(), finding=finding)
+    result = runtime.holding_execution_service.advance_persisted_exit(market=market(), finding=finding)
     assert result is not None and result.state == "sell_placed"
     assert gateway.calls[0]["price"] == Decimal("0.74868") * Decimal("1.05") / Decimal("0.9996")
 
@@ -849,7 +868,7 @@ def test_s3_emergency_exit_requires_durable_loss_band_then_uses_price_protected_
     monkeypatch.setattr("bot.outcome_emergency_exit.time.time", lambda: base)
 
     finding = type("Finding", (), {"coin": "#11530", "inventory": Decimal("13"), "sell_order_ids": ("old-sell",)})()
-    result = runtime._maybe_emergency_exit(market=market(), finding=finding)
+    result = runtime.holding_risk_service.maybe_emergency(market=market(), finding=finding)
 
     assert result is not None and result.state == "emergency_exit_residual"
     assert [name for name, _ in gateway.calls] == ["cancel", "ioc"]
@@ -879,12 +898,12 @@ def test_fast_failure_exit_uses_official_fill_age_and_never_waits_for_loss_band(
     store.record(OutcomeExitLifecycle("w", 1153, "#11530", "old-sell", Decimal("13"), Decimal("0.76"), 0, "SELL_RESTING"), reason="fixture")
     runtime = OutcomeLiveExecutionRuntime(account=account, wallet="w", gateway=gateway, ledger=ledger, exit_lifecycle_store=store)
     runtime._emergency_reversal_windows[(1153, "#11530")] = (base - 121, base - 1, 3)
-    monkeypatch.setattr(runtime, "_official_holding_age_sec", lambda **_: 120.0)
+    runtime.holding_risk_service.official_holding_age = lambda **_: 120.0
     monkeypatch.setattr("bot.outcome_live_execution_runtime.time.time", lambda: base)
     monkeypatch.setattr("bot.outcome_emergency_exit.time.time", lambda: base)
     finding = type("Finding", (), {"coin": "#11530", "inventory": Decimal("13"), "sell_order_ids": ("old-sell",)})()
 
-    result = runtime._maybe_fast_failure_exit(market=market(), finding=finding)
+    result = runtime.holding_risk_service.maybe_fast_failure(market=market(), finding=finding)
 
     assert result is not None and result.state == "emergency_exit_residual"
     assert [name for name, _ in gateway.calls] == ["cancel", "ioc"]
@@ -913,7 +932,7 @@ def test_s3_young_protected_holding_skips_fee_and_l2_reads(monkeypatch, tmp_path
         account=YoungAccount(), wallet="w", gateway=NoBookGateway(), ledger=ledger, exit_lifecycle_store=store,
     )
     finding = type("Finding", (), {"coin": "#11530", "inventory": Decimal("13"), "sell_order_ids": ("old-sell",)})()
-    assert runtime._maybe_emergency_exit(market=market(), finding=finding) is None
+    assert runtime.holding_risk_service.maybe_emergency(market=market(), finding=finding) is None
 
 
 def test_s3_uses_exact_durable_fill_fallback_when_exchange_history_is_temporarily_empty(monkeypatch, tmp_path):
@@ -952,7 +971,7 @@ def test_s3_uses_exact_durable_fill_fallback_when_exchange_history_is_temporaril
     monkeypatch.setattr("bot.outcome_emergency_exit.time.time", lambda: base)
     finding = type("Finding", (), {"coin": "#11530", "inventory": Decimal("13"), "sell_order_ids": ("old-sell",)})()
 
-    result = runtime._maybe_emergency_exit(market=market(), finding=finding)
+    result = runtime.holding_risk_service.maybe_emergency(market=market(), finding=finding)
 
     assert result is not None and result.state == "emergency_exit_residual"
     assert [name for name, _ in gateway.calls] == ["cancel", "ioc"]

@@ -11,6 +11,7 @@ from bot.outcome_emergency_exit import (
     parse_bid_levels,
 )
 from bot.outcome_exit_lifecycle import OutcomeExitLifecycle, OutcomeExitLifecycleStore
+from bot.outcome_sdk_sidecar import OutcomeSdkAmbiguousExecutionError
 from monitoring.trade_journal_db import TradeJournalDB
 
 
@@ -151,3 +152,25 @@ def test_partial_ioc_records_residual_and_keeps_one_bounded_retry(tmp_path):
     assert recovered.inventory == Decimal("10")
     assert store.emergency_attempt_count(wallet="w", outcome_id=1153, coin="#11530") == 1
     assert store.emergency_attempted(wallet="w", outcome_id=1153, coin="#11530") is False
+
+
+def test_ambiguous_ioc_is_durably_fenced_and_consumes_attempt_budget(tmp_path):
+    account, gateway = Account(), Gateway(None)
+    gateway.account = account
+    store = OutcomeExitLifecycleStore(TradeJournalDB(tmp_path / "journal.db"), "run")
+    lifecycle = OutcomeExitLifecycle("w", 1153, "#11530", "old-7", Decimal("13"), Decimal("0.76"), 0, "LOSS_BAND_UNFILLED")
+    store.record(lifecycle, reason="loss_band")
+    def ambiguous_ioc(**kwargs):
+        gateway.calls.append(("ioc", kwargs))
+        raise OutcomeSdkAmbiguousExecutionError(
+            command="place_emergency_ioc_exit", request_id="request-ioc", detail="response timeout",
+        )
+    gateway.place_price_protected_ioc_exit = ambiguous_ioc
+    result = OutcomeEmergencyExitController(
+        account=account, gateway=gateway, store=store, wallet="w", policy=OutcomeEmergencyExitPolicy(),
+    ).execute(market=market(), side_index=0, lifecycle=lifecycle, item=item(), plan=OutcomeEmergencyExitPolicy().plan(item()))
+    assert result.state == "reconcile_required"
+    assert "ambiguous" in result.detail
+    pending = store.pending_ambiguous_submit(wallet="w", outcome_id=1153, coin="#11530")
+    assert pending is not None and pending["order_kind"] == "emergency_ioc"
+    assert store.emergency_attempt_count(wallet="w", outcome_id=1153, coin="#11530") == 1

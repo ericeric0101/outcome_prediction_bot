@@ -34,6 +34,18 @@ def cancel_and_confirm(
     between entry replacement, exit replacement, emergency, rollover, and
     graceful shutdown.
     """
+    # A cross-validated WS snapshot is sufficient for steady-state monitoring,
+    # but a mutation boundary deliberately pays for fresh REST truth.  If the
+    # order disappeared between the decision and this read, do not issue a
+    # blind cancel or infer whether it filled.
+    force_reconcile = getattr(account, "force_open_orders_reconciliation_sync", None)
+    if callable(force_reconcile):
+        try:
+            before = force_reconcile(wallet)
+        except Exception as exc:
+            return CancelConfirmResult(False, f"cancel_preflight_unavailable:{type(exc).__name__}")
+        if not any(str(row.get("oid")) == str(order_id) for row in before):
+            return CancelConfirmResult(False, "old_order_not_open_before_cancel")
     try:
         gateway.cancel_owned_order(market=market, side_index=side_index, order_id=str(order_id))
     except Exception as exc:

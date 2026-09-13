@@ -16,6 +16,7 @@ from typing import Any, Protocol
 from bot.lifecycle.outcome_lifecycle import OutcomeMarketSpec
 from bot.outcome_exit_lifecycle import OutcomeExitLifecycle, OutcomeExitLifecycleStore
 from bot.outcome_order_mutation import cancel_and_confirm
+from bot.outcome_sdk_sidecar import OutcomeSdkAmbiguousExecutionError
 
 
 class EmergencyExitAction(StrEnum):
@@ -258,12 +259,43 @@ class OutcomeEmergencyExitController:
             if fresh_plan.action is not EmergencyExitAction.EXECUTE or fresh_plan.limit_price is None:
                 self.store.record(lifecycle, reason=f"emergency_revalidation_{fresh_plan.reason}", extra={"state": "RECONCILE_REQUIRED"})
                 return EmergencyExitExecutionResult("reconcile_required", f"emergency_revalidation_blocked:{fresh_plan.reason}", lifecycle.order_id)
+            intent = self.store.record_submit_intent(
+                wallet=self.wallet, outcome_id=market.outcome_id, coin=lifecycle.coin,
+                order_kind="emergency_ioc", price=fresh_plan.limit_price, shares=after_inventory,
+                old_order_id=lifecycle.order_id, replacement_count=lifecycle.replacement_count,
+                intended_state="EMERGENCY_EXIT_SUBMITTED",
+                context={
+                    "planned_executable_vwap": str(fresh_plan.executable_vwap),
+                    "planned_net_return_pct": str(fresh_plan.net_return_pct),
+                    "policy": self.policy.config.policy_name,
+                },
+            )
+            if intent is None:
+                self.store.record(lifecycle, reason="durable_emergency_intent_unavailable", extra={"state": "RECONCILE_REQUIRED"})
+                return EmergencyExitExecutionResult("reconcile_required", "durable emergency intent unavailable", lifecycle.order_id)
+            intent_id, intent_event_id = intent
             try:
                 result = self.gateway.place_price_protected_ioc_exit(
                     market=market, side_index=side_index, limit_price=fresh_plan.limit_price,
                     requested_shares=after_inventory,
                 )
+            except OutcomeSdkAmbiguousExecutionError as exc:
+                ambiguity_id = self.store.record_ambiguous_submit(
+                    wallet=self.wallet, outcome_id=market.outcome_id, coin=lifecycle.coin,
+                    intent_id=intent_id, intent_event_id=intent_event_id,
+                    order_kind="emergency_ioc", price=fresh_plan.limit_price, shares=after_inventory,
+                    old_order_id=lifecycle.order_id, replacement_count=lifecycle.replacement_count,
+                    intended_state="EMERGENCY_EXIT_SUBMITTED",
+                    sidecar_request_id=exc.request_id, command=exc.command, detail=str(exc),
+                )
+                if ambiguity_id is None:
+                    raise RuntimeError("ambiguous emergency IOC could not persist reconciliation fence") from exc
+                return EmergencyExitExecutionResult("reconcile_required", "ambiguous emergency IOC; account-truth reconciliation required", lifecycle.order_id)
             except Exception as exc:
+                self.store.finalize_submit_intent(
+                    intent_id=intent_id, order_id=None,
+                    reason=f"safe_sdk_rejection:{type(exc).__name__}",
+                )
                 self.store.record(lifecycle, reason=f"emergency_ioc_exception:{type(exc).__name__}", extra={"state": "RECONCILE_REQUIRED"})
                 return EmergencyExitExecutionResult("reconcile_required", "emergency_ioc_submission_failed", lifecycle.order_id)
             self._invalidate_account_reads()
@@ -275,11 +307,17 @@ class OutcomeEmergencyExitController:
                 self.wallet, market.outcome_id, lifecycle.coin, emergency_order_id,
                 after_inventory, fresh_plan.limit_price, lifecycle.replacement_count, "EMERGENCY_EXIT_SUBMITTED",
             )
-            self.store.record(submitted, reason=fresh_plan.reason, extra={
+            if self.store.record(submitted, reason=fresh_plan.reason, extra={
                 "old_order_id": lifecycle.order_id, "requested_shares": str(after_inventory),
                 "limit_price": str(fresh_plan.limit_price), "planned_executable_vwap": str(fresh_plan.executable_vwap),
                 "planned_net_return_pct": str(fresh_plan.net_return_pct), "order_type": "price_protected_fak_ioc",
-            })
+                "exit_intent_id": intent_id,
+            }, durable=True) is None:
+                raise RuntimeError("acknowledged emergency IOC ownership could not persist durably")
+            if not self.store.finalize_submit_intent(
+                intent_id=intent_id, order_id=emergency_order_id, reason="sdk_acknowledged_emergency_ioc",
+            ):
+                raise RuntimeError("acknowledged emergency IOC intent could not finalize durably")
             # FAK/IOC acceptance does not prove a full fill.  Reconcile the
             # residual immediately; a remaining position receives durable
             # evidence and retains one bounded retry rather than silently
