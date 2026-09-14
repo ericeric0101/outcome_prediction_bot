@@ -51,11 +51,11 @@ def test_runtime_is_disabled_without_both_operator_gates(monkeypatch):
     assert runtime.tick(market=market(), side_index=0, entry_permitted=True).state == "disabled"
 
 
-def test_narrow_hard_failure_canary_requires_ten_dollar_limits_and_shared_episode_budget(monkeypatch, tmp_path):
+def test_narrow_hard_failure_canary_requires_eleven_dollar_limits_and_shared_episode_budget(monkeypatch, tmp_path):
     monkeypatch.setenv("OUTCOME_NARROW_HARD_FAILURE_CANARY_ENABLED", "1")
     monkeypatch.setenv("OUTCOME_RISK_EPISODE_BUDGET_ENABLED", "1")
-    monkeypatch.setenv("OUTCOME_MAX_ENTRY_NOTIONAL_USDC", "10")
-    monkeypatch.setenv("OUTCOME_MAX_OUTCOME_EXPOSURE_USDC", "10")
+    monkeypatch.setenv("OUTCOME_MAX_ENTRY_NOTIONAL_USDC", "11")
+    monkeypatch.setenv("OUTCOME_MAX_OUTCOME_EXPOSURE_USDC", "11")
     journal = TradeJournalDB(tmp_path / "narrow_canary.db")
     runtime = OutcomeLiveExecutionRuntime(
         account=CalibrationAccount(), wallet="w", gateway=Gateway(),
@@ -68,7 +68,7 @@ def test_narrow_hard_failure_canary_requires_ten_dollar_limits_and_shared_episod
     assert manifest["narrow_hard_failure_canary"].ready is True
     assert manifest["narrow_hard_failure_canary"].safety_critical is True
 
-    monkeypatch.setenv("OUTCOME_MAX_ENTRY_NOTIONAL_USDC", "11")
+    monkeypatch.setenv("OUTCOME_MAX_ENTRY_NOTIONAL_USDC", "12")
     blocked = OutcomeLiveExecutionRuntime(
         account=CalibrationAccount(), wallet="w", gateway=Gateway(),
         ledger=OutcomeExecutionLedger(TradeJournalDB(tmp_path / "too_large.db"), "run"),

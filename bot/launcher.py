@@ -44,6 +44,7 @@ from bot.outcome_execution_ledger import OutcomeExecutionLedger
 from bot.outcome_operations_monitor import OutcomeOperationsMonitor
 from bot.outcome_research_capture import OutcomeResearchCapture
 from bot.outcome_research_worker import OutcomeResearchWorker
+from bot.deribit_market_data import DeribitMarketDataWorker
 from bot.outcome_rollover import OutcomeRolloverCoordinator
 from monitoring.trade_journal_db import TradeJournalDB
 from bot.enums import MarketPhase
@@ -246,6 +247,7 @@ def run_integrated_hyperliquid_bot(
     # wallet writer.
     research_capture = None
     research_worker = None
+    deribit_worker = None
     if not simulation:
         # Keep capture off the wallet/execution loop.  This client is used
         # exclusively by the worker, whose code has no order submission or
@@ -258,6 +260,15 @@ def run_integrated_hyperliquid_bot(
             client=research_client, capture=research_capture, journal=live_journal,
         )
         research_worker.start()
+        # Deribit is isolated public research only.  Its worker never shares
+        # the account client or execution loop and its absence cannot block
+        # Outcome entry/exit safety.  It is opt-in so a copied environment
+        # never begins an unrelated external connection by surprise.
+        if os.getenv("DERIBIT_RESEARCH_ENABLED", "0").strip().lower() in {"1", "true", "yes", "on"}:
+            deribit_worker = DeribitMarketDataWorker(
+                journal=live_journal, run_id=f"deribit-research-{uuid.uuid4().hex[:10]}",
+            )
+            deribit_worker.start()
     ops_monitor = OutcomeOperationsMonitor(live_journal, f"outcome-ops-{uuid.uuid4().hex[:10]}")
     live_execution = OutcomeLiveExecutionRuntime(
         account=client, wallet=auth.wallet_address,
@@ -286,6 +297,8 @@ def run_integrated_hyperliquid_bot(
         logger.error("Unable to persist runtime safety startup manifest; live startup aborted fail-closed.")
         if research_worker is not None:
             research_worker.stop()
+        if deribit_worker is not None:
+            deribit_worker.stop()
         if settlement_worker is not None:
             settlement_worker.stop()
         raise RuntimeError("durable runtime safety startup manifest unavailable")
@@ -747,6 +760,8 @@ def run_integrated_hyperliquid_bot(
                 logger.error(f"[OUTCOME SHUTDOWN] entry-buy cancellation reconciliation failed: {exc}")
         if research_worker is not None:
             research_worker.stop()
+        if deribit_worker is not None:
+            deribit_worker.stop()
         if settlement_worker is not None:
             settlement_worker.stop()
         if live_ws_recorder is not None:

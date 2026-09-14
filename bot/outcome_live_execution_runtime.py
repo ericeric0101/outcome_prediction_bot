@@ -138,14 +138,15 @@ class OutcomeLiveExecutionRuntime:
             if ledger is not None and os.environ.get("OUTCOME_RISK_EPISODE_BUDGET_ENABLED", "0").strip() == "1"
             else None
         )
-        # This is intentionally an opt-in $10 canary.  A stale copied .env
-        # cannot silently authorize it at a larger exposure, and the lane
-        # cannot run without the shared durable episode budget.
+        # This is intentionally an opt-in $11 canary.  $11 accommodates the
+        # venue's $10 minimum after mandatory whole-share rounding; a stale
+        # copied .env cannot silently authorize a larger exposure, and the
+        # lane cannot run without the shared durable episode budget.
         self.narrow_hard_failure_canary_enabled = bool(
             os.environ.get("OUTCOME_NARROW_HARD_FAILURE_CANARY_ENABLED", "0").strip() == "1"
             and self.risk_episode_store is not None
-            and self.risk_gate.limits.max_entry_notional_usdc <= Decimal("10")
-            and self.risk_gate.limits.max_total_outcome_exposure_usdc <= Decimal("10")
+            and self.risk_gate.limits.max_entry_notional_usdc <= Decimal("11")
+            and self.risk_gate.limits.max_total_outcome_exposure_usdc <= Decimal("11")
         )
         # This observer is deliberately shadow-only.  It has no reference to
         # an execution controller and cannot alter S0/S2/S3 authority.

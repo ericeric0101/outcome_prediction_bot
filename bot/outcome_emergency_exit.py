@@ -63,7 +63,7 @@ class OutcomeEmergencyExitConfig:
 
     @classmethod
     def narrow_hard_failure_canary(cls) -> "OutcomeEmergencyExitConfig":
-        """The separately shadow-validated $10 hard-failure IOC lane.
+        """The separately shadow-validated $11 hard-failure IOC lane.
 
         Eligibility is supplied by the read-only multi-signal monitor; this
         policy only retains the common fresh-depth, fee and loss-cap boundary.

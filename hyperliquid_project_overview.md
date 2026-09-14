@@ -1095,11 +1095,11 @@ flowchart TD
 | `HL_AGENT_PRIVATE_KEY` | `0x...` (選填) | 專用 Agent Key 私鑰 (若留空則程式自動生成暫態 Key) |
 | `HL_TESTNET` | `0` (主網) / `1` (測試網) | 是否連線至 Hyperliquid Testnet |
 | `HL_MIN_NOTIONAL_USDC` | `10.0` | 最小開倉名義價值 (USDC) |
-| `OUTCOME_MAX_ENTRY_NOTIONAL_USDC` | `10`（2026-09-14 canary） | 每筆 Outcome entry 上限；dynamic sizing 可因薄盤降至官方 $10 opening minimum，絕不以拆單補足。`$20` 是歷史 F5 階段，不可和本輪 canary 混用。 |
-| `OUTCOME_MAX_OUTCOME_EXPOSURE_USDC` | `10`（2026-09-14 canary） | Outcome 總曝險上限；必須包含 inventory 與可能成交的 resting BUY；任一 limit 超過 `$10` 時窄版 IOC 不啟用。 |
+| `OUTCOME_MAX_ENTRY_NOTIONAL_USDC` | `11`（2026-09-14 canary） | 每筆 Outcome entry 上限；這是官方 $10 minimum 在整數 shares 下的必要取整餘裕，並非一般 size tier 擴張。dynamic sizing 可因薄盤降至官方 $10 opening minimum，絕不以拆單補足。`$20` 是歷史 F5 階段，不可和本輪 canary 混用。 |
+| `OUTCOME_MAX_OUTCOME_EXPOSURE_USDC` | `11`（2026-09-14 canary） | Outcome 總曝險上限；必須包含 inventory 與可能成交的 resting BUY。任一 limit 超過 `$11` 時窄版 IOC 不啟用。 |
 | `OUTCOME_MAX_OPEN_ORDERS` | `1` | Outcome 同時 open orders 上限；不得以提高此值迴避單一市場 entry／exit ownership |
 | `OUTCOME_RISK_EPISODE_BUDGET_ENABLED` | `1`（canary profile） | 啟用 fast-failure/S3/窄版 hard lane 共用的 durable attempt budget；不存在即 fail-closed。 |
-| `OUTCOME_NARROW_HARD_FAILURE_CANARY_ENABLED` | `1`（canary profile） | 僅啟用上述 `$10` 窄版 hard IOC lane；tracked example 保持 `0`，需人工設定與重啟。 |
+| `OUTCOME_NARROW_HARD_FAILURE_CANARY_ENABLED` | `1`（canary profile） | 僅啟用上述 `$11` 窄版 hard IOC lane；tracked example 保持 `0`，需人工設定與重啟。 |
 | `HL_REFERRAL_CODE` | `""` | 推薦碼 (享受 4% 手續費返還折扣) |
 | `ENTRY_SCORE_MIN`、`FIRST_ENTRY_*` | legacy / shadow | 不參與目前 Outcome S0 live entry；S0 由 OI/mark/spot-strike gate 決定。 |
 | `HOLD_TO_REDEEM` | legacy / shadow | 不授權 Outcome one-sided payout 或自動 redeem；Outcome settlement 仍只接受官方 evidence。 |
@@ -1395,13 +1395,113 @@ This milestone is **not live and not approved for canary**.
 
 ### 2026-09-14 bounded tail-loss intervention: explicit operator-authorized exception
 
-The broad Stage-2 promotion criteria above were not waived. An operator authorized one deliberately narrow `$10` live canary only after the final definition was replayed across all **43** reconstructable lifecycles: **1** cap-eligible hard candidate and **0** ultimately-profitable cap-eligible candidates. The sole historical candidate was `#2820`, at approximately **-12.109%**, with full 21-share depth and approximately **-420.97 bps** 30-second bid velocity.
+The broad Stage-2 promotion criteria above were not waived. An operator authorized one deliberately narrow `$11` live canary only after the final definition was replayed across all **43** reconstructable lifecycles: **1** cap-eligible hard candidate and **0** ultimately-profitable cap-eligible candidates. The sole historical candidate was `#2820`, at approximately **-12.109%**, with full 21-share depth and approximately **-420.97 bps** 30-second bid velocity. `$11` is solely the whole-share rounding allowance for the venue's $10 opening minimum.
 
 1. **High-premium new-entry pause.** A selected bid **>=85¢** pauses a fresh BUY on either YES or NO. It does not cancel, reprice or otherwise affect an existing inventory, protective SELL, reduce-only behavior or settlement. It addresses the capped-upside geometry in the 92–93¢ `#2437`/`#2820` entries; it does not claim to solve the lower-priced `#1993` tail.
-2. **Narrow hard-failure IOC.** It requires an exact official-fill-bound lifecycle aged >=60 seconds; a fresh WS two-or-more-signal warning persisted >=10 seconds; WS drawdown >=-10%; a newly fetched complete L2 walk for the *entire* inventory; and fee-inclusive executable return >=-15%. Only then it delegates to the existing durable-intent, cancel-and-confirm, re-read-L2, price-protected reduce-only FAK/IOC controller. It cannot activate if either configured entry or exposure cap exceeds `$10`.
+2. **Narrow hard-failure IOC.** It requires an exact official-fill-bound lifecycle aged >=60 seconds; a fresh WS two-or-more-signal warning persisted >=10 seconds; WS drawdown >=-10%; a newly fetched complete L2 walk for the *entire* inventory; and fee-inclusive executable return >=-15%. Only then it delegates to the existing durable-intent, cancel-and-confirm, re-read-L2, price-protected reduce-only FAK/IOC controller. It cannot activate if either configured entry or exposure cap exceeds `$11`.
 3. **One shared budget.** The lane has no independent attempt counter. It refuses to run unless `OutcomeRiskEpisodeStore` is enabled and uses the same durable wallet/outcome/coin episode as existing fast-failure and S3. An accepted or ambiguous prior attempt therefore consumes the same conservative budget.
 4. **Warning lane remains shadow-only.** Short-TTL aggressive-passive warning behavior retains no cancel, reprice, or IOC authority.
 
-The actual local canary profile explicitly sets `OUTCOME_RISK_EPISODE_BUDGET_ENABLED=1`, `OUTCOME_NARROW_HARD_FAILURE_CANARY_ENABLED=1`, and both Outcome limits to `10`. The tracked `.env.example` keeps the canary flag `0`, preventing accidental activation by a copied profile. A restart is required; startup manifest must report `narrow_hard_failure_canary=ready`. Canary review must compare decision→ACK, decision→confirmed-flat, partial/full fills, cap blocks, shared-episode usage, false exits and realized capital-hours before any expansion. No directional signal, OI gate, ALO entry selection, normal take-profit, warning-lane, or S3/fast-failure threshold changes in this deployment.
+The actual local canary profile explicitly sets `OUTCOME_RISK_EPISODE_BUDGET_ENABLED=1`, `OUTCOME_NARROW_HARD_FAILURE_CANARY_ENABLED=1`, and both Outcome limits to `11`. The tracked `.env.example` keeps the canary flag `0`, preventing accidental activation by a copied profile. A restart is required; startup manifest must report `narrow_hard_failure_canary=ready`. Canary review must compare decision→ACK, decision→confirmed-flat, partial/full fills, cap blocks, shared-episode usage, false exits and realized capital-hours before any expansion. No directional signal, OI gate, ALO entry selection, normal take-profit, warning-lane, or S3/fast-failure threshold changes in this deployment.
+
+### 2026-09-14 — Deribit external-derivatives research integration plan (approved for planning only; no code or live authority)
+
+**Decision purpose and strict boundary.** Deribit is a prospective *external feature source* for the existing E2/B1–B5 research layers.  It is not an execution venue, wallet, settlement adapter, or an alternative source of truth for an Outcome contract.  In particular, no Deribit instrument can "correctly predict BTC" in a way that replaces the Outcome market's own official resolution.  Current Outcome settlement must continue to use official Outcome SDK/account evidence only.  Deribit data may instead help answer narrower, testable questions: whether external BTC price discovery, perp order-flow pressure, implied-volatility regime, or option skew improves a prediction of a **future executable Outcome bid**, a recovery probability, or a tail-risk state beyond the current Binance/Outcome features.
+
+This distinction is required because the active Outcome contract's exact resolution reference is venue-specific.  A Deribit BTC index/perpetual may be correlated with it but is not proof of its comparator, timing rule, or final settlement value.  Any feature that is stale, has a broken book sequence, has ambiguous instrument metadata, or cannot be aligned as-of the Outcome decision timestamp must be recorded as unavailable and must not be imputed.
+
+**Official API findings.** The official Deribit quickstart recommends JSON-RPC over WebSocket for real-time bots and shows that public market data/subscriptions do not require authentication; its test and production environments are separate, with production at `www.deribit.com`.  `ticker.BTC-PERPETUAL.100ms` exposes BBO, mark, index, OI and funding; `book.BTC-PERPETUAL.100ms` provides a snapshot followed by sequenced changes with `change_id`/`prev_change_id`; `trades.BTC-PERPETUAL.100ms` exposes executed trade direction and amount.  The `raw` interval requires authorization, whereas `100ms` is public.  Options ticker data exposes bid/ask/mark IV and Greeks.  Deribit recommends `instrument.state.option.BTC` over frequent `get_instruments` polling, and documents a sustained `public/subscribe` limit of about 3.3 requests per second.  See official references: [quickstart](https://docs.deribit.com/articles/deribit-quickstart), [notifications](https://docs.deribit.com/articles/notifications), [ticker](https://docs.deribit.com/subscriptions/market-data/tickerinstrument_nameinterval), [book](https://docs.deribit.com/subscriptions/orderbook/bookinstrument_nameinterval), [instruments](https://docs.deribit.com/api-reference/market-data/public-get_instruments), [book summaries](https://docs.deribit.com/api-reference/market-data/public-get_book_summary_by_currency), [volatility-index history](https://docs.deribit.com/api-reference/market-data/public-get_volatility_index_data), and [rate limits](https://docs.deribit.com/articles/rate-limits).
+
+#### D0 — source selection and credentials (no connection, no secret ingestion)
+
+The initial research universe is deliberately small and has separate roles:
+
+| Deribit source | Role in research | Explicit non-role |
+|---|---|---|
+| `deribit_price_index.btc_usd` | independent BTC/USD reference and Binance-vs-Deribit basis/latency-quality feature | Outcome settlement truth or direct BUY/SELL signal |
+| `BTC-PERPETUAL` ticker, BBO book, and public trades | short-horizon external price discovery, spread/depth/imbalance, aggressive trade-flow, funding and OI features | Deribit order submission or a replacement for Hyperliquid Outcome L2 |
+| BTC volatility-index data / supported live volatility-index subscription | volatility-regime and expected-range feature; useful for distinguishing normal repricing from unusual Outcome dislocation | a directional forecast by itself |
+| selected BTC options around ATM across the nearest viable expiry/next expiry | IV level, term structure, call-put skew and option-implied tail-risk features | subscribing to the full options universe or treating option IV as a guaranteed directional edge |
+
+`public/get_instruments(currency="BTC", kind="option")` is only a low-frequency bootstrap/recovery query.  Thereafter `instrument.state.option.BTC` owns expiry/open/terminal changes.  The option selector must choose a bounded ATM-centered set from **currently open** instruments, record each expiry and strike, and reject a surface if quotes are crossed, missing, stale, or too sparse.  It must never hard-code an expiry name or assume that an option expiry exactly matches the 14:00 Taipei Outcome settlement.  Near-expiry options can inform a volatility regime, but their expiry mismatch must remain an explicit feature/audit field.
+
+The user-prepared API key is **not needed for D1 public data** and must not be pasted into chat, source, tests, journal payloads, terminal output, or tracked `.env.example`.  If a later authorized raw-channel experiment needs it, use only locally ignored `DERIBIT_CLIENT_ID` / `DERIBIT_CLIENT_SECRET`, minimal read-only scope, no trade/withdrawal scope, redacted startup reporting, and separate testnet/production credentials.  No private Deribit endpoint is in this plan.
+
+#### D1 — bounded public WebSocket collector (shadow-only)
+
+**Implementation status (2026-09-14):** D1 is implemented as
+`bot.deribit_market_data.DeribitMarketDataWorker`.  It remains opt-in through
+`DERIBIT_RESEARCH_ENABLED=1` (default `0` in `.env.example`), so deployment
+requires an explicit local configuration change and a launcher restart.  It
+does not accept, load, or need a Deribit credential.  The launcher owns it as
+an isolated daemon thread and stops it during normal shutdown; a Deribit
+disconnect cannot block, slow, authorize, or otherwise alter the Outcome
+execution lane.  It emits only `DERIBIT_FEATURE_SNAPSHOT` (at most once per
+configured second) and de-duplicated `DERIBIT_RESEARCH_STATUS` events.  The
+read-only `scripts/deribit_feature_quality_report.py --db
+logs/outcome_shadow.db` reports valid/unavailable snapshot counts before D2
+can be considered.  The collector/test contract covers a valid snapshot,
+book-sequence gap, stale-book invalidation, and bounded journal payloads.
+No option-surface selector, Deribit-to-Outcome as-of join, model feature, or
+live decision authority is implemented yet.
+
+Add one independent, restart-safe `DeribitMarketDataWorker` only after a separate implementation authorization.  It will connect to `wss://www.deribit.com/ws/api/v2`, use unique JSON-RPC request ids, subscribe once per managed channel set, and start with public `100ms` rather than authorized `raw` channels:
+
+```text
+deribit_price_index.btc_usd
+ticker.BTC-PERPETUAL.100ms
+book.BTC-PERPETUAL.100ms
+trades.BTC-PERPETUAL.100ms
+instrument.state.option.BTC
+selected ticker.<BTC-option>.100ms channels only
+```
+
+The worker must maintain the perpetual book from the initial snapshot and only accept a change whose `prev_change_id` continues the locally accepted sequence.  Any gap, reconnect, malformed message, rate-limit/disconnect, or stale source timestamp clears the affected feature state, re-subscribes, and reports `deribit_features_unavailable`; it never extrapolates a missing book.  WebSocket reconnect/backoff must be isolated from the Outcome execution thread.  The worker may not import an Outcome gateway, account, private key, controller, lifecycle store with mutation methods, or any execution service.
+
+To prevent another multi-GB raw-payload problem, the persistent contract is **derived evidence only**: one as-of feature vector per second plus state transitions, gap/reconnect counters, and event-triggered 100ms summaries around an existing entry/holding/tail candidate.  It must not persist every raw options book update or an unbounded full L2 payload.  A short in-memory ring buffer may support triggered summaries, but is discarded on restart and never treated as missing historical evidence.
+
+#### D2 — feature contract and alignment audit (shadow-only)
+
+For each existing Outcome decision/lifecycle timestamp, record an immutable as-of join with:
+
+1. Deribit index, Deribit-vs-Binance basis, and their short returns;
+2. perpetual BBO/mid/spread, top-of-book sizes, imbalance, microprice proxy, trade-flow imbalance, mark/index basis, funding and OI;
+3. volatility-index level/change; and
+4. option-surface quality, selected ATM mark/bid/ask IV, call-put skew and expiry/tenor mismatch.
+
+Every field carries source timestamp, local receipt timestamp, age, connection generation, and validity reason.  A feature may be fed to research only if it was observed no later than the decision timestamp and within a predeclared freshness budget.  Outcome state, current S0 signal, side, time-left, spread/depth, entry/fill/exit path, and eventual executable labels remain separately recorded; no future Outcome quote, fill, settlement result, or later option quote may leak into a decision row.
+
+#### D3 — incremental-value research, not a new signal by assertion
+
+Deribit features enter two frozen, comparable shadow variants:
+
+```text
+Baseline: existing E2/B1/B2 features
+Candidate: baseline + validated Deribit public features
+```
+
+The targets remain executable and decision-specific: 5/15/30/60-second and 5-minute future Outcome **bid**, fee-after target/recovery probability, MAE/MFE, tail-warning probability, and capital-time outcome.  Evaluation must use purged chronological walk-forward splits by complete Outcome daily market; never random snapshot splits.  It must report per independent market, weekday/weekend, time-left, price, spread/depth and volatility bucket:
+
+- out-of-sample RMSE/MAE/calibration versus the existing persistence and baseline models;
+- decision-action distribution (`WAIT`, join, improve-one-tick, bounded marketable candidate), not just a headline accuracy score;
+- post-entry executable markout, realized/counterfactual PnL and PnL per capital-hour;
+- tail detection recall, recover-winner false-exit cost, and feature availability/staleness bias.
+
+The primary hypothesis is **incremental** value: a Deribit model must beat the identical non-Deribit model on unseen markets, not merely fit historical rows.  A negative or unstable contribution means the feature is removed from the candidate model; it is not retained because it sounds sophisticated.
+
+#### D4 — promotion gates and explicit non-authority
+
+No D1–D3 component may alter Tier-A/B/C, OI veto, entry size, spread cap, ALO price, high-premium pause, normal exit, warning lane, narrow hard-failure canary, S3, or settlement.  The only initial output is `live_authority=false` shadow telemetry and read-only reports.
+
+Before proposing any execution-policy canary, the candidate must show all of the following on predeclared unseen daily markets: adequate data quality/uptime; positive incremental value versus the non-Deribit baseline after fees/depth; no material degradation in recover-winner preservation; improved or non-worse tail capital-hour exposure; and stable results across both weekday/weekend and time-left buckets.  At least 15–20 independent daily markets are required for a tail/exit proposal; entry-policy promotion also requires enough actual fills to compare fill probability and executable markout, not merely model rows.  Passing D4 can produce only `READY_FOR_CANARY_REVIEW`; a separate operator authorization is required for any limited live policy.
+
+#### Implementation order after a future explicit authorization
+
+1. Add public-only worker, typed immutable feature snapshot, bounded recorder, sequence/gap tests, and a startup manifest that lists Deribit as `read_only`.
+2. Run it alongside the existing bot with no API key and verify freshness, reconnect behavior, row size, DB growth and zero impact on execution-loop latency.
+3. Add option-universe selector and surface-quality recorder only after the perpetual/index collector is healthy; use `instrument.state.option.BTC`, not polling loops.
+4. Add D2 as-of joins and a read-only data-quality report.
+5. Add the baseline-versus-Deribit B1/B2 walk-forward report.  Do not retrain/reload artifacts inside the live process.
+6. If, and only if, D3/D4 pass, design one independent shadow execution/exit policy comparison.  It must produce a `PreparedDecision` and still delegate any future mutation through the existing execution service, durable intent, ambiguity fence, account reconciliation, portfolio guard and lifecycle protections.
 
 ### 關鍵環境變數清單

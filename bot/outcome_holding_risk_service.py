@@ -61,7 +61,7 @@ class OutcomeHoldingRiskService:
         self.risk_episodes = risk_episodes
 
     def maybe_narrow_hard_failure(self, *, market: OutcomeMarketSpec, finding: object) -> LiveExecutionResult | None:
-        """Execute only a fresh, shadow-qualified $10-cap canary candidate.
+        """Execute only a fresh, shadow-qualified $11-cap canary candidate.
 
         The candidate has no mutation authority.  This method independently
         re-reads fees/L2 and shares the same durable risk-episode budget as
