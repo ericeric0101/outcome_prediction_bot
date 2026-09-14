@@ -1,4 +1,4 @@
-"""Print read-only Deribit public-feature collection quality."""
+"""Print D3 baseline-versus-Deribit read-only walk-forward report."""
 from __future__ import annotations
 
 import argparse
@@ -6,18 +6,15 @@ import json
 import sys
 from pathlib import Path
 
-# Running a repository script by path puts ``scripts/`` rather than the
-# repository root on sys.path.  Keep this report invocation self-contained;
-# it remains read-only and never loads runtime credentials.
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from bot.deribit_feature_report import as_json
+from bot.outcome_deribit_walkforward import as_json
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Deribit public-feature collection quality report")
+    parser = argparse.ArgumentParser(description="Read-only Outcome baseline-vs-Deribit walk-forward")
     parser.add_argument("--db", default="logs/outcome_shadow.db")
     args = parser.parse_args()
     print(json.dumps(as_json(args.db), indent=2, sort_keys=True))

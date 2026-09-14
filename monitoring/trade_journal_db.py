@@ -322,6 +322,34 @@ class TradeJournalDB:
         CREATE INDEX IF NOT EXISTS idx_outcome_oi_features_market_time
             ON outcome_oi_feature_rows(outcome_id, period, snapshot_timestamp_ms);
 
+        -- D2: immutable Outcome decision-time joins to public Deribit
+        -- feature snapshots.  The source event id and both clocks remain
+        -- explicit so a model cannot silently turn delayed data into alpha.
+        -- These rows are research-only; no execution path reads this table.
+        CREATE TABLE IF NOT EXISTS outcome_deribit_feature_rows (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            feature_schema_version INTEGER NOT NULL,
+            outcome_snapshot_event_id INTEGER NOT NULL,
+            outcome_id INTEGER NOT NULL,
+            period TEXT NOT NULL,
+            snapshot_timestamp_ms INTEGER NOT NULL,
+            deribit_snapshot_event_id INTEGER,
+            deribit_source_timestamp_ms INTEGER,
+            deribit_local_received_at_ms INTEGER,
+            deribit_age_ms INTEGER,
+            deribit_join_direction TEXT NOT NULL,
+            deribit_valid INTEGER NOT NULL DEFAULT 0,
+            features_json TEXT NOT NULL,
+            labels_json TEXT NOT NULL,
+            market_context_json TEXT NOT NULL,
+            generated_at TEXT NOT NULL,
+            UNIQUE(feature_schema_version, outcome_snapshot_event_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_outcome_deribit_features_market_time
+            ON outcome_deribit_feature_rows(outcome_id, period, snapshot_timestamp_ms);
+        CREATE INDEX IF NOT EXISTS idx_outcome_deribit_features_source_time
+            ON outcome_deribit_feature_rows(deribit_local_received_at_ms, deribit_valid);
+
         CREATE TABLE IF NOT EXISTS outcome_oi_fill_feature_rows (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             feature_schema_version INTEGER NOT NULL,
@@ -1433,6 +1461,67 @@ class TradeJournalDB:
             return written
         except Exception as e:
             logger.debug(f"TradeJournalDB bulk_upsert_outcome_oi_feature_rows failed after {written} rows: {e}")
+            raise
+
+    def bulk_upsert_outcome_deribit_feature_rows(
+        self,
+        rows: Iterable[Mapping[str, Any]],
+        *,
+        batch_size: int = 500,
+        progress: Callable[[int], None] | None = None,
+    ) -> int:
+        """Write D2 derived joins in short, restart-safe transactions only."""
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        sql = """
+        INSERT INTO outcome_deribit_feature_rows (
+          feature_schema_version,outcome_snapshot_event_id,outcome_id,period,snapshot_timestamp_ms,
+          deribit_snapshot_event_id,deribit_source_timestamp_ms,deribit_local_received_at_ms,deribit_age_ms,
+          deribit_join_direction,deribit_valid,features_json,labels_json,market_context_json,generated_at
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(feature_schema_version,outcome_snapshot_event_id) DO UPDATE SET
+          deribit_snapshot_event_id=excluded.deribit_snapshot_event_id,
+          deribit_source_timestamp_ms=excluded.deribit_source_timestamp_ms,
+          deribit_local_received_at_ms=excluded.deribit_local_received_at_ms,
+          deribit_age_ms=excluded.deribit_age_ms,deribit_join_direction=excluded.deribit_join_direction,
+          deribit_valid=excluded.deribit_valid,features_json=excluded.features_json,
+          labels_json=excluded.labels_json,market_context_json=excluded.market_context_json,
+          generated_at=excluded.generated_at
+        """
+
+        def values(row: Mapping[str, Any]) -> tuple[Any, ...]:
+            return (
+                row["feature_schema_version"], row["outcome_snapshot_event_id"], row["outcome_id"], row["period"],
+                row["snapshot_timestamp_ms"], row.get("deribit_snapshot_event_id"),
+                row.get("deribit_source_timestamp_ms"), row.get("deribit_local_received_at_ms"),
+                row.get("deribit_age_ms"), row["deribit_join_direction"], int(bool(row.get("deribit_valid"))),
+                _json_dumps(dict(row["features"])), _json_dumps(dict(row["labels"])),
+                _json_dumps(dict(row["market_context"])), _utc_now_iso(),
+            )
+
+        written, batch = 0, []
+        try:
+            for row in rows:
+                batch.append(values(row))
+                if len(batch) < batch_size:
+                    continue
+                with self._connect() as conn:
+                    conn.executemany(sql, batch)
+                    conn.commit()
+                written += len(batch)
+                if progress:
+                    progress(written)
+                batch.clear()
+            if batch:
+                with self._connect() as conn:
+                    conn.executemany(sql, batch)
+                    conn.commit()
+                written += len(batch)
+                if progress:
+                    progress(written)
+            return written
+        except Exception as exc:
+            logger.debug(f"TradeJournalDB bulk_upsert_outcome_deribit_feature_rows failed after {written} rows: {exc}")
             raise
 
     def upsert_outcome_oi_fill_feature_row(self, *, feature_schema_version: int, fill_order_event_id: int,

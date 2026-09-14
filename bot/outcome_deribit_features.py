@@ -1,0 +1,278 @@
+"""D2: leak-free as-of joins between Outcome P2 snapshots and Deribit data.
+
+This is an offline research builder.  It cannot import a client, runtime,
+gateway, or execution service.  A Deribit observation is eligible only when
+it was locally received no later than the Outcome snapshot and its own
+collector already declared the book valid.
+"""
+from __future__ import annotations
+
+import json
+import math
+import sqlite3
+from bisect import bisect_left, bisect_right
+from collections import defaultdict
+from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
+from typing import Any, Callable, Mapping
+
+from bot.outcome_oi_features import _bbo
+from bot.outcome_p2_quality import is_eligible_p2_snapshot
+from monitoring.trade_journal_db import TradeJournalDB
+
+
+DERIBIT_FEATURE_SCHEMA_VERSION = 1
+DERIBIT_LABEL_HORIZONS_SEC = (5, 15, 30, 60, 300)
+DERIBIT_LABEL_TOLERANCE_MS = 7_500
+
+
+def _number(value: Any) -> float | None:
+    try:
+        result = float(Decimal(str(value)))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    return result if math.isfinite(result) else None
+
+
+@dataclass(frozen=True)
+class _DeribitPoint:
+    event_id: int
+    source_timestamp_ms: int | None
+    local_received_at_ms: int
+    payload: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class D2BuildResult:
+    eligible_outcome_snapshots: int
+    rows_written: int
+    deribit_joined: int
+    deribit_unavailable: int
+    labels_available: dict[int, int]
+    first_deribit_received_at_ms: int | None
+    last_deribit_received_at_ms: int | None
+
+
+class _DeribitIndex:
+    def __init__(self, points: list[_DeribitPoint]) -> None:
+        self.points = tuple(sorted(points, key=lambda point: point.local_received_at_ms))
+        self.times = tuple(point.local_received_at_ms for point in self.points)
+
+    def as_of(self, timestamp_ms: int) -> _DeribitPoint | None:
+        index = bisect_right(self.times, timestamp_ms) - 1
+        return self.points[index] if index >= 0 else None
+
+    def return_bps(self, point: _DeribitPoint, *, field: str, horizon_sec: int) -> float | None:
+        prior = self.as_of(point.local_received_at_ms - horizon_sec * 1000)
+        current_value = _number(point.payload.get(field))
+        prior_value = _number(prior.payload.get(field)) if prior else None
+        if current_value is None or prior_value is None or prior_value <= 0:
+            return None
+        return ((current_value / prior_value) - 1.0) * 10_000.0
+
+
+class OutcomeDeribitFeaturePipeline:
+    """Build recomputable D2 rows with strict local-receipt as-of semantics."""
+
+    def __init__(self, journal: TradeJournalDB) -> None:
+        self.journal = journal
+
+    @staticmethod
+    def _outcome_snapshots(
+        conn: sqlite3.Connection, *, after_ms: int | None, after_event_id: int | None,
+    ) -> list[tuple[int, dict[str, Any]]]:
+        # The journal id is only an efficient lower bound on scanning; it is
+        # never used as timing evidence.  The actual join still requires
+        # Deribit local receipt <= Outcome snapshot timestamp.
+        if after_event_id is None:
+            rows = conn.execute(
+                "SELECT id,payload_json FROM strategy_events WHERE event_type='OUTCOME_P2_PARITY_SNAPSHOT' ORDER BY id"
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT id,payload_json FROM strategy_events "
+                "WHERE event_type='OUTCOME_P2_PARITY_SNAPSHOT' AND id>=? ORDER BY id", (after_event_id,)
+            ).fetchall()
+        snapshots: list[tuple[int, dict[str, Any]]] = []
+        for event_id, raw in rows:
+            try:
+                payload = json.loads(raw or "{}")
+                timestamp = int(payload.get("snapshot_timestamp_ms"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if (
+                isinstance(payload, dict) and payload.get("period") == "1d"
+                and is_eligible_p2_snapshot(payload) and (after_ms is None or timestamp >= after_ms)
+            ):
+                snapshots.append((int(event_id), payload))
+        return snapshots
+
+    @staticmethod
+    def _deribit_points(conn: sqlite3.Connection) -> list[_DeribitPoint]:
+        rows = conn.execute(
+            "SELECT id,payload_json FROM strategy_events WHERE event_type='DERIBIT_FEATURE_SNAPSHOT' ORDER BY id"
+        ).fetchall()
+        points: list[_DeribitPoint] = []
+        for event_id, raw in rows:
+            try:
+                payload = json.loads(raw or "{}")
+                local = int(payload.get("local_received_at_ms"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if not isinstance(payload, dict) or payload.get("valid") is not True:
+                continue
+            source = payload.get("source_timestamp_ms")
+            try:
+                source_ms = int(source) if source is not None else None
+            except (TypeError, ValueError):
+                continue
+            # Collector's immutable declaration means the book was continuous
+            # and fresh.  Reject pathological clocks instead of repairing.
+            if source_ms is not None and source_ms > local:
+                continue
+            points.append(_DeribitPoint(int(event_id), source_ms, local, payload))
+        return points
+
+    @staticmethod
+    def _labels(current: dict[str, Any], market_times: tuple[int, ...], market_rows: tuple[dict[str, Any], ...]) -> dict[str, Any]:
+        timestamp = int(current["snapshot_timestamp_ms"])
+        labels: dict[str, Any] = {}
+        for horizon in DERIBIT_LABEL_HORIZONS_SEC:
+            target = timestamp + horizon * 1_000
+            position = bisect_left(market_times, target)
+            key = f"future_{horizon}s"
+            if position >= len(market_rows) or market_times[position] > target + DERIBIT_LABEL_TOLERANCE_MS:
+                labels[key] = {"available": False, "reason": "future_accepted_snapshot_unavailable"}
+                continue
+            future = market_rows[position]
+            record: dict[str, Any] = {
+                "available": True, "label_timestamp_ms": int(future["snapshot_timestamp_ms"]),
+                "label_lag_ms": int(future["snapshot_timestamp_ms"]) - target,
+            }
+            for side in ("yes", "no"):
+                _bid, entry_ask, _bid_size, _ask_size = _bbo(current[f"{side}_l2"])
+                future_bid, _ask, _future_bid_size, _future_ask_size = _bbo(future[f"{side}_l2"])
+                record[f"{side}_future_bid"] = future_bid
+                record[f"{side}_long_markout_ps"] = (
+                    future_bid - entry_ask if future_bid is not None and entry_ask is not None else None
+                )
+            labels[key] = record
+        return labels
+
+    @staticmethod
+    def _outcome_features(snapshot: Mapping[str, Any]) -> dict[str, Any]:
+        yes_bid, yes_ask, yes_bid_size, yes_ask_size = _bbo(snapshot["yes_l2"])
+        no_bid, no_ask, no_bid_size, no_ask_size = _bbo(snapshot["no_l2"])
+        return {
+            "time_left_sec": _number(snapshot.get("time_left_sec")), "strike": _number(snapshot.get("strike")),
+            "yes_bid": yes_bid, "yes_ask": yes_ask, "yes_bid_size": yes_bid_size, "yes_ask_size": yes_ask_size,
+            "no_bid": no_bid, "no_ask": no_ask, "no_bid_size": no_bid_size, "no_ask_size": no_ask_size,
+        }
+
+    @staticmethod
+    def _deribit_features(index: _DeribitIndex, point: _DeribitPoint, *, outcome_timestamp_ms: int) -> dict[str, Any]:
+        raw = point.payload
+        features = {
+            "deribit_available": True,
+            "deribit_age_ms": outcome_timestamp_ms - point.local_received_at_ms,
+            "deribit_index_price": _number(raw.get("index_price")),
+            "deribit_mid": _number(raw.get("mid")),
+            "deribit_spread_bps": _number(raw.get("spread_bps")),
+            "deribit_top_imbalance": _number(raw.get("top_imbalance")),
+            "deribit_mark_price": _number(raw.get("mark_price")),
+            "deribit_open_interest": _number(raw.get("open_interest")),
+            "deribit_funding_8h": _number(raw.get("funding_8h")),
+            # No trades in one second is a legitimate zero, not missing data.
+            "deribit_trade_flow_imbalance_1s": _number(raw.get("trade_flow_imbalance_1s")) or 0.0,
+            "deribit_trade_flow_present_1s": float(raw.get("trade_flow_imbalance_1s") is not None),
+        }
+        for horizon in (5, 15, 60):
+            features[f"deribit_mid_return_{horizon}s_bps"] = index.return_bps(point, field="mid", horizon_sec=horizon)
+            features[f"deribit_index_return_{horizon}s_bps"] = index.return_bps(point, field="index_price", horizon_sec=horizon)
+        return features
+
+    def build(
+        self, *, batch_size: int = 500, rebuild: bool = False,
+        progress: Callable[[int, int], None] | None = None,
+    ) -> D2BuildResult:
+        """Build D2 rows, limiting source scope to the live Deribit era."""
+        with sqlite3.connect(self.journal.db_path) as conn:
+            points = self._deribit_points(conn)
+            first = min((point.local_received_at_ms for point in points), default=None)
+            first_event_id = min((point.event_id for point in points), default=None)
+            snapshots = self._outcome_snapshots(conn, after_ms=first, after_event_id=first_event_id)
+            existing = set() if rebuild else {
+                int(row[0]) for row in conn.execute(
+                    "SELECT outcome_snapshot_event_id FROM outcome_deribit_feature_rows WHERE feature_schema_version=?",
+                    (DERIBIT_FEATURE_SCHEMA_VERSION,),
+                )
+            }
+        index = _DeribitIndex(points)
+        by_market: dict[int, list[dict[str, Any]]] = defaultdict(list)
+        for _event_id, snapshot in snapshots:
+            by_market[int(snapshot["outcome_id"])].append(snapshot)
+        market_index = {
+            outcome_id: (
+                tuple(int(row["snapshot_timestamp_ms"]) for row in ordered), tuple(ordered),
+            ) for outcome_id, group in by_market.items()
+            for ordered in (sorted(group, key=lambda row: int(row["snapshot_timestamp_ms"])),)
+        }
+        newest = max((int(snapshot["snapshot_timestamp_ms"]) for _id, snapshot in snapshots), default=0)
+        refresh_after = newest - (max(DERIBIT_LABEL_HORIZONS_SEC) * 1_000 + DERIBIT_LABEL_TOLERANCE_MS)
+        work = [
+            (event_id, snapshot) for event_id, snapshot in snapshots
+            if rebuild or event_id not in existing or int(snapshot["snapshot_timestamp_ms"]) >= refresh_after
+        ]
+        joined = unavailable = 0
+        labels_available = {horizon: 0 for horizon in DERIBIT_LABEL_HORIZONS_SEC}
+
+        def rows() -> Any:
+            nonlocal joined, unavailable
+            for event_id, snapshot in work:
+                timestamp = int(snapshot["snapshot_timestamp_ms"])
+                point = index.as_of(timestamp)
+                features = self._outcome_features(snapshot)
+                context: dict[str, Any] = {
+                    "market_instance": str(snapshot["outcome_id"]), "snapshot_event_id": event_id,
+                    "event_time_ms": timestamp, "deribit_join_rule": "as_of_local_received_at",
+                    "deribit_source": "deribit_public_ws", "live_authority": False,
+                }
+                if point is None:
+                    unavailable += 1
+                    features.update({"deribit_available": False, "deribit_unavailable_reason": "no_valid_locally_received_snapshot"})
+                else:
+                    joined += 1
+                    features.update(self._deribit_features(index, point, outcome_timestamp_ms=timestamp))
+                    context.update({
+                        "deribit_snapshot_event_id": point.event_id,
+                        "deribit_source_timestamp_ms": point.source_timestamp_ms,
+                        "deribit_local_received_at_ms": point.local_received_at_ms,
+                        "deribit_age_ms": timestamp - point.local_received_at_ms,
+                    })
+                market_times, market_rows = market_index[int(snapshot["outcome_id"])]
+                labels = self._labels(snapshot, market_times, market_rows)
+                for horizon in DERIBIT_LABEL_HORIZONS_SEC:
+                    labels_available[horizon] += int(labels[f"future_{horizon}s"]["available"])
+                yield {
+                    "feature_schema_version": DERIBIT_FEATURE_SCHEMA_VERSION,
+                    "outcome_snapshot_event_id": event_id, "outcome_id": int(snapshot["outcome_id"]),
+                    "period": "1d", "snapshot_timestamp_ms": timestamp,
+                    "deribit_snapshot_event_id": point.event_id if point else None,
+                    "deribit_source_timestamp_ms": point.source_timestamp_ms if point else None,
+                    "deribit_local_received_at_ms": point.local_received_at_ms if point else None,
+                    "deribit_age_ms": timestamp - point.local_received_at_ms if point else None,
+                    "deribit_join_direction": "as_of_local_received_at",
+                    "deribit_valid": point is not None,
+                    "features": features, "labels": labels, "market_context": context,
+                }
+
+        written = self.journal.bulk_upsert_outcome_deribit_feature_rows(
+            rows(), batch_size=batch_size,
+            progress=(lambda completed: progress(completed, len(work))) if progress else None,
+        )
+        return D2BuildResult(
+            eligible_outcome_snapshots=len(snapshots), rows_written=written, deribit_joined=joined,
+            deribit_unavailable=unavailable, labels_available=labels_available,
+            first_deribit_received_at_ms=first,
+            last_deribit_received_at_ms=max((point.local_received_at_ms for point in points), default=None),
+        )

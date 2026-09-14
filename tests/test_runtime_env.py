@@ -6,6 +6,8 @@ def test_loader_accepts_only_current_outcome_local_surface(tmp_path):
     env_path.write_text(
         "HL_WALLET_ADDRESS=0xabc\n"
         "OUTCOME_MAX_ENTRY_NOTIONAL_USDC=11\n"
+        "DERIBIT_RESEARCH_ENABLED=1\n"
+        "DERIBIT_RESEARCH_SNAPSHOT_INTERVAL_SEC=1\n"
         "POLYMARKET_PK=must_not_load\n"
         "STRATEGY_PROFILE=must_not_load\n",
         encoding="utf-8",
@@ -16,6 +18,8 @@ def test_loader_accepts_only_current_outcome_local_surface(tmp_path):
 
     assert environ["HL_WALLET_ADDRESS"] == "0xabc"
     assert environ["OUTCOME_MAX_ENTRY_NOTIONAL_USDC"] == "11"
+    assert environ["DERIBIT_RESEARCH_ENABLED"] == "1"
+    assert environ["DERIBIT_RESEARCH_SNAPSHOT_INTERVAL_SEC"] == "1"
     assert "POLYMARKET_PK" not in environ
     assert "STRATEGY_PROFILE" not in environ
 

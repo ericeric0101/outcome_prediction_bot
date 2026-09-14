@@ -1442,8 +1442,7 @@ read-only `scripts/deribit_feature_quality_report.py --db
 logs/outcome_shadow.db` reports valid/unavailable snapshot counts before D2
 can be considered.  The collector/test contract covers a valid snapshot,
 book-sequence gap, stale-book invalidation, and bounded journal payloads.
-No option-surface selector, Deribit-to-Outcome as-of join, model feature, or
-live decision authority is implemented yet.
+No option-surface selector or live decision authority is implemented.
 
 Add one independent, restart-safe `DeribitMarketDataWorker` only after a separate implementation authorization.  It will connect to `wss://www.deribit.com/ws/api/v2`, use unique JSON-RPC request ids, subscribe once per managed channel set, and start with public `100ms` rather than authorized `raw` channels:
 
@@ -1462,6 +1461,33 @@ To prevent another multi-GB raw-payload problem, the persistent contract is **de
 
 #### D2 — feature contract and alignment audit (shadow-only)
 
+**Implementation status (2026-09-15):** D2 is implemented as the offline
+`bot.outcome_deribit_features.OutcomeDeribitFeaturePipeline`, invoked by
+`scripts/build_outcome_deribit_features.py`.  It writes recomputable
+`outcome_deribit_feature_rows` in short batches; this table is never read by
+the live runtime.  The builder uses the first valid Deribit journal event only
+as a scan lower bound for the multi-GB journal; the actual eligibility rule is
+unchanged and strict: `deribit_local_received_at_ms <=
+outcome_snapshot_timestamp_ms`, with only collector-declared valid snapshots.
+It retains source event id, source/receipt timestamps, age, join direction and
+unavailability rather than imputing a missing row.  It produces 5/15/30/60s
+and 5m same-market executable YES/NO bid labels from Outcome P2 snapshots.
+
+First production build, observed 2026-09-15: **194** eligible current-era P2
+snapshots were found; the incremental build refreshed/wrote **59** rows, with
+**59** valid as-of Deribit joins and **0** unavailable joins.  At that moment
+the still-maturing label coverage was 58/56/53/47/1 at 5/15/30/60/300 seconds.
+These are collection/alignment facts, not a prediction result.  The commands
+are deliberately offline:
+
+```bash
+./.venv/bin/python scripts/build_outcome_deribit_features.py \
+  --db logs/outcome_shadow.db --batch-size 500
+
+./.venv/bin/python scripts/outcome_deribit_walkforward_report.py \
+  --db logs/outcome_shadow.db
+```
+
 For each existing Outcome decision/lifecycle timestamp, record an immutable as-of join with:
 
 1. Deribit index, Deribit-vs-Binance basis, and their short returns;
@@ -1472,6 +1498,25 @@ For each existing Outcome decision/lifecycle timestamp, record an immutable as-o
 Every field carries source timestamp, local receipt timestamp, age, connection generation, and validity reason.  A feature may be fed to research only if it was observed no later than the decision timestamp and within a predeclared freshness budget.  Outcome state, current S0 signal, side, time-left, spread/depth, entry/fill/exit path, and eventual executable labels remain separately recorded; no future Outcome quote, fill, settlement result, or later option quote may leak into a decision row.
 
 #### D3 — incremental-value research, not a new signal by assertion
+
+**Implementation status (2026-09-15):** The initial read-only comparator is
+`bot.outcome_deribit_walkforward.deribit_walk_forward_report`.  It evaluates
+the exact same valid D2 rows twice: a Outcome-book/time-left baseline, then
+the same baseline plus Deribit 5s mid/index returns, perpetual spread,
+top-book imbalance, funding, and one-second trade-flow fields.  It predicts
+the 5-minute future executable YES bid markout with ridge regression, trains
+only on earlier complete daily markets, and purges each training market's last
+five minutes.  It cannot load a live model artifact and always reports
+`ready_for_live=false`.
+
+The initial report correctly has **111** eligible rows but only **one**
+independent daily market, zero folds and zero OOS rows.  It therefore reports
+`insufficient_independent_daily_market_instances`,
+`insufficient_purged_walk_forward_rows`, and
+`insufficient_out_of_sample_rows`; RMSE/MAE are null and there is no
+incremental-evidence claim.  A passing unit test intentionally uses five
+synthetic complete markets to verify that the two variants are compared on the
+same purged rows; it is a code-contract test, never production evidence.
 
 Deribit features enter two frozen, comparable shadow variants:
 
@@ -1497,11 +1542,10 @@ Before proposing any execution-policy canary, the candidate must show all of the
 
 #### Implementation order after a future explicit authorization
 
-1. Add public-only worker, typed immutable feature snapshot, bounded recorder, sequence/gap tests, and a startup manifest that lists Deribit as `read_only`.
-2. Run it alongside the existing bot with no API key and verify freshness, reconnect behavior, row size, DB growth and zero impact on execution-loop latency.
-3. Add option-universe selector and surface-quality recorder only after the perpetual/index collector is healthy; use `instrument.state.option.BTC`, not polling loops.
-4. Add D2 as-of joins and a read-only data-quality report.
-5. Add the baseline-versus-Deribit B1/B2 walk-forward report.  Do not retrain/reload artifacts inside the live process.
-6. If, and only if, D3/D4 pass, design one independent shadow execution/exit policy comparison.  It must produce a `PreparedDecision` and still delegate any future mutation through the existing execution service, durable intent, ambiguity fence, account reconciliation, portfolio guard and lifecycle protections.
+1. **Completed:** Add public-only worker, typed immutable feature snapshot, bounded recorder and sequence/gap tests.
+2. **In progress:** Run it alongside the existing bot with no API key; verify freshness, reconnect behavior, row size, DB growth and zero impact on execution-loop latency across complete markets.
+3. **Completed as offline research:** Add D2 as-of joins and the initial baseline-versus-Deribit purged daily-market report.  Do not retrain/reload artifacts inside the live process.
+4. Add option-universe selector and surface-quality recorder only after the perpetual/index collector is healthy across the stated coverage; use `instrument.state.option.BTC`, not polling loops.
+5. If, and only if, D3/D4 pass, design one independent shadow execution/exit policy comparison.  It must produce a `PreparedDecision` and still delegate any future mutation through the existing execution service, durable intent, ambiguity fence, account reconciliation, portfolio guard and lifecycle protections.
 
 ### 關鍵環境變數清單
