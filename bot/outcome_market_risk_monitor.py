@@ -46,6 +46,9 @@ class OutcomeMarketRiskMonitor:
     def __init__(self) -> None:
         self._samples: dict[str, deque[tuple[float, Decimal, Decimal]]] = {}
         self._dislocation_started: dict[str, float] = {}
+        self._warning_started: dict[str, float] = {}
+        self._latest_lane: dict[str, dict[str, Any]] = {}
+        self._latest_full_depth_lane: dict[str, dict[str, Any]] = {}
 
     @staticmethod
     def _prior(samples: deque[tuple[float, Decimal, Decimal]], now: float, horizon: int) -> tuple[Decimal, Decimal] | None:
@@ -85,20 +88,38 @@ class OutcomeMarketRiskMonitor:
         else:
             self._dislocation_started.pop(item.lifecycle_id, None)
             started = None
-        severe = bool(
-            executable_return is not None and executable_return <= Decimal("-0.10")
-            and v30 is not None and v30 <= Decimal("-250")
-            and d30 is not None and d30 <= Decimal("0.70")
+        severe = bool(executable_return is not None and executable_return <= Decimal("-0.10")
+                      and v30 is not None and v30 <= Decimal("-250")
+                      and d30 is not None and d30 <= Decimal("0.70"))
+        lane_signals: list[str] = []
+        if executable_return is not None and executable_return <= Decimal("-0.05"):
+            lane_signals.append("executable_drawdown")
+        if v30 is not None and v30 <= Decimal("-250"):
+            lane_signals.append("bid_velocity")
+        if d30 is not None and d30 <= Decimal("0.70"):
+            lane_signals.append("top3_depth_depletion")
+        if item.reversal_state == "REVERSAL_CONFIRMED":
+            lane_signals.append("reversal_confirmed")
+        multi_signal = len(lane_signals) >= 2
+        if multi_signal:
+            warning_started = self._warning_started.setdefault(item.lifecycle_id, item.timestamp)
+        else:
+            self._warning_started.pop(item.lifecycle_id, None)
+            warning_started = None
+        warning_persistent = bool(warning_started is not None and item.timestamp - warning_started >= 10.0)
+        lane_state = "WARNING_CANDIDATE" if warning_persistent else (
+            "WARNING_BUILDING" if multi_signal else "NORMAL"
         )
         # This fixed research bucket has not passed tail/winner validation;
         # avoid naming it like a production protection authorization.
         state = "SEVERE_DISLOCATION_RESEARCH" if severe else (
             "RISK_COMPRESSION_SHADOW" if dislocated else "NORMAL"
         )
-        return {
+        result = {
             "schema_version": 1, "read_only": True, "live_authority": False,
             "execution_submitted": False, "outcome_id": item.outcome_id,
             "period": item.period, "coin": item.coin, "entry_lifecycle_id": item.lifecycle_id,
+            "timestamp": item.timestamp,
             "entry_price": str(item.entry_price), "position_size": str(item.position_size),
             "entry_time_left_sec": item.entry_time_left_sec, "current_time_left_sec": item.time_left_sec,
             "full_inventory_executable_vwap": str(item.full_inventory_executable_vwap) if item.full_inventory_executable_vwap is not None else None,
@@ -119,5 +140,86 @@ class OutcomeMarketRiskMonitor:
             "would_compress_target": state != "NORMAL",
             "would_aggressively_reprice": state != "NORMAL",
             "would_freeze_additional_exposure": state != "NORMAL",
+            "fast_failure_lane_shadow": {
+                "state": lane_state,
+                "signals": lane_signals,
+                "signal_count": len(lane_signals),
+                "persistence_sec": (item.timestamp - warning_started) if warning_started is not None else 0.0,
+                "hard_drawdown_reached": bool(executable_return is not None and executable_return <= Decimal("-0.10")),
+                "requires_fresh_full_inventory_depth": True,
+                "live_authority": False,
+            },
             "limits": ["shadow only", "no mutation authority", "full depth is null when WS only exposes top-of-book"],
         }
+        self._latest_lane[item.lifecycle_id] = result
+        return result
+
+    def assess_full_depth(
+        self, *, lifecycle_id: str, timestamp: float, entry_price: Decimal,
+        full_inventory_vwap: Decimal | None, full_inventory: bool,
+        taker_close_fee_rate: Decimal | None,
+    ) -> dict[str, Any]:
+        """Attach fresh REST full-depth facts to the latest WS shadow lane.
+
+        This has no controller reference.  It is deliberately the last
+        read-only step before any future live-canary proposal can be judged.
+        """
+        latest = self._latest_lane.get(lifecycle_id)
+        lane = dict(latest.get("fast_failure_lane_shadow") or {}) if isinstance(latest, dict) else {}
+        if not lane:
+            return {"state": "NO_WS_LANE_CONTEXT", "live_authority": False, "execution_submitted": False}
+        net_return = None
+        if full_inventory and full_inventory_vwap is not None and taker_close_fee_rate is not None and entry_price > 0:
+            net_return = full_inventory_vwap * (Decimal("1") - taker_close_fee_rate) / entry_price - Decimal("1")
+        within_cap = bool(net_return is not None and net_return >= Decimal("-0.15"))
+        hard = bool(lane.get("state") == "WARNING_CANDIDATE" and lane.get("hard_drawdown_reached")
+                    and full_inventory and within_cap)
+        result = {
+            "state": "HARD_CANDIDATE_WITHIN_CAP" if hard else (
+                "HARD_CANDIDATE_DEPTH_OR_CAP_BLOCKED" if lane.get("hard_drawdown_reached") else str(lane.get("state"))
+            ),
+            "ws_lane": lane,
+            "full_inventory": full_inventory,
+            "full_depth_net_return_pct": str(net_return) if net_return is not None else None,
+            "within_minus_15pct_cap": within_cap,
+            "observed_at": timestamp,
+            "live_authority": False,
+            "execution_submitted": False,
+            "limits": ["shadow only", "does_not_cancel_protection", "does_not_submit_ioc"],
+        }
+        self._latest_full_depth_lane[lifecycle_id] = result
+        return result
+
+    def latest_hard_candidate(self, *, lifecycle_id: str, now: float, max_age_sec: float = 15.0) -> dict[str, Any] | None:
+        """Return only a fresh, cap-eligible shadow fact; never an order intent."""
+        item = self._latest_full_depth_lane.get(lifecycle_id)
+        if item is None:
+            return None
+        try:
+            age = now - float(item["observed_at"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        if age < 0 or age > max_age_sec or item.get("state") != "HARD_CANDIDATE_WITHIN_CAP":
+            return None
+        return dict(item)
+
+    def latest_persistent_lane(self, *, lifecycle_id: str, now: float, max_age_sec: float = 15.0) -> dict[str, Any] | None:
+        """Return a recent WS-qualified lane before a fresh L2 depth read.
+
+        Holding-path rows arrive at a deliberately low cadence, so an old
+        full-depth observation cannot satisfy the live canary's freshness
+        boundary.  The caller must still fetch and walk fresh L2 depth.
+        """
+        item = self._latest_lane.get(lifecycle_id)
+        if item is None:
+            return None
+        try:
+            age = now - float(item["timestamp"])
+            lane = item["fast_failure_lane_shadow"]
+        except (KeyError, TypeError, ValueError):
+            return None
+        if age < 0 or age > max_age_sec or not isinstance(lane, dict):
+            return None
+        if lane.get("state") != "WARNING_CANDIDATE" or not lane.get("hard_drawdown_reached"):
+            return None
+        return dict(lane)

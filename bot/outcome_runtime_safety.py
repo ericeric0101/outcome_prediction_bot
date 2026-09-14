@@ -109,11 +109,11 @@ class OutcomeRuntimeSafety:
         state = "|".join((str(eligible), reason, str(loss_band_state), str(book_state), str(reversal_state)))
         if self._last_gate_state.get(key) == state:
             return
-        self._last_gate_state[key] = state
         # These transitions explain why an owned position did *not* receive a
         # live safety action.  They must survive the same crash class we are
-        # investigating, rather than being best-effort loop telemetry.
-        self.journal.log_durable_strategy_event(self.run_id, GATE_AUDIT_EVENT, {
+        # investigating, rather than being best-effort loop telemetry.  Do
+        # not cache a failed write: the unchanged state must retry next tick.
+        event_id = self.journal.log_durable_strategy_event(self.run_id, GATE_AUDIT_EVENT, {
             "schema_version": 1, "component": component, "eligible": eligible,
             "reason": reason, "outcome_id": outcome_id, "lifecycle_id": lifecycle_id,
             "position_age_sec": position_age_sec, "current_executable_pnl": current_executable_pnl,
@@ -122,6 +122,8 @@ class OutcomeRuntimeSafety:
             "loss_band_state": loss_band_state, "book_state": book_state,
             "execution_submitted": False,
         })
+        if event_id is not None:
+            self._last_gate_state[key] = state
 
     def audit_not_ready(
         self, *, components: Iterable[SafetyComponent], outcome_id: int | None = None,
@@ -134,10 +136,14 @@ class OutcomeRuntimeSafety:
         state = ",".join(sorted(missing))
         if self._last_gate_state.get(key) == state:
             return
-        self._last_gate_state[key] = state
-        self.journal.log_durable_strategy_event(self.run_id, NOT_READY_EVENT, {
+        event_id = self.journal.log_durable_strategy_event(self.run_id, NOT_READY_EVENT, {
             "schema_version": 1, "outcome_id": outcome_id,
             "missing_safety_critical_components": missing,
             "action": ("active_holding_exit_safety_attention_required" if active_holding
                        else "new_entry_blocked_existing_protection_unchanged"),
         })
+        # Same principle as gate audit: a failed durable forensic record is
+        # not a state transition and must be retried while the component stays
+        # unavailable.
+        if event_id is not None:
+            self._last_gate_state[key] = state

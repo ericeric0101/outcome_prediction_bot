@@ -38,6 +38,9 @@ class OutcomeHoldingRiskService:
         live_entry_age: Callable[..., float | None],
         gate_audit: Callable[..., None] | None = None,
         risk_episodes: OutcomeRiskEpisodeStore | None = None,
+        narrow_policy: OutcomeEmergencyExitPolicy | None = None,
+        narrow_controller: OutcomeEmergencyExitController | None = None,
+        narrow_candidate: Callable[..., dict[str, object] | None] | None = None,
     ) -> None:
         self.recovery = recovery
         self.machine = machine
@@ -47,12 +50,71 @@ class OutcomeHoldingRiskService:
         self.fast_controller = fast_controller
         self.emergency_policy = emergency_policy
         self.emergency_controller = emergency_controller
+        self.narrow_policy = narrow_policy
+        self.narrow_controller = narrow_controller
+        self.narrow_candidate = narrow_candidate
         self.reversal_windows = reversal_windows
         self.fresh_book = fresh_book
         self.official_holding_age = official_holding_age
         self.live_entry_age = live_entry_age
         self.gate_audit = gate_audit
         self.risk_episodes = risk_episodes
+
+    def maybe_narrow_hard_failure(self, *, market: OutcomeMarketSpec, finding: object) -> LiveExecutionResult | None:
+        """Execute only a fresh, shadow-qualified $10-cap canary candidate.
+
+        The candidate has no mutation authority.  This method independently
+        re-reads fees/L2 and shares the same durable risk-episode budget as
+        existing fast-failure and S3 controllers.
+        """
+        if (self.ledger is None or self.store is None or self.narrow_controller is None
+                or self.narrow_policy is None or self.narrow_candidate is None or self.risk_episodes is None):
+            return None
+        coin = str(getattr(finding, "coin", ""))
+        inventory = Decimal(str(getattr(finding, "inventory", "0")))
+        if not tuple(getattr(finding, "sell_order_ids", ())):
+            self._audit_early(component="OUTCOME_NARROW_HARD_FAILURE_CANARY", market=market, coin=coin, reason="no_owned_protective_sell", inventory=inventory)
+            return None
+        lifecycle = self.store.recover(wallet=self.recovery.wallet, outcome_id=market.outcome_id, coin=coin)
+        if lifecycle is None or lifecycle.state == "EMERGENCY_EXIT_SUBMITTED":
+            self._audit_early(component="OUTCOME_NARROW_HARD_FAILURE_CANARY", market=market, coin=coin, lifecycle=lifecycle, reason="exit_lifecycle_unavailable_or_emergency_submitted", inventory=inventory)
+            return None
+        fill_vwap = self.machine._fill_vwap_for_inventory(coin=coin, inventory=inventory)
+        candidate = self.narrow_candidate(
+            market=market, coin=coin, inventory=inventory, fill_vwap=fill_vwap,
+        )
+        if candidate is None:
+            self._audit_early(component="OUTCOME_NARROW_HARD_FAILURE_CANARY", market=market, coin=coin, lifecycle=lifecycle, reason="no_fresh_shadow_hard_candidate", inventory=inventory)
+            return None
+        if self._attempt_budget_exhausted(market=market, coin=coin):
+            self._audit_early(component="OUTCOME_NARROW_HARD_FAILURE_CANARY", market=market, coin=coin, lifecycle=lifecycle, reason="shared_risk_episode_attempt_budget_exhausted", inventory=inventory)
+            return None
+        entry_age = self.official_holding_age(market=market, coin=coin, inventory=inventory, fill_vwap=fill_vwap)
+        if entry_age is None:
+            self._audit_early(component="OUTCOME_NARROW_HARD_FAILURE_CANARY", market=market, coin=coin, lifecycle=lifecycle, reason="official_fill_age_unavailable", inventory=inventory)
+            return None
+        side_index = 0 if coin == market.yes_coin else 1
+        try:
+            fees = self.recovery.account.get_user_fees_sync(self.recovery.wallet)
+            taker_fee = Decimal(str(fees["userSpotCrossRate"]))
+            book = self.fresh_book(market=market, side_index=side_index)
+            bids = parse_bid_levels(book)
+            book_age = emergency_book_age_sec(book, now_ms=int(time.time() * 1000))
+        except (KeyError, TypeError, ValueError, ArithmeticError):
+            bids, book_age, taker_fee = None, None, None
+        item = OutcomeEmergencyExitInput(
+            inventory=inventory, fill_vwap=fill_vwap, taker_close_fee_rate=taker_fee,
+            bids=bids or (), book_age_sec=book_age, holding_age_sec=entry_age,
+            loss_band_unfilled_sec=None, reversal_independent_observations=0,
+            reversal_duration_sec=0.0, already_attempted=False, risk_detected_ts=time.time(),
+        )
+        return self._plan_record_execute(
+            market=market, coin=coin, side_index=side_index, lifecycle=lifecycle, item=item,
+            policy=self.narrow_policy, controller=self.narrow_controller,
+            decision_event="OUTCOME_NARROW_HARD_FAILURE_CANARY",
+            execution_type="narrow_hard_failure_price_protected_fak_ioc",
+            holding_age_basis="official_fill_timestamp_ms",
+        )
 
     def maybe_fast_failure(self, *, market: OutcomeMarketSpec, finding: object) -> LiveExecutionResult | None:
         if self.ledger is None or self.store is None or self.fast_controller is None:

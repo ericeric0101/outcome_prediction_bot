@@ -1,7 +1,7 @@
 # Hyperliquid Outcome (HIP-4) BTC Daily Prediction Market Trading Bot — Current Authority
 
-> **權威架構版本 (Authority Version)**：2.3.0 (Outcome-only, typed execution-domain services)
-> **建立與審計日期**：2026-08-23；最近修訂：2026-09-13
+> **權威架構版本 (Authority Version)**：2.4.0 (Outcome-only, typed execution-domain services; tail-risk validation roadmap)
+> **建立與審計日期**：2026-08-23；最近修訂：2026-09-14
 > **目標系統**：Hyperliquid HyperCore L1 原生預測市場 — Outcome (HIP-4 協議標準)  
 > **單一權威聲明**：本文件取代原 `project_overview.md`，為系統唯一的設計、架構、量化模型與執行權威規範。
 
@@ -692,6 +692,10 @@ B4 目前在 10,005 個 OOS decision timestamps 中提出 8,242 個 `JOIN_BEST_B
 | **B5-P — full-depth +1% profit-lock evidence** | 每個 `OUTCOME_ACTIVE_HOLDING_CHALLENGER_SHADOW` 現在附上同輪既有 fresh REST depth walk 的 inventory、fill VWAP、marketable VWAP、full-inventory boolean、taker fee、fee-after net exit price/return。`python -m bot.outcome_profit_lock_shadow_report --db logs/outcome_shadow.db --period 1d` 對每個 lifecycle 只取**第一個** B5 `MARKETABLE_PROFIT_EXIT`，保存其 displayed-depth hypothetical PnL、實際 canonical close PnL，並觀察之後 5/15/30/60 分鐘的 full-depth net return、最低/最高值、是否又跌破成本。 | 報表不假裝 hypothetical IOC 一定成交，不在假想 exit 後製造 re-entry path，也不把 actual lifecycle 當作「若當時 taker 賣出」的因果結果。少於 20 個 full-depth profit-lock lifecycle 或少於 5 個 unseen daily markets 一律 blocker；即使達標，仍需單獨人工審查與操作者明確授權，才可把 **這一條 profit-lock lane** 提作第一個 B6 小額 canary。 |
 | **B5-C — crash-circuit feature / episode evidence** | healthy WS holding check 維持既有 5 秒 cadence；新的 `OUTCOME_CRASH_CIRCUIT_SHADOW` 僅保存 compact BBO、top-3 bid depth、15/30/60 秒 bid velocity、depth ratio、entry VWAP gross return、spot/mark/OI、OI freshness、regime 與既有 reversal state。`RAPID_DRAWDOWN_RESEARCH` 只是 `<=-5%` gross drawdown + 30 秒 `<=-250bps` bid velocity + `<=0.70` top-3 depth ratio 的**分析 bucket**；journal 只在 state transition 或十秒 cadence 寫入。`python -m bot.outcome_crash_circuit_report --db logs/outcome_shadow.db --period 1d` 對每個 episode 連接後續 full-depth 5/15/30/60 分鐘 return、最差／最佳值與是否回本。 | WS BBO/top-3 不代表全倉 IOC 可成交深度；analysis bucket 不能 submit、cancel、raise loss cap 或觸發 IOC。未來需在至少 20 個 rapid-drawdown episodes、至少 5 個 daily markets 中比較「誤殺後回本」與「繼續崩跌可避免的損失」，並同時重新驗證 fresh full-position depth、fee、price cap、official account truth、one-shot lifecycle，再另行提出 crash canary。不能因單一 95¢→65¢ 事件或單純跌幅而啟用。 |
 | **B5-D — time-left-aware thesis-failure evidence（完成 2026-09-12；read-only）** | 新的 `python -m bot.outcome_thesis_failure_shadow_report --db logs/outcome_shadow.db --period 1d` 以 `entry_lifecycle_id` 對每筆 immutable official BUY 僅取第一次 `REVERSAL_CONFIRMED` 或 `RAPID_DRAWDOWN_RESEARCH`。reversal 與 crash journal 現在都帶入 holding age、time-left、entry side/Tier/target；報表再連接同一 lifecycle 的 full-depth 5/15/30/60 分鐘 net return、之後最低/最高值、是否回成本／entry target、canonical realized return 與第一個後續 SELL 的 `execution_origin`。 | 報表不合成 IOC fill、不把手動 `external_manual_or_unknown` close 誤標成 bot 退出，也不建立第二個模型。它是同一 `outcome_active_multi_target_model` 未來的 holding/exit-label join source：將以 `entry_lifecycle_id` 加入 future executable bid、recovery、continued-drawdown outputs。現階段樣本少於 20 個 lifecycle-bound episode 或 5 個 daily markets 時，一律不可訓練這個 head、更不可啟用 time-left exit；B5-D 沒有 submit/cancel/IOC authority。 |
+| **Tail-risk fast-failure replay（2026-09-14；read-only，進行中）** | `python -m bot.outcome_fast_failure_replay_report --db logs/outcome_shadow.db --period 1d` 對 immutable holding-path 與 crash telemetry 重放兩條候選風險 lane：warning 為可執行 drawdown、30 秒 bid velocity、top-3 depth depletion、spot/strike thesis failure 中至少兩項持續十秒；hard candidate 另要求 `<= -10%` full-depth net return，並明列是否仍在 `-15%` loss cap 內。`--include-raw-known` 會額外讀 #1993/#2437/#2639/#2820 的原始 WS holding windows，補足 observer 上線前的 velocity／depth 事實；預設不讀，以免 multi-GB journal 的 read-only 分析反而壓迫 live DB。報表固定列出四個 outcome（有 lifecycle-bound 資料者）及最終已實現 PnL，將 profitable hard candidates 當 false-positive 成本，而非只挑 tail。 | 這不是 live stop、不是 IOC fill simulator，也不改 DB／schema／telemetry。它不宣稱 passive queue 可否成交；任何未來 live lane 都仍需以 mutation 前 fresh L2、official account truth、full-inventory depth、fee-inclusive cap、durable intent、ambiguity fence 與 one-shot reconciliation 作最後授權。若資料沒有 crash telemetry，報表明示 coverage gap，不能把缺失當作安全。 |
+| **Tail-risk replay 初次讀數（2026-09-14；不可 promotion）** | 43 個 lifecycle 中，候選條件產生 9 個 warning 與 8 個 hard candidates；其中 5 個最終獲利 lifecycle 也被 hard candidate 命中，故「跌到 -10% 即 IOC」被資料明確否決。#2820 最後的 21-share NO（92¢、實現 `-$18.1702`）在台北 09:48:23、持有約 782 秒時，出現 `-12.109%` full-inventory executable return、30 秒 bid velocity `-420.97 bps`，仍在 `-15%` cap 內；這是可供後續 controller replay 驗證的早期 hard candidate。#2437 與 #1993 在 holding-path/research telemetry 的第一個 multi-signal candidate 分別已是約 `-21.53%` 和 `-14.59%`，都不在相同 `-15%` cap 的安全邊界內；#2437 仍須用 `--include-raw-known` 交叉驗證原始 WS，不能把後加入 observer 的缺席當作市場沒有早期訊號。#2639 的最終 `+$0.3996` lifecycle 曾出現同型 hard candidate（約 `-38.29%`，但已超 cap），證實裸 drawdown／velocity 不能直接成為 live exit。 | 結論不是放棄 hard-failure，而是把它拆成：warning 先壓縮風險、hard 僅在同時滿足可執行 cap 的窄窗口動作。這組讀數尚未建立任何策略勝率或可直接上線的 threshold；下一步是將 raw WS control-window、實際 fee／depth walk、後續回本路徑與候選誤殺成本逐筆比較。 |
+| **`-20% → 回升至 -10% → 再跌 -20%` replay（2026-09-14；不可 promotion）** | 為精確測試「漲回來又跌下去才 taker」而非用模糊語意，report 定義為：先穿越 `-20%`、其後回升至至少 `-10%`、再穿越 `-20%`。43 個 lifecycle 中只有 2 個命中：#1993 與最終 `+$0.3996` 的 #2639；後者在台北 08:40、仍有 full-inventory depth 時會被此規則誤殺。#1993 的第二次跌破雖出現，卻沒有 full-inventory depth。#2437 與 #2820 都未形成這個完整重回 `-10%` 的第二跌型態：它們不是可依賴「第二次確認」才處理的案例。 | 因此第二次 `-20%` 不是安全 stop：它救不到 #2437/#2820，且會犧牲 #2639 的後續獲利。可將「recovery/rebreak」保留為未來模型特徵，但不得作為獨立 live trigger。剩餘時間可作為 exposure-risk multiplier；不能單獨判斷方向或 exit，因為 #2437（entry 約 15.1h）與回本的 #2639（約 14.7h）幾乎相同，而 #2820 只有約 4.4h 仍形成重大尾損。 |
+| **Fast-failure lanes shadow（2026-09-14；已啟用觀測，無交易 authority）** | `OutcomeMarketRiskMonitor` 現在在 healthy WS holding stream 以 executable drawdown、30 秒 bid velocity、top-3 depth depletion、`REVERSAL_CONFIRMED` 建立 candidate：至少兩項連續十秒才成為 `WARNING_CANDIDATE`。下一個既有 fresh REST holding-path capture 只補上 full-inventory VWAP、taker fee 與 `-15%` cap 事實，寫入 `OUTCOME_FAST_FAILURE_LANE_SHADOW`；若兼具 warning、`<=-10%` 與 cap 內完整深度，才標為 `HARD_CANDIDATE_WITHIN_CAP`。 | 這是 read-only decision telemetry：不取消 protective SELL、不改 TP、不發 IOC，也不改現行 fast-failure/S3。shadow 資料將比較 warning 後的實際後續 path、#2639 類 false-positive、以及候選時的真實全倉深度；只有完成這些比較、保留現有 ambiguity/reconciliation boundary、並取得明確 live-canary 授權後，才能讓它傳遞 prepared decision。 |
 
 **資料與操作。** 新 payload 只在重啟含本段程式的 launcher 後開始累積；舊事件沒有 raw depth/velocity 不能補造。兩個 report 均可在 live bot 進行時以 SQLite read-only 執行，但若需要重新建 X3 derived rows、訓練 artifact 或 VACUUM，仍應停止 writers 或使用一致性 DB copy。兩條 report 都固定 `ready_for_live=false` / `live_authority=false`；目前最優先的 future B6 假設是先驗證 B5-P profit-lock，而不是放寬 crash 後的 taker stop。
 
@@ -1091,9 +1095,11 @@ flowchart TD
 | `HL_AGENT_PRIVATE_KEY` | `0x...` (選填) | 專用 Agent Key 私鑰 (若留空則程式自動生成暫態 Key) |
 | `HL_TESTNET` | `0` (主網) / `1` (測試網) | 是否連線至 Hyperliquid Testnet |
 | `HL_MIN_NOTIONAL_USDC` | `10.0` | 最小開倉名義價值 (USDC) |
-| `OUTCOME_MAX_ENTRY_NOTIONAL_USDC` | `20` | $20 canary 的每筆 Outcome entry 上限；dynamic sizing 可因薄盤降至官方 $10 opening minimum，絕不以拆單補足 |
-| `OUTCOME_MAX_OUTCOME_EXPOSURE_USDC` | `20` | $20 canary 的 Outcome 總曝險上限；必須包含 inventory 與可能成交的 resting BUY，未完成 campaign ledger 前不得提高 |
+| `OUTCOME_MAX_ENTRY_NOTIONAL_USDC` | `10`（2026-09-14 canary） | 每筆 Outcome entry 上限；dynamic sizing 可因薄盤降至官方 $10 opening minimum，絕不以拆單補足。`$20` 是歷史 F5 階段，不可和本輪 canary 混用。 |
+| `OUTCOME_MAX_OUTCOME_EXPOSURE_USDC` | `10`（2026-09-14 canary） | Outcome 總曝險上限；必須包含 inventory 與可能成交的 resting BUY；任一 limit 超過 `$10` 時窄版 IOC 不啟用。 |
 | `OUTCOME_MAX_OPEN_ORDERS` | `1` | Outcome 同時 open orders 上限；不得以提高此值迴避單一市場 entry／exit ownership |
+| `OUTCOME_RISK_EPISODE_BUDGET_ENABLED` | `1`（canary profile） | 啟用 fast-failure/S3/窄版 hard lane 共用的 durable attempt budget；不存在即 fail-closed。 |
+| `OUTCOME_NARROW_HARD_FAILURE_CANARY_ENABLED` | `1`（canary profile） | 僅啟用上述 `$10` 窄版 hard IOC lane；tracked example 保持 `0`，需人工設定與重啟。 |
 | `HL_REFERRAL_CODE` | `""` | 推薦碼 (享受 4% 手續費返還折扣) |
 | `ENTRY_SCORE_MIN`、`FIRST_ENTRY_*` | legacy / shadow | 不參與目前 Outcome S0 live entry；S0 由 OI/mark/spot-strike gate 決定。 |
 | `HOLD_TO_REDEEM` | legacy / shadow | 不授權 Outcome one-sided payout 或自動 redeem；Outcome settlement 仍只接受官方 evidence。 |
@@ -1165,7 +1171,7 @@ The current monitor is **BBO-based shadow evidence**, not full-inventory executa
 
 ### Exit latency, RiskEpisode and stress sizing
 
-`scripts/outcome_exit_latency_report.py --db logs/outcome_shadow.db` is a read-only chain report.  It separately reports `decision → exchange ACK` and `decision → confirmed inventory reduction`; the latter is the comparator for the historical #2437 `-5% → -10%` window of about 11 seconds.  An account read with unchanged residual inventory is deliberately **not** counted as a reduction or successful exit.  Controller lifecycle events carry cancellation, fresh-book, planning, durable-intent, submit, ACK and account-inventory-confirmation timestamps.  Missing milestones are reported as missing evidence; the report never fabricates a completed IOC/fill sequence.  Until a complete observed chain has a compatible p90, any Stage-2 capital-protection candidate is blocked.
+`scripts/outcome_exit_latency_report.py --db logs/outcome_shadow.db` is a read-only chain report.  It separately reports `decision → exchange ACK`, `decision → first confirmed inventory reduction`, and `decision → confirmed flat`.  The last is the tail-risk-elimination comparator for the historical #2437 `-5% → -10%` window of about 11 seconds; a one-share partial fill cannot satisfy it.  An account read with unchanged residual inventory is deliberately **not** counted as a reduction or successful exit.  Controller lifecycle events carry cancellation, fresh-book, planning, durable-intent, submit, ACK and account-inventory-confirmation timestamps.  Missing milestones are reported as missing evidence; the report never fabricates a completed IOC/fill sequence.  Until a complete observed **flat** chain has a compatible p90, any Stage-2 capital-protection candidate is blocked.
 
 `OutcomeRiskEpisodeStore` provides a durable, bounded episode record (`episode_id`, opened time, trigger family, severity, attempts and recovered close) for the **existing** fast-failure/S3 controller.  It is explicitly disabled by default with `OUTCOME_RISK_EPISODE_BUDGET_ENABLED=0`.  When enabled, an ambiguous/reconcile-required exit consumes one conservative attempt within the same episode; recovery (best executable bid within 2% of entry and no confirmed reversal) closes that episode, so a later new severe deterioration can receive a fresh bounded budget.  If the post-mutation episode-attempt write fails, the in-process budget becomes uncertain/exhausted and the result is reconciliation-required; restart reads durable accepted-IOC/ambiguous evidence after episode open so the same mutation cannot silently regain a budget.  It never adds an IOC path or removes the existing full-depth/intent/reconciliation checks.
 
@@ -1190,3 +1196,212 @@ Stage 1 remains the read-only risk-compression shadow.  Stage 2 remains shadow/b
 5. Observed exit latency compatible with the risk window, plus verified ambiguity/recovery behavior.
 
 No OI gate, Tier A/B definition, 125bps entry-spread ceiling, `$20` cap, fair-value promotion, dynamic IOC entry, or live hard-invalidation trigger was changed by this foundation work.
+
+---
+
+## 2026-09-14 — Tail-Risk Strategy Validation Roadmap (current authority)
+
+> **Priority override.** This section is the current formal roadmap and takes precedence over earlier frequency, OI-softening, fair-value, or execution-aggressiveness roadmaps.  It changes no live authority by itself.
+
+### Current state: execution and safety foundation completed
+
+The system now has the following completed execution/safety foundations:
+
+- runtime service split: strategy/policy producers do not own exchange mutation;
+- BUY and SELL durable submit intent;
+- entry and exit ambiguous-execution fencing;
+- one owned exit-lifecycle contract for protective SELL, replacement SELL, and emergency IOC;
+- account-truth reconciliation;
+- runtime startup safety manifest;
+- flat + safety-critical component not-ready → fail-closed new entry;
+- holding + safety-critical component not-ready → durable high-priority audit;
+- durable early-return gate-decision audit for fast-failure, loss-band and S3;
+- WS-driven in-memory risk observations and a read-only Market Risk Monitor;
+- emergency-exit execution-latency instrumentation;
+- a durable/restart-hardened RiskEpisode architecture, default disabled;
+- price-capped full-depth Stress Exitability sizing, default disabled; and
+- a characterization test pinning `loss-band → durable lifecycle → S3 prerequisite` routing.
+
+`6c23162 Harden tail risk safety audits` closed the first foundation review's early-return coverage, audit durability, decision-to-ACK/inventory latency calculation, price-capped stress capacity, post-mutation RiskEpisode persistence/restart recovery, loss-band durable routing, active-holding readiness audit, and misleading `HARD_CAPITAL_PROTECTION_SHADOW` naming.  The research state is now `SEVERE_DISLOCATION_RESEARCH`; its name must never be treated as validation or live authority.
+
+### Explicitly unchanged live strategy
+
+The recent commits materially hardened execution ownership, ambiguity recovery, auditability, and runtime fail-closed behavior, but they have **not yet solved the economic tail-loss problem represented by #2437-type collapses**.
+
+The following live behavior remains unchanged:
+
+- spot / mark / OI directional gate and the OI hard veto;
+- Tier-A / Tier-B definitions;
+- 125 bps entry-spread ceiling and ALO entry policy;
+- no dynamic IOC entry;
+- nominal `$20` maximum entry cap;
+- no fair-value live authority;
+- fast-failure, S3, and loss-band thresholds;
+- Market Risk Monitor and `SEVERE_DISLOCATION_RESEARCH` have no mutation authority;
+- `OUTCOME_STRESS_EXITABILITY_ENABLED=0` and `OUTCOME_RISK_EPISODE_BUDGET_ENABLED=0` remain the defaults; and
+- no new hard stop exists.
+
+### Payout geometry: highest strategy priority
+
+Observed normal winners are approximately `+$0.3 ~ +$0.5`; historical tail losers can reach `-$8 ~ -$10`.  One tail can therefore consume roughly **16–33 normal winners**.  The project's fixed strategy order is:
+
+1. Bound downside tail.
+2. Preserve recoverable winners.
+3. Improve PnL / capital-hour.
+4. Only then improve trade frequency.
+5. Only then reconsider OI softening, execution aggressiveness, or fair-value promotion.
+
+Increasing frequency must not be promoted ahead of tail-risk validation.
+
+### #2437 design lesson
+
+`#2437` was not a real 39% market gap.  Its Outcome executable-bid path was continuous through approximately `-5%`, `-10%`, `-15%`, `-22%`, `-26%`, `-33%`, and `-39%`; the move from about `-5%` to `-39%` took about **3m45s**.  In the early `-5%/-10%/-15%` ranges, a 15-share position had sufficient executable L2 capacity.
+
+The existing fast-failure authority did not activate because it protects underlying-thesis reversal.  For a YES position it requires `spot_strike_bps < 0`, `mark_return_bps < 0`, `oi_return_bps > 0`, `REVERSAL_CONFIRMED`, and then three independent confirmations spaced by at least 60 seconds.  During most of `#2437`, the Outcome price was severely falling but the classifier remained `WEAKENING`, not `REVERSAL_CONFIRMED`.
+
+> **Core gap:** Outcome market/execution failure and underlying thesis failure are not the same event.  The current live authority primarily protects the latter; it has no validated live authority dedicated to the former.
+
+### Tail-Risk Strategy Validation Phase
+
+The next phase is formally named **Tail-Risk Strategy Validation Phase**, not generic research.  Its sole question is:
+
+> Can we identify an economically dangerous Outcome-market collapse early enough to exit while full-position liquidity is still available, without systematically exiting recoverable winners?
+
+Any answer must meet both conditions:
+
+- **Tail rescue:** the trigger is early enough and, at that exact time, the full inventory is executable inside a bounded loss cap.  Detection after the cap is already penetrated is not a rescue.
+- **Winner preservation:** recoverable winners may not be systematically killed.  `#2639` is a mandatory known false-positive control; a candidate hard-exit of `#2639` fails validation.
+
+### Current highest-priority open question
+
+> What observable combination distinguishes a recoverable Outcome drawdown from a non-recoverable Outcome-market dislocation early enough that the existing bounded emergency execution path can still exit the full inventory?
+
+Known constraints:
+
+- drawdown magnitude, `-5/-10/-15%` thresholds, bid velocity, or depth depletion alone are insufficient;
+- three-source thesis reversal is too slow for the `#2437` regime;
+- `#2639` proves a deep drawdown alone is not a bad trade;
+- full-depth exitability is a mandatory execution constraint; and
+- benefit must be evaluated as saved tail loss versus false-positive winner destruction.
+
+### P0–P8 authoritative priority order
+
+```text
+P0  Finish small safety correctness follow-ups
+    - durable gate-audit retry semantics
+    - decision → confirmed-flat latency
+
+P1  Collect complete lifecycle-bound market-risk evidence
+
+P2  Build multivariate tail-vs-recovery diagnostic
+
+P3  Evaluate Stage-1 risk-compression shadow
+
+P4  Design Stage-2 hard capital-risk candidates
+
+P5  Mandatory historical tail-rescue + winner-preservation replay
+
+P6  Shadow across >=15–20 independent daily markets
+
+P7  Produce READY_FOR_LIVE_CANARY_REVIEW or NO_PROMOTION
+
+P8  Only after tail risk is bounded:
+    Entry TTL / OI reconsideration / fair-value / execution router
+```
+
+#### P1 — lifecycle-bound holding-risk evidence
+
+For every new lifecycle, evidence collection and analysis must preserve/use executable BBO path, full-depth executable state when available, bid velocity, top-1/top-3 depth deterioration, spread, spot-strike distance, mark return, OI return/freshness, reversal state, holding age, time-left, final recovery/exit, and realized PnL.  `MarketRiskMonitor` remains `read_only=true` and `live_authority=false`; `SEVERE_DISLOCATION_RESEARCH` is only a research classification and cannot be promoted by name.
+
+#### P2 — multivariate tail/recovery analysis
+
+Analysis must jointly inspect executable drawdown, drawdown velocity, depth deterioration, spread, spot-strike distance, mark, OI, time-left, holding age, and regime.  The goal is an explainable feature combination that separates tail and recover-winner behavior.  It is forbidden to train ML from a single-digit tail cohort, add a threshold for each observed tail, or select a historical best threshold from many candidates and promote it directly.
+
+#### P3 — Stage-1 risk-compression shadow
+
+Only after P2 identifies plausible characteristics, Stage 1 may remain shadow-only and output hypothetical `would compress target`, `would aggressively passive-reprice`, and `would freeze additional exposure`.  It must not cancel, live-reprice a SELL, submit IOC, or obtain mutation authority.  Its question is whether earlier abandonment of TP reduces tail capital-hours rather than merely destroying recovery.
+
+#### P4/P5 — Stage-2 candidate and mandatory replay
+
+Stage 2 is the only future lane that could change `#2437`-type tail behavior.  It must be multivariate, may not use three-source thesis reversal as its sole prerequisite, and must retain persistent evidence, fresh full-depth executable capacity, a bounded loss cap, and risk-authorization-only semantics.
+
+```text
+Market Risk Monitor
+        ↓
+Risk Authorization
+        ↓
+Existing OutcomeExitLifecycleStore
+        ↓
+Existing OutcomeEmergencyExitController
+        ↓
+cancel_and_confirm
+        ↓
+fresh full-depth L2 revalidation
+        ↓
+durable submit intent
+        ↓
+ambiguity fence
+        ↓
+reduce-only / price-protected IOC
+        ↓
+official reconciliation
+```
+
+New risk logic must never create a second cancel, IOC, SDK, or ownership path.  Before any Stage-2 shadow candidate, replay at least `#2437`, `#2639`, `#1201`, `#1993`, `#1242`, and the historical approximately `-$19.51` case.  A missing case must be labelled `INSUFFICIENT DATA`, never reconstructed by guesswork.  Each known tail must trigger while its **full position** is executable inside cap; each known recover winner, including `#2639`, must not hard-exit.  Failure on either side means `NO PROMOTION`.
+
+#### P6/P7 — shadow validation and live-promotion contract
+
+After retrospective replay, a candidate may only be a shadow candidate with `live_authority=false`.  It needs at least 15–20 **independent daily markets** (never snapshot rows), both tail-like and recovery episodes, and hypothetical-versus-actual comparisons for saved tail loss, false-exit cost, net counterfactual PnL, capital-hour delta, P90/P95 holding reduction, and full-risk-removal latency.
+
+Stage-2 hard capital protection must **never** be promoted live automatically by Codex.  Even if all criteria pass, P7 can produce only `READY_FOR_LIVE_CANARY_REVIEW`; a separate explicit user authorization is required for live authority.  Minimum promotion evidence is historical tail rescue, known-winner preservation, 15–20 independent shadow markets, positive fee/slippage-adjusted counterfactual EV, meaningful tail capital-hour reduction, acceptable false-positive cost, decision-to-flat latency compatible with observed collapse windows, and verified ambiguity fencing, RiskEpisode behavior, startup/readiness safety.
+
+### Emergency latency evidence
+
+The required latency evidence is reported separately as:
+
+1. `decision → exchange ACK`;
+2. `decision → first confirmed inventory reduction`; and
+3. `decision → confirmed flat`.
+
+The third is the Stage-2 promotion KPI: a one-share partial fill is not tail-risk elimination.  It must be evaluated against `#2437`'s approximately `-5% → -10% = 11 sec` window.  If complete-risk-removal latency cannot meet comparable windows, Stage-2 live promotion is prohibited.
+
+### Stress Exitability and RiskEpisode status
+
+**Stress Exitability** is correctly implemented as price-capped full-depth capacity, but `OUTCOME_STRESS_EXITABILITY_ENABLED=0` remains the default.  Its `0.60/0.45` haircuts are policy assumptions, not sufficiently calibrated Outcome liquidity evidence.  It must first be assessed through shadow/audit for rejected candidate/size effects.  It can only reduce size and can never raise size.
+
+**RiskEpisode** has durable/restart hardening, but `OUTCOME_RISK_EPISODE_BUDGET_ENABLED=0` remains the default.  It cannot be promoted until real emergency-episode behavior is sufficiently observed and reviewed.
+
+### Entry roadmap freeze and telemetry discipline
+
+Entry TTL remains potentially useful but is deferred.  OI softening remains blocked by `INSUFFICIENT DATA`; current hard veto stays.  Fair-value, dynamic execution router, and IOC entry remain research-only, with IOC entry not authorized.
+
+Before any telemetry field is added, its owner must answer:
+
+> Which concrete promotion/rejection decision will this field support?
+
+If it has no answer, it must not be added.  Allowed telemetry serves only tail-versus-recovery distinction, execution latency, full-depth exitability, safety readiness, or historical counterfactual validation; this prevents unbounded DB growth without decision value.
+
+### Next live-behavior milestone and final authority statement
+
+The foundation primarily improves execution reliability.  The next milestone that could actually alter live trading behavior is:
+
+> A validated parallel capital-risk authorization lane that can intervene before full thesis reversal, while still delegating every exchange mutation to the existing hardened emergency-exit controller.
+
+This milestone is **not live and not approved for canary**.
+
+> The project is no longer primarily blocked by execution ownership, ambiguity recovery, or forensic observability.  Those foundations are now substantially hardened.  The principal unresolved problem is economic: distinguishing recoverable drawdowns from non-recoverable Outcome-market dislocations early enough to bound tail losses without destroying the strategy's normal recovery behavior.
+
+> Until that distinction is validated, the current thesis-based fast-failure/S3 authority remains unchanged.  Market-risk states remain read-only research evidence **except for the narrowly bounded, explicitly authorized canary below**.
+
+### 2026-09-14 bounded tail-loss intervention: explicit operator-authorized exception
+
+The broad Stage-2 promotion criteria above were not waived. An operator authorized one deliberately narrow `$10` live canary only after the final definition was replayed across all **43** reconstructable lifecycles: **1** cap-eligible hard candidate and **0** ultimately-profitable cap-eligible candidates. The sole historical candidate was `#2820`, at approximately **-12.109%**, with full 21-share depth and approximately **-420.97 bps** 30-second bid velocity.
+
+1. **High-premium new-entry pause.** A selected bid **>=85¢** pauses a fresh BUY on either YES or NO. It does not cancel, reprice or otherwise affect an existing inventory, protective SELL, reduce-only behavior or settlement. It addresses the capped-upside geometry in the 92–93¢ `#2437`/`#2820` entries; it does not claim to solve the lower-priced `#1993` tail.
+2. **Narrow hard-failure IOC.** It requires an exact official-fill-bound lifecycle aged >=60 seconds; a fresh WS two-or-more-signal warning persisted >=10 seconds; WS drawdown >=-10%; a newly fetched complete L2 walk for the *entire* inventory; and fee-inclusive executable return >=-15%. Only then it delegates to the existing durable-intent, cancel-and-confirm, re-read-L2, price-protected reduce-only FAK/IOC controller. It cannot activate if either configured entry or exposure cap exceeds `$10`.
+3. **One shared budget.** The lane has no independent attempt counter. It refuses to run unless `OutcomeRiskEpisodeStore` is enabled and uses the same durable wallet/outcome/coin episode as existing fast-failure and S3. An accepted or ambiguous prior attempt therefore consumes the same conservative budget.
+4. **Warning lane remains shadow-only.** Short-TTL aggressive-passive warning behavior retains no cancel, reprice, or IOC authority.
+
+The actual local canary profile explicitly sets `OUTCOME_RISK_EPISODE_BUDGET_ENABLED=1`, `OUTCOME_NARROW_HARD_FAILURE_CANARY_ENABLED=1`, and both Outcome limits to `10`. The tracked `.env.example` keeps the canary flag `0`, preventing accidental activation by a copied profile. A restart is required; startup manifest must report `narrow_hard_failure_canary=ready`. Canary review must compare decision→ACK, decision→confirmed-flat, partial/full fills, cap blocks, shared-episode usage, false exits and realized capital-hours before any expansion. No directional signal, OI gate, ALO entry selection, normal take-profit, warning-lane, or S3/fast-failure threshold changes in this deployment.
+
+### 關鍵環境變數清單

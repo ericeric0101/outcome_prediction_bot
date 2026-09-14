@@ -66,6 +66,20 @@ def test_fast_failure_policy_is_earlier_but_keeps_full_depth_and_price_cap_guard
     assert policy.plan(item(bids=((Decimal("0.67"), Decimal("20")),), loss_band_unfilled_sec=None)).reason == "insufficient_full_inventory_depth_at_loss_cap"
 
 
+def test_narrow_hard_failure_canary_keeps_the_ten_percent_trigger_and_fifteen_percent_cap():
+    policy = OutcomeEmergencyExitPolicy(OutcomeEmergencyExitConfig.narrow_hard_failure_canary())
+    allowed = policy.plan(item(
+        bids=((Decimal("0.70"), Decimal("20")),), holding_age_sec=60,
+        loss_band_unfilled_sec=None, reversal_independent_observations=0, reversal_duration_sec=0,
+    ))
+    assert allowed.action is EmergencyExitAction.EXECUTE
+    assert allowed.net_return_pct is not None and Decimal("-0.15") <= allowed.net_return_pct <= Decimal("-0.10")
+    assert policy.plan(item(
+        bids=((Decimal("0.70"), Decimal("20")),), holding_age_sec=59,
+        loss_band_unfilled_sec=None, reversal_independent_observations=0, reversal_duration_sec=0,
+    )).reason == "minimum_holding_time_not_reached"
+
+
 def test_raw_sdk_book_levels_must_be_positive_and_descending():
     assert parse_bid_levels({"bids": [{"price": "0.73", "size": "13"}]}) == ((Decimal("0.73"), Decimal("13")),)
     assert parse_bid_levels({"bids": [{"price": "0.70", "size": "13"}, {"price": "0.71", "size": "1"}]}) is None

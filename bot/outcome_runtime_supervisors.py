@@ -79,6 +79,12 @@ class OutcomeHoldingSupervisor:
             )
             self._last_path_capture_at[holding_key] = now
 
+        narrow = getattr(runtime.holding_risk_service, "maybe_narrow_hard_failure", None)
+        if callable(narrow):
+            result = narrow(market=snapshot.market, finding=finding)
+            if result is not None:
+                return result
+
         result = runtime.holding_risk_service.maybe_fast_failure(market=snapshot.market, finding=finding)
         if result is not None:
             return result

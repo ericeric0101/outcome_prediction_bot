@@ -51,6 +51,32 @@ def test_runtime_is_disabled_without_both_operator_gates(monkeypatch):
     assert runtime.tick(market=market(), side_index=0, entry_permitted=True).state == "disabled"
 
 
+def test_narrow_hard_failure_canary_requires_ten_dollar_limits_and_shared_episode_budget(monkeypatch, tmp_path):
+    monkeypatch.setenv("OUTCOME_NARROW_HARD_FAILURE_CANARY_ENABLED", "1")
+    monkeypatch.setenv("OUTCOME_RISK_EPISODE_BUDGET_ENABLED", "1")
+    monkeypatch.setenv("OUTCOME_MAX_ENTRY_NOTIONAL_USDC", "10")
+    monkeypatch.setenv("OUTCOME_MAX_OUTCOME_EXPOSURE_USDC", "10")
+    journal = TradeJournalDB(tmp_path / "narrow_canary.db")
+    runtime = OutcomeLiveExecutionRuntime(
+        account=CalibrationAccount(), wallet="w", gateway=Gateway(),
+        ledger=OutcomeExecutionLedger(journal, "run"),
+    )
+    assert runtime.narrow_hard_failure_canary_enabled is True
+    assert runtime.narrow_hard_failure_controller is not None
+    assert runtime.holding_risk_service.risk_episodes is runtime.risk_episode_store
+    manifest = {item.name: item for item in runtime.safety_components()}
+    assert manifest["narrow_hard_failure_canary"].ready is True
+    assert manifest["narrow_hard_failure_canary"].safety_critical is True
+
+    monkeypatch.setenv("OUTCOME_MAX_ENTRY_NOTIONAL_USDC", "11")
+    blocked = OutcomeLiveExecutionRuntime(
+        account=CalibrationAccount(), wallet="w", gateway=Gateway(),
+        ledger=OutcomeExecutionLedger(TradeJournalDB(tmp_path / "too_large.db"), "run"),
+    )
+    assert blocked.narrow_hard_failure_canary_enabled is False
+    assert blocked.narrow_hard_failure_controller is None
+
+
 def test_runtime_blocks_cross_side_existing_exposure(monkeypatch):
     monkeypatch.setenv("OUTCOME_AUTOMATED_EXECUTION_ENABLED", "1")
     monkeypatch.setenv("OUTCOME_SDK_EXECUTION_ENABLED", "1")
@@ -480,6 +506,26 @@ def test_s0_live_strategy_blocks_selected_bid_in_50_to_55_no_trade_band(monkeypa
         ).fetchone()[0]
     assert '"entry_price_gate": "selected_bid_in_no_trade_band"' in payload
     assert '"execution_submitted": false' in payload
+
+
+def test_s0_live_strategy_pauses_new_expensive_side_entry_at_85_cents(monkeypatch, tmp_path):
+    monkeypatch.setenv("OUTCOME_AUTOMATED_EXECUTION_ENABLED", "1")
+    monkeypatch.setenv("OUTCOME_SDK_EXECUTION_ENABLED", "1")
+    monkeypatch.setenv("OUTCOME_LIVE_STRATEGY_ENABLED", "1")
+    journal = TradeJournalDB(tmp_path / "high_premium_pause.db")
+    class HighGateway(Gateway):
+        def __init__(self): self.calls = []
+        def fetch_order_book(self, **_): return {"bids": [{"price": "0.85"}], "asks": [{"price": "0.851"}]}
+        def place_alo(self, **kwargs): self.calls.append(kwargs); return {"orderId": "must-not-place"}
+    gateway = HighGateway()
+    runtime = OutcomeLiveExecutionRuntime(
+        account=CalibrationAccount(), wallet="w", gateway=gateway, stream_health=healthy_stream(),
+        ledger=OutcomeExecutionLedger(journal, "run"),
+    )
+    result = runtime.tick_live_strategy(market=market(), entry_side_index=0, entry_reason="confirmed", entry_evidence={})
+    assert result.state == "flat"
+    assert "high-premium pause" in result.detail
+    assert gateway.calls == []
 
 
 def test_s0_persists_gate_decision_and_cancels_only_owned_stale_entry_before_next_tick_rebook(monkeypatch, tmp_path):
@@ -912,6 +958,51 @@ def test_fast_failure_exit_uses_official_fill_age_and_never_waits_for_loss_band(
             "SELECT payload_json FROM order_events WHERE event_type='ORDER_SUBMIT'"
         ).fetchone()[0])
     assert payload["execution_type"] == "fast_failure_price_protected_fak_ioc"
+
+
+def test_narrow_hard_failure_canary_uses_the_shared_episode_and_existing_ioc_boundary(monkeypatch, tmp_path):
+    monkeypatch.setenv("OUTCOME_RISK_EPISODE_BUDGET_ENABLED", "1")
+    monkeypatch.setenv("OUTCOME_NARROW_HARD_FAILURE_CANARY_ENABLED", "1")
+    monkeypatch.setenv("OUTCOME_MAX_ENTRY_NOTIONAL_USDC", "10")
+    monkeypatch.setenv("OUTCOME_MAX_OUTCOME_EXPOSURE_USDC", "10")
+    journal = TradeJournalDB(tmp_path / "narrow_ioc.db")
+    ledger = OutcomeExecutionLedger(journal, "run")
+    base = time.time() + 300
+
+    class FilledAccount(CalibrationAccount):
+        def __init__(self):
+            super().__init__(balances=[{"coin": "+11530", "total": "13", "entryNtl": "10.4"}], orders=[{"coin": "#11530", "side": "A", "oid": "old-sell", "sz": "13"}])
+        def get_user_fills_sync(self, _): return [{"coin": "#11530", "side": "B", "px": "0.80", "sz": "13", "time": 1}]
+
+    class CanaryGateway(Gateway):
+        def __init__(self, account): self.account, self.calls = account, []
+        def fetch_order_book(self, **_): return {"timestamp": int(base * 1000), "bids": [{"price": "0.710", "size": "20"}], "asks": [{"price": "0.711", "size": "20"}]}
+        def cancel_owned_order(self, **kwargs): self.calls.append(("cancel", kwargs)); self.account.orders = []; return {}
+        def place_price_protected_ioc_exit(self, **kwargs): self.calls.append(("ioc", kwargs)); return {"orderId": "narrow-ioc", "status": "filled"}
+
+    account = FilledAccount()
+    gateway = CanaryGateway(account)
+    store = OutcomeExitLifecycleStore(journal, "run")
+    store.record(OutcomeExitLifecycle("w", 1153, "#11530", "old-sell", Decimal("13"), Decimal("0.76"), 0, "SELL_RESTING"), reason="fixture")
+    runtime = OutcomeLiveExecutionRuntime(account=account, wallet="w", gateway=gateway, ledger=ledger, exit_lifecycle_store=store)
+    runtime.holding_risk_service.official_holding_age = lambda **_: 120.0
+    runtime.holding_risk_service.narrow_candidate = lambda **_: {"state": "WARNING_CANDIDATE"}
+    monkeypatch.setattr("bot.outcome_holding_risk_service.time.time", lambda: base)
+    monkeypatch.setattr("bot.outcome_emergency_exit.time.time", lambda: base)
+    finding = type("Finding", (), {"coin": "#11530", "inventory": Decimal("13"), "sell_order_ids": ("old-sell",)})()
+
+    result = runtime.holding_risk_service.maybe_narrow_hard_failure(market=market(), finding=finding)
+
+    assert result is not None and result.state == "emergency_exit_residual"
+    assert [name for name, _ in gateway.calls] == ["cancel", "ioc"]
+    with sqlite3.connect(journal.db_path) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM strategy_events WHERE event_type='OUTCOME_RISK_EPISODE'"
+        ).fetchone()[0] == 2
+        payload = json.loads(conn.execute(
+            "SELECT payload_json FROM order_events WHERE event_type='ORDER_SUBMIT'"
+        ).fetchone()[0])
+    assert payload["execution_type"] == "narrow_hard_failure_price_protected_fak_ioc"
 
 
 def test_s3_young_protected_holding_skips_fee_and_l2_reads(monkeypatch, tmp_path):

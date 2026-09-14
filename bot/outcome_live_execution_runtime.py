@@ -138,6 +138,15 @@ class OutcomeLiveExecutionRuntime:
             if ledger is not None and os.environ.get("OUTCOME_RISK_EPISODE_BUDGET_ENABLED", "0").strip() == "1"
             else None
         )
+        # This is intentionally an opt-in $10 canary.  A stale copied .env
+        # cannot silently authorize it at a larger exposure, and the lane
+        # cannot run without the shared durable episode budget.
+        self.narrow_hard_failure_canary_enabled = bool(
+            os.environ.get("OUTCOME_NARROW_HARD_FAILURE_CANARY_ENABLED", "0").strip() == "1"
+            and self.risk_episode_store is not None
+            and self.risk_gate.limits.max_entry_notional_usdc <= Decimal("10")
+            and self.risk_gate.limits.max_total_outcome_exposure_usdc <= Decimal("10")
+        )
         # This observer is deliberately shadow-only.  It has no reference to
         # an execution controller and cannot alter S0/S2/S3 authority.
         self.market_regime_shadow = OutcomeMarketRegimeShadow()
@@ -168,6 +177,15 @@ class OutcomeLiveExecutionRuntime:
                 wallet=wallet, policy=self.fast_failure_exit_policy,
             ) if self.exit_lifecycle_store else None
         )
+        self.narrow_hard_failure_policy = OutcomeEmergencyExitPolicy(
+            OutcomeEmergencyExitConfig.narrow_hard_failure_canary()
+        )
+        self.narrow_hard_failure_controller = (
+            OutcomeEmergencyExitController(
+                account=self._account_reads, gateway=self.machine.gateway, store=self.exit_lifecycle_store,
+                wallet=wallet, policy=self.narrow_hard_failure_policy,
+            ) if self.narrow_hard_failure_canary_enabled and self.exit_lifecycle_store else None
+        )
         self._holding_context: dict[int, dict[str, object]] = {}
         self._opposite_observation_counts: dict[tuple[int, str], int] = {}
         # Emergency S3 requires three independently spaced confirmed samples.
@@ -187,6 +205,7 @@ class OutcomeLiveExecutionRuntime:
         self._last_efficiency_shadow_record: dict[tuple[str, int, int], tuple[str, float]] = {}
         self._last_crash_shadow_record: dict[str, tuple[str, float]] = {}
         self._last_market_risk_record: dict[str, tuple[str, float]] = {}
+        self._last_fast_failure_lane_record: dict[str, tuple[str, float]] = {}
         self._last_fill_sync_at = float("-inf")
         self.journal_view = OutcomeRuntimeJournalView(ledger.journal.db_path if ledger else None)
         # These narrow services own decision ordering.  Atomic execution and
@@ -230,6 +249,9 @@ class OutcomeLiveExecutionRuntime:
             live_entry_age=self._live_entry_age_sec,
             gate_audit=self._audit_exit_safety_gate,
             risk_episodes=self.risk_episode_store,
+            narrow_policy=(self.narrow_hard_failure_policy if self.narrow_hard_failure_canary_enabled else None),
+            narrow_controller=self.narrow_hard_failure_controller,
+            narrow_candidate=(self._narrow_hard_failure_candidate if self.narrow_hard_failure_canary_enabled else None),
         )
         self.exit_requote_service = OutcomeExitRequoteService(
             recovery=self.recovery, machine=self.machine,
@@ -261,6 +283,7 @@ class OutcomeLiveExecutionRuntime:
             SafetyComponent("exit_requote", self.exit_requote_enabled(), "live_exit_authorization", "e4", "ready" if exit_ready else "missing", exit_ready, True),
             SafetyComponent("loss_band", self.exit_requote_enabled(), "live_exit_authorization", "e4", "ready" if exit_ready else "missing", exit_ready, True),
             SafetyComponent("fast_failure", self.fast_failure_exit_controller is not None, "live_exit_authorization", "v1", "ready" if self.fast_failure_exit_controller else "missing", self.fast_failure_exit_controller is not None, True),
+            SafetyComponent("narrow_hard_failure_canary", self.narrow_hard_failure_canary_enabled, "live_exit_authorization", "v1", "ready" if self.narrow_hard_failure_controller else "disabled_or_missing_shared_budget", self.narrow_hard_failure_controller is not None, self.narrow_hard_failure_canary_enabled),
             SafetyComponent("s3_emergency", self.emergency_exit_controller is not None, "live_exit_authorization", "s3", "ready" if self.emergency_exit_controller else "missing", self.emergency_exit_controller is not None, True),
             SafetyComponent("reversal_monitor", self.reversal_classifier is not None, "strategy_input", "v1", "ready" if self.reversal_classifier else "missing", self.reversal_classifier is not None),
             SafetyComponent("crash_shadow", self.crash_circuit_shadow is not None, "read_only", "v1", "ready" if self.crash_circuit_shadow else "missing", self.crash_circuit_shadow is not None),
@@ -1232,6 +1255,26 @@ class OutcomeLiveExecutionRuntime:
                 taker_close_fee_rate=taker_fee,
                 **provenance,
             ))
+            lifecycle_id = str(provenance.get("entry_lifecycle_id") or "")
+            if lifecycle_id:
+                lane = self.market_risk_monitor.assess_full_depth(
+                    lifecycle_id=lifecycle_id, timestamp=time.time(), entry_price=vwap,
+                    full_inventory_vwap=marketable_vwap, full_inventory=marketable_vwap is not None,
+                    taker_close_fee_rate=taker_fee,
+                )
+                lane_state = str(lane.get("state") or "UNKNOWN")
+                previous_lane = self._last_fast_failure_lane_record.get(lifecycle_id)
+                now = time.time()
+                if previous_lane is None or previous_lane[0] != lane_state or now - previous_lane[1] >= self._HOLDING_PATH_MIN_INTERVAL_SEC:
+                    self.ledger.journal.log_strategy_event(
+                        self.ledger.run_id, "OUTCOME_FAST_FAILURE_LANE_SHADOW", {
+                            **lane, "schema_version": 1, "period": market.period,
+                            "outcome_id": market.outcome_id, "coin": coin,
+                            "entry_lifecycle_id": lifecycle_id, "holding_age_sec": age,
+                            "time_left_sec": market.time_to_expiry_sec(),
+                        },
+                    )
+                    self._last_fast_failure_lane_record[lifecycle_id] = (lane_state, now)
             # B5 observes the same already-fetched full-depth book.  It never
             # creates an order and therefore adds no REST or SDK call.
             live_context = dict(evidence)
@@ -1313,6 +1356,28 @@ class OutcomeLiveExecutionRuntime:
             return max(0.0, time.time() - datetime.fromisoformat(str(provenance["entry_filled_at"])).timestamp())
         except (TypeError, ValueError, KeyError):
             return None
+
+    def _narrow_hard_failure_candidate(
+        self, *, market: OutcomeMarketSpec, coin: str, inventory: Decimal, fill_vwap: Decimal | None,
+    ) -> dict[str, object] | None:
+        """Bind a live canary only to its exact WS-observed entry lifecycle.
+
+        The monitor remains a decision producer: it has no execution object.
+        This adapter refuses unbound holdings and only returns a very recent
+        two-signal, ten-second-persistent shadow qualification.  The holding
+        service then re-reads full L2 and independently validates the cap.
+        """
+        if fill_vwap is None:
+            return None
+        provenance = self._resolve_holding_entry_provenance(
+            market=market, coin=coin, inventory=inventory, fill_vwap=fill_vwap,
+        )
+        lifecycle_id = str((provenance or {}).get("entry_lifecycle_id") or "")
+        if not lifecycle_id:
+            return None
+        return self.market_risk_monitor.latest_persistent_lane(
+            lifecycle_id=lifecycle_id, now=time.time(), max_age_sec=15.0,
+        )
 
     def tick_market(self, *, market: OutcomeMarketSpec, entry_side_index: int | None) -> LiveExecutionResult:
         """Advance existing exposure first; only a flat market accepts a signal."""
@@ -1610,6 +1675,12 @@ class OutcomeLiveExecutionRuntime:
             return LiveExecutionResult(
                 "flat",
                 f"live strategy no-trade band: selected bid {price} < {config.min_entry_price}",
+            )
+        if price >= config.max_entry_price:
+            admission["entry_price_gate"] = "selected_bid_at_or_above_high_premium_pause"
+            return LiveExecutionResult(
+                "flat",
+                f"live strategy high-premium pause: selected bid {price} >= {config.max_entry_price}",
             )
         shadow_requested_shares = max(
             whole_share_size(price),

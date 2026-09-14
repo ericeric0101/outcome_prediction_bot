@@ -61,6 +61,24 @@ class OutcomeEmergencyExitConfig:
             policy_name="fast_failure",
         )
 
+    @classmethod
+    def narrow_hard_failure_canary(cls) -> "OutcomeEmergencyExitConfig":
+        """The separately shadow-validated $10 hard-failure IOC lane.
+
+        Eligibility is supplied by the read-only multi-signal monitor; this
+        policy only retains the common fresh-depth, fee and loss-cap boundary.
+        """
+        return cls(
+            trigger_loss_pct=Decimal("0.10"),
+            max_net_loss_pct=Decimal("0.15"),
+            min_holding_sec=60.0,
+            min_loss_band_unfilled_sec=0.0,
+            min_independent_reversal_observations=0,
+            min_reversal_duration_sec=0.0,
+            require_passive_loss_band=False,
+            policy_name="narrow_hard_failure_canary",
+        )
+
 
 @dataclass(frozen=True)
 class OutcomeEmergencyExitInput:

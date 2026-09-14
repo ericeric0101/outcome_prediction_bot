@@ -28,6 +28,10 @@ class OutcomeLiveStrategyConfig:
     oi_lookback_sec: int = 300
     oi_max_age_sec: int = 90
     min_entry_price: Decimal = Decimal("0.55")
+    # Binary contracts have a capped upside.  This is a code-owned emergency
+    # risk pause, not a tunable signal threshold: no fresh expensive-side BUY
+    # may be opened at or above 85 cents while tail-risk work is active.
+    max_entry_price: Decimal = Decimal("0.85")
     tier_b_enabled: bool = False
     # A deliberately temporary, explicit kill switch for the only new live
     # strategy branch.  It is false by default; its numeric policy is
@@ -59,8 +63,8 @@ class OutcomeLiveStrategyConfig:
             raise ValueError("live strategy OI windows must be positive")
         if min(value.spot_strike_min_bps, value.mark_return_min_bps, value.oi_return_min_bps) < 0:
             raise ValueError("live strategy thresholds must be non-negative")
-        if not Decimal("0") < value.min_entry_price < Decimal("1"):
-            raise ValueError("OUTCOME_LIVE_STRATEGY_MIN_ENTRY_PRICE must be in (0, 1)")
+        if not Decimal("0") < value.min_entry_price < value.max_entry_price < Decimal("1"):
+            raise ValueError("live strategy entry price band must satisfy 0 < min < max < 1")
         return value
 
 

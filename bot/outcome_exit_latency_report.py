@@ -76,6 +76,7 @@ def report(db_path: str | Path) -> dict[str, Any]:
             following = [row for row in lifecycle.get(key, []) if row[0] >= decision_ts]
             marks: dict[str, float] = {"risk_detected_ts": decision_ts}
             inventory_reduced = False
+            inventory_flat = False
             for ts, event in following:
                 timing = event.get("execution_timing")
                 if isinstance(timing, dict):
@@ -104,8 +105,10 @@ def report(db_path: str | Path) -> dict[str, Any]:
                     # Old rows lack this field, so they remain evidence of a
                     # reconciliation but must not be promoted as reduction.
                     inventory_reduced = inventory_reduced or event.get("inventory_reduced") is True
+                    inventory_flat = inventory_flat or event.get("inventory_flat") is True
             row: dict[str, Any] = {"outcome_id": key[0], "coin": key[1], "decision_event": kind, **marks}
             row["inventory_reduced"] = inventory_reduced
+            row["inventory_flat"] = inventory_flat
             ordered_names = [
                 "risk_detected_ts", "cancel_requested_ts", "cancel_confirmed_ts", "fresh_book_ready_ts",
                 "ioc_plan_ready_ts", "durable_intent_committed_ts", "ioc_submit_ts", "ack_ts",
@@ -127,11 +130,18 @@ def report(db_path: str | Path) -> dict[str, Any]:
         (row["inventory_confirmed_ts"] - row["risk_detected_ts"]) * 1000 for row in base["rows"]
         if row.get("inventory_reduced") and "inventory_confirmed_ts" in row and "risk_detected_ts" in row
     ]
+    decision_to_flat = [
+        (row["complete_fill_ts"] - row["risk_detected_ts"]) * 1000 for row in base["rows"]
+        if row.get("inventory_flat") and "complete_fill_ts" in row and "risk_detected_ts" in row
+    ]
     base["decision_to_exchange_ack_ms"] = _summary(decision_to_ack)
     base["decision_to_confirmed_inventory_reduction_ms"] = _summary(decision_to_inventory)
+    base["decision_to_confirmed_flat_ms"] = _summary(decision_to_flat)
     if not decision_to_inventory:
-        base["blockers"].append("no_complete_instrumented_emergency_exit_chain_yet")
-    elif float(base["decision_to_confirmed_inventory_reduction_ms"]["p90"] or 0) > 11_000:
+        base["blockers"].append("no_confirmed_inventory_reduction_chain_yet")
+    if not decision_to_flat:
+        base["blockers"].append("no_confirmed_flat_exit_chain_yet")
+    elif float(base["decision_to_confirmed_flat_ms"]["p90"] or 0) > 11_000:
         base["blockers"].append("p90_exceeds_2437_11_second_risk_window")
     base["limits"] = [
         "Historical rows without an EXECUTE decision or matching lifecycle state are not inferred.",
