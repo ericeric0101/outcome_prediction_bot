@@ -381,12 +381,14 @@ class OutcomeLiveExecutionRuntime:
     def _entry_fast_risk_decision(
         self, *, market: OutcomeMarketSpec, lifecycle: OutcomeEntryLifecycle,
         current_side_index: int, desired_side_index: int | None, decision_reason: str,
+        now: float | None = None,
     ) -> tuple[bool, str | None, dict[str, object]]:
         """Observe strong cancel-only risks; ordinary quote movement stays on the 5m lane."""
         key = (market.outcome_id, lifecycle.coin)
         reason: str | None = None
         evidence: dict[str, object] = {}
-        status = self.stream_health.check(market) if self.stream_health is not None else None
+        observed_now = time.monotonic() if now is None else now
+        status = self.stream_health.check(market, now=observed_now) if self.stream_health is not None else None
         if status is None or not status.ready:
             reason = f"market_data_unhealthy:{status.reason if status is not None else 'not_configured'}"
         elif desired_side_index in (0, 1) and desired_side_index != current_side_index:
@@ -419,7 +421,7 @@ class OutcomeLiveExecutionRuntime:
                     reason = "adverse_bid_drift"
                 elif depth_collapsed:
                     reason = "supporting_bid_depth_collapsed"
-        observed = self.entry_fast_risk_tracker.observe(key=key, reason=reason, now=time.monotonic())
+        observed = self.entry_fast_risk_tracker.observe(key=key, reason=reason, now=observed_now)
         evidence.update({
             "reason": observed.reason, "observation_count": observed.observation_count,
             "duration_sec": round(observed.duration_sec, 3), "confirmed": observed.confirmed,
@@ -637,10 +639,16 @@ class OutcomeLiveExecutionRuntime:
             order_id = str(provenance["entry_order_id"])
         except (KeyError, TypeError, ValueError):
             return
+        holding_age_sec = max(0.0, time.time() - filled_at)
+        # Phase B only labels immediate post-fill quality.  Long-held risk is
+        # covered by the existing bounded holding-path/crash observers; do
+        # not mirror it here and grow a multi-GB journal indefinitely.
+        if holding_age_sec > 120.0:
+            return
         payload = self.entry_quality_shadow.evaluate_post_fill(OutcomePostFillQualityInput(
             outcome_id=market.outcome_id, period=market.period, coin=coin,
             order_id=order_id, fill_trade_id=trade_id, fill_vwap=vwap,
-            holding_age_sec=max(0.0, time.time() - filled_at),
+            holding_age_sec=holding_age_sec,
             best_bid=Decimal(str(snapshot["bid"])), best_ask=Decimal(str(snapshot["ask"])),
             top3_bid_depth=Decimal(str(snapshot["top3_bid_depth"])),
         ))

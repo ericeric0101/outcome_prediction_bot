@@ -183,10 +183,10 @@ def test_live_entry_fast_risk_requires_persistent_signal_invalidation(monkeypatc
     )
     decisions = []
     for now in (100.0, 102.5, 105.0):
-        monkeypatch.setattr("bot.outcome_live_execution_runtime.time.monotonic", lambda value=now: value)
         decisions.append(runtime._entry_fast_risk_decision(
             market=market(), lifecycle=lifecycle, current_side_index=1,
             desired_side_index=None, decision_reason="directional_confirmation_not_met",
+            now=now,
         ))
     assert [item[0] for item in decisions] == [False, False, True]
     assert decisions[-1][1] == "confirmed_signal_invalidation"
@@ -213,6 +213,26 @@ def test_market_regime_shadow_is_journalled_without_execution_authority(tmp_path
             "SELECT payload_json FROM strategy_events WHERE event_type='OUTCOME_MARKET_REGIME_SHADOW'"
         ).fetchone()[0]
     assert json.loads(payload)["execution_submitted"] is False
+
+
+def test_postfill_quality_shadow_stops_after_its_two_minute_window(monkeypatch, tmp_path):
+    journal = TradeJournalDB(tmp_path / "postfill-window.db")
+    runtime = OutcomeLiveExecutionRuntime(
+        account=CalibrationAccount(), wallet="w", gateway=Gateway(), stream_health=healthy_stream(),
+        ledger=OutcomeExecutionLedger(journal, "run"),
+    )
+    monkeypatch.setattr(runtime.machine, "_fill_vwap_for_inventory", lambda **_: Decimal("0.60"))
+    monkeypatch.setattr(runtime.stream_health, "fresh_book_top", lambda *_: {
+        "bid": Decimal("0.57"), "ask": Decimal("0.58"), "top3_bid_depth": Decimal("10"),
+    })
+    monkeypatch.setattr(runtime, "_resolve_holding_entry_provenance", lambda **_: {
+        "entry_filled_at": "2020-01-01T00:00:00+00:00", "entry_trade_id": "t", "entry_order_id": "o",
+    })
+    runtime._observe_postfill_quality_shadow(market=market(), finding=SimpleNamespace(coin="#11530", inventory="10"))
+    with sqlite3.connect(journal.db_path) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM strategy_events WHERE event_type='OUTCOME_POST_FILL_QUALITY_SHADOW'"
+        ).fetchone()[0] == 0
 
 
 def test_p3_calibration_requires_its_own_explicit_gate(monkeypatch, tmp_path):
