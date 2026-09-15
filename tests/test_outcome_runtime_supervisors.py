@@ -50,6 +50,7 @@ def test_holding_supervisor_protects_before_observation_and_short_circuits_exit(
         ),
         audit_safety_for_existing_holding=lambda **_: calls.append("holding_safety_audit"),
         _observe_toxic_fill_shadow=lambda **_: calls.append("toxic"),
+        _observe_postfill_quality_shadow=lambda **_: calls.append("postfill_quality"),
         _observe_holding_reversal_ws=lambda **_: calls.append("reversal") or True,
         _capture_holding_path=lambda **_: calls.append("holding"),
         holding_risk_service=SimpleNamespace(
@@ -64,7 +65,7 @@ def test_holding_supervisor_protects_before_observation_and_short_circuits_exit(
         runtime, snapshot=_snapshot(active=(finding,)), config=OutcomeLiveStrategyConfig(),
     )
     assert result is fast_result
-    assert calls == ["protect", "holding_safety_audit", "toxic", "reversal", "holding", "fast_failure"]
+    assert calls == ["protect", "holding_safety_audit", "toxic", "postfill_quality", "reversal", "holding", "fast_failure"]
 
 
 def test_holding_supervisor_does_not_observe_until_protection_is_resolved():

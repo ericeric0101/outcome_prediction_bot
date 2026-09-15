@@ -36,8 +36,8 @@ def test_d2_joins_only_deribit_locally_known_at_outcome_decision(tmp_path):
     base = 2_000_000_000_000
     first_deribit_id = journal.log_strategy_event("deribit", "DERIBIT_FEATURE_SNAPSHOT", _deribit(base - 1, mid=70_000))
     first_outcome_id = journal.log_strategy_event("outcome", "OUTCOME_P2_PARITY_SNAPSHOT", _outcome(base))
+    journal.log_strategy_event("deribit", "DERIBIT_FEATURE_SNAPSHOT", _deribit(base + 4_999, mid=99_000))
     journal.log_strategy_event("outcome", "OUTCOME_P2_PARITY_SNAPSHOT", _outcome(base + 5_000, bid="0.50", ask="0.52"))
-    journal.log_strategy_event("deribit", "DERIBIT_FEATURE_SNAPSHOT", _deribit(base + 1, mid=99_000))
     result = OutcomeDeribitFeaturePipeline(journal).build()
     assert result.eligible_outcome_snapshots == 2
     assert result.deribit_joined == 2
@@ -65,3 +65,21 @@ def test_d2_rejects_invalid_deribit_snapshot_without_imputation(tmp_path):
     assert result.eligible_outcome_snapshots == 1
     assert result.deribit_joined == 0
     assert result.deribit_unavailable == 1
+
+
+def test_d2_rejects_an_asof_snapshot_that_exceeds_immutable_freshness_budget(tmp_path):
+    journal = TradeJournalDB(tmp_path / "journal.db")
+    base = 2_200_000_000_000
+    journal.log_strategy_event("deribit", "DERIBIT_FEATURE_SNAPSHOT", _deribit(base - 3_001, valid=True))
+    outcome_id = journal.log_strategy_event("outcome", "OUTCOME_P2_PARITY_SNAPSHOT", _outcome(base))
+    result = OutcomeDeribitFeaturePipeline(journal).build()
+    assert result.deribit_joined == 0
+    assert result.deribit_stale_rejected == 1
+    with sqlite3.connect(journal.db_path) as conn:
+        raw = conn.execute(
+            "SELECT features_json FROM outcome_deribit_feature_rows WHERE outcome_snapshot_event_id=? "
+            "AND feature_schema_version=?", (outcome_id, DERIBIT_FEATURE_SCHEMA_VERSION),
+        ).fetchone()[0]
+    features = json.loads(raw)
+    assert features["deribit_available"] is False
+    assert features["deribit_unavailable_reason"] == "deribit_snapshot_stale_for_outcome_decision"

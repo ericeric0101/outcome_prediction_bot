@@ -21,7 +21,11 @@ from bot.outcome_p2_quality import is_eligible_p2_snapshot
 from monitoring.trade_journal_db import TradeJournalDB
 
 
-DERIBIT_FEATURE_SCHEMA_VERSION = 1
+# v2 adds a fixed, persisted as-of freshness budget.  Do not read the current
+# environment here: a historical research row must not change validity when a
+# later deployment adjusts its collector setting.
+DERIBIT_FEATURE_SCHEMA_VERSION = 2
+DERIBIT_MAX_JOIN_AGE_MS = 3_000
 DERIBIT_LABEL_HORIZONS_SEC = (5, 15, 30, 60, 300)
 DERIBIT_LABEL_TOLERANCE_MS = 7_500
 
@@ -48,6 +52,7 @@ class D2BuildResult:
     rows_written: int
     deribit_joined: int
     deribit_unavailable: int
+    deribit_stale_rejected: int
     labels_available: dict[int, int]
     first_deribit_received_at_ms: int | None
     last_deribit_received_at_ms: int | None
@@ -223,14 +228,15 @@ class OutcomeDeribitFeaturePipeline:
             (event_id, snapshot) for event_id, snapshot in snapshots
             if rebuild or event_id not in existing or int(snapshot["snapshot_timestamp_ms"]) >= refresh_after
         ]
-        joined = unavailable = 0
+        joined = unavailable = stale_rejected = 0
         labels_available = {horizon: 0 for horizon in DERIBIT_LABEL_HORIZONS_SEC}
 
         def rows() -> Any:
-            nonlocal joined, unavailable
+            nonlocal joined, unavailable, stale_rejected
             for event_id, snapshot in work:
                 timestamp = int(snapshot["snapshot_timestamp_ms"])
-                point = index.as_of(timestamp)
+                candidate = index.as_of(timestamp)
+                point = candidate if candidate is not None and timestamp - candidate.local_received_at_ms <= DERIBIT_MAX_JOIN_AGE_MS else None
                 features = self._outcome_features(snapshot)
                 context: dict[str, Any] = {
                     "market_instance": str(snapshot["outcome_id"]), "snapshot_event_id": event_id,
@@ -239,7 +245,19 @@ class OutcomeDeribitFeaturePipeline:
                 }
                 if point is None:
                     unavailable += 1
-                    features.update({"deribit_available": False, "deribit_unavailable_reason": "no_valid_locally_received_snapshot"})
+                    unavailable_reason = (
+                        "deribit_snapshot_stale_for_outcome_decision"
+                        if candidate is not None else "no_valid_locally_received_snapshot"
+                    )
+                    stale_rejected += int(candidate is not None)
+                    features.update({
+                        "deribit_available": False, "deribit_unavailable_reason": unavailable_reason,
+                        "deribit_freshness_budget_ms": DERIBIT_MAX_JOIN_AGE_MS,
+                    })
+                    context.update({
+                        "deribit_freshness_budget_ms": DERIBIT_MAX_JOIN_AGE_MS,
+                        "deribit_unavailable_reason": unavailable_reason,
+                    })
                 else:
                     joined += 1
                     features.update(self._deribit_features(index, point, outcome_timestamp_ms=timestamp))
@@ -248,6 +266,7 @@ class OutcomeDeribitFeaturePipeline:
                         "deribit_source_timestamp_ms": point.source_timestamp_ms,
                         "deribit_local_received_at_ms": point.local_received_at_ms,
                         "deribit_age_ms": timestamp - point.local_received_at_ms,
+                        "deribit_freshness_budget_ms": DERIBIT_MAX_JOIN_AGE_MS,
                     })
                 market_times, market_rows = market_index[int(snapshot["outcome_id"])]
                 labels = self._labels(snapshot, market_times, market_rows)
@@ -272,7 +291,7 @@ class OutcomeDeribitFeaturePipeline:
         )
         return D2BuildResult(
             eligible_outcome_snapshots=len(snapshots), rows_written=written, deribit_joined=joined,
-            deribit_unavailable=unavailable, labels_available=labels_available,
+            deribit_unavailable=unavailable, deribit_stale_rejected=stale_rejected, labels_available=labels_available,
             first_deribit_received_at_ms=first,
             last_deribit_received_at_ms=max((point.local_received_at_ms for point in points), default=None),
         )

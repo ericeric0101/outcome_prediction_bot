@@ -66,6 +66,9 @@ class OutcomeHoldingSupervisor:
         # All research follows protection.  None of these observers can
         # authorize a mutation.
         runtime._observe_toxic_fill_shadow(market=snapshot.market, finding=finding)
+        postfill_quality = getattr(runtime, "_observe_postfill_quality_shadow", None)
+        if callable(postfill_quality):
+            postfill_quality(market=snapshot.market, finding=finding)
         holding_key = (snapshot.market.outcome_id, str(getattr(finding, "coin", "")))
         now = snapshot.observed_monotonic
         reversal_observed = False

@@ -1402,7 +1402,33 @@ The broad Stage-2 promotion criteria above were not waived. An operator authoriz
 3. **One shared budget.** The lane has no independent attempt counter. It refuses to run unless `OutcomeRiskEpisodeStore` is enabled and uses the same durable wallet/outcome/coin episode as existing fast-failure and S3. An accepted or ambiguous prior attempt therefore consumes the same conservative budget.
 4. **Warning lane remains shadow-only.** Short-TTL aggressive-passive warning behavior retains no cancel, reprice, or IOC authority.
 
-The actual local canary profile explicitly sets `OUTCOME_RISK_EPISODE_BUDGET_ENABLED=1`, `OUTCOME_NARROW_HARD_FAILURE_CANARY_ENABLED=1`, and both Outcome limits to `11`. The tracked `.env.example` keeps the canary flag `0`, preventing accidental activation by a copied profile. A restart is required; startup manifest must report `narrow_hard_failure_canary=ready`. Canary review must compare decision→ACK, decision→confirmed-flat, partial/full fills, cap blocks, shared-episode usage, false exits and realized capital-hours before any expansion. No directional signal, OI gate, ALO entry selection, normal take-profit, warning-lane, or S3/fast-failure threshold changes in this deployment.
+The actual local canary profile explicitly sets `OUTCOME_RISK_EPISODE_BUDGET_ENABLED=1`, `OUTCOME_NARROW_HARD_FAILURE_CANARY_ENABLED=1`, and both Outcome limits to `11`. The tracked `.env.example` keeps the canary flag `0`, preventing accidental activation by a copied profile. A restart is required; startup manifest must report `narrow_hard_failure_canary=ready` **and** `risk_episode_budget=enabled` before treating the lane as live. `runtime_env.LOCAL_ENV_KEYS` deliberately remains an allowlist: it prevents stale/unknown `.env` keys from silently changing a real-money process. On 2026-09-15, these two approved canary keys were found missing from that allowlist, so a process recorded the lane disabled despite the private `.env` setting. They now belong to the named `LIVE_EXIT_CANARY_LOCAL_ENV_KEYS` group, with a loader regression test; this is a configuration-loading correction, not a broadening of the accepted `.env` surface. Canary review must compare decision→ACK, decision→confirmed-flat, partial/full fills, cap blocks, shared-episode usage, false exits and realized capital-hours before any expansion. No directional signal, OI gate, ALO entry selection, normal take-profit, warning-lane, or S3/fast-failure threshold changes in this deployment.
+
+### 2026-09-15 — Adverse-selection engineering: Phase A/B shadow implementation
+
+**Scope and authority.** This work studies a valid directional signal that is filled late during a pullback/exhaustion by a passive ALO. It does **not** change production confirmation, entry side, high-premium pause, resting-BUY planner, protective SELL, warning lane, narrow hard-failure canary, S3, size, or any live IOC authority. Tail-risk work remains the safety line; this is an execution-quality experiment that must prove or refute passive-fill adverse selection before live routing changes.
+
+#### Phase A — bounded evidence collection (implemented)
+
+`bot.outcome_entry_quality_shadow.OutcomeEntryQualityShadow` is a pure decision producer: it imports no account client, gateway, controller, SDK, journal or mutation primitive. `OutcomeEntryExecutionService` calls it only after proving an existing BUY is wallet-owned, and before the pre-existing requote planner. Its compact `OUTCOME_ENTRY_QUALITY_SHADOW` event is emitted at state change or ten-second cadence, never as a cancellation instruction. It uses only tick-provided as-of market context and performs no additional REST/account request.
+
+Each pre-fill event records exact order id, side, original quote, order age, tier/time-left, production signal state (`SAME_SIDE_CONFIRMED`, `SIGNAL_DECAY`, `SIDE_FLIP`), as-of BBO when already available, quote-off-touch state, and top-of-book cross cost. It compares five non-authoritative labels: baseline `JOIN_BEST_BID`, `IMPROVE_ONE_TICK_SHADOW`, `CANCEL_STALE_SHADOW`, and `PRICE_PROTECTED_IOC_COUNTERFACTUAL`. The predeclared 30-second stale age is an **analysis bucket**, not a live cancellation threshold. An unavailable BBO remains unavailable; public L2 cannot establish queue priority, passive fill probability, full-depth IOC VWAP, fee or slippage.
+
+After the existing protective-SELL-first step, `OutcomeHoldingSupervisor` also emits `OUTCOME_POST_FILL_QUALITY_SHADOW` at state change/ten seconds, with exact official-fill provenance, executable BBO return, and `SCRATCH_IOC_COUNTERFACTUAL`/`KEEP_NORMAL_EXIT_SHADOW`. It has no stop-loss authority: it cannot cancel a protective SELL, alter a price or submit an IOC. The first two minutes and -3% executable loss are a watch bucket only; later P3/holding-path outcomes decide whether it would have been a false positive.
+
+`scripts/outcome_entry_quality_report.py --db logs/outcome_shadow.db --period 1d` is the read-only report. It groups pre-fill signal states and first stale-cancel candidates by owned order, then joins post-fill observations to P3 solely by immutable official fill trade id. It must never claim that a shadow cancellation occurred or that a top-of-book IOC could fill the whole inventory.
+
+#### Phase B — frozen counterfactual policies (implemented as labels only)
+
+| Variant | Authority now | Phase-B evidence |
+|---|---:|---|
+| Baseline | current ALO join/requote only | actual production quote/fill outcome |
+| Fast hybrid | none | `IMPROVE_ONE_TICK_SHADOW` where same-side confirmation and as-of touch permit comparison |
+| Stale resting BUY cancel | none | `CANCEL_STALE_SHADOW` only after >=30s plus signal decay/side flip |
+| Active entry | none | top-of-book price-protected IOC cost counterfactual; no queue/full-depth fill assertion |
+| Post-fill scratch | none | watch label plus later P3/holding-path recovery outcome |
+
+Promotion is blocked until reports compare predeclared variants on unseen daily markets using actual maker fill probability, immutable P3 executable markouts, cancel-to-fill races, fee/depth-aware active-entry replay, PnL per capital-hour, and recover-winner false-exit cost. The first live entry canary, if evidence supports one, must be **stale resting BUY cancellation only** and still use the existing lifecycle, durable intent, cancel-and-confirm, account truth and cooldown. A dynamic JOIN/improve/IOC router is a later separately authorized proposal requiring full-depth, fee-adjusted EV and independent-market validation. No Phase-A/B module may call `place_alo`, `place_order`, `place_ioc`, cancel a venue order, or bypass execution services.
 
 ### 2026-09-14 — Deribit external-derivatives research integration plan (approved for planning only; no code or live authority)
 
@@ -1472,6 +1498,15 @@ outcome_snapshot_timestamp_ms`, with only collector-declared valid snapshots.
 It retains source event id, source/receipt timestamps, age, join direction and
 unavailability rather than imputing a missing row.  It produces 5/15/30/60s
 and 5m same-market executable YES/NO bid labels from Outcome P2 snapshots.
+
+**Freshness correction (2026-09-15):** the first D2 build exposed a
+reconnect-era flaw: an as-of lookup could select a previously valid Deribit
+snapshot after a later 115-second interruption.  D2 schema **v2** now has an
+immutable `DERIBIT_MAX_JOIN_AGE_MS=3000` budget.  Any candidate older than
+three seconds at an Outcome decision is recorded as
+`deribit_snapshot_stale_for_outcome_decision`, not joined and not eligible for
+D3.  The historical v1 rows remain audit evidence but D3 reads v2 only.  This
+is research-data integrity hardening; it has no live execution authority.
 
 First production build, observed 2026-09-15: **194** eligible current-era P2
 snapshots were found; the incremental build refreshed/wrote **59** rows, with

@@ -55,6 +55,7 @@ from bot.outcome_emergency_exit import (
 )
 from bot.outcome_efficiency_shadow import OutcomeConfidenceEntryShadow, OutcomeQueueAwarePricingShadow
 from bot.outcome_active_shadow import OutcomeActiveChallengerShadow
+from bot.outcome_entry_quality_shadow import OutcomeEntryQualityShadow, OutcomePostFillQualityInput
 from bot.outcome_crash_circuit_shadow import OutcomeCrashCircuitObservation, OutcomeCrashCircuitShadow
 from bot.outcome_market_risk_monitor import OutcomeMarketRiskMonitor, OutcomeMarketRiskObservation
 from bot.outcome_stress_exitability import OutcomeStressExitabilitySizer
@@ -156,6 +157,9 @@ class OutcomeLiveExecutionRuntime:
         # Milestone-B challenger is journal-only.  It owns no account,
         # gateway, controller or key and cannot alter the production action.
         self.active_challenger_shadow = OutcomeActiveChallengerShadow()
+        # Phase A/B adverse-selection evidence is a pure decision producer.
+        # It is shared with entry supervision only as an evaluator.
+        self.entry_quality_shadow = OutcomeEntryQualityShadow()
         # This records fast WS crash features for later calibration.  It is
         # deliberately separate from S3 / fast-failure authority.
         self.crash_circuit_shadow = OutcomeCrashCircuitShadow()
@@ -207,6 +211,7 @@ class OutcomeLiveExecutionRuntime:
         self._last_crash_shadow_record: dict[str, tuple[str, float]] = {}
         self._last_market_risk_record: dict[str, tuple[str, float]] = {}
         self._last_fast_failure_lane_record: dict[str, tuple[str, float]] = {}
+        self._last_postfill_quality_record: dict[str, tuple[str, float]] = {}
         self._last_fill_sync_at = float("-inf")
         self.journal_view = OutcomeRuntimeJournalView(ledger.journal.db_path if ledger else None)
         # These narrow services own decision ordering.  Atomic execution and
@@ -222,6 +227,7 @@ class OutcomeLiveExecutionRuntime:
             loss_reentry_gate=self.loss_reentry_gate, record_result=self._record,
             fast_risk_decision=self._entry_fast_risk_decision,
             safety_preflight=self.safety_ready_for_new_entry,
+            entry_quality_shadow=self.entry_quality_shadow,
         )
         self.exit_recovery_service = OutcomeExitRecoveryService(
             recovery=self.recovery, store=self.exit_lifecycle_store,
@@ -609,6 +615,41 @@ class OutcomeLiveExecutionRuntime:
             "duration_sec": round(decision.duration_sec, 3), "execution_submitted": False,
         })
         self._last_toxic_shadow_record[key] = (str(decision.state), now)
+
+    def _observe_postfill_quality_shadow(self, *, market: OutcomeMarketSpec, finding: object) -> None:
+        """Record a scratch counterfactual after protection, never an action."""
+        if self.ledger is None or self.stream_health is None:
+            return
+        coin = str(getattr(finding, "coin", ""))
+        inventory = Decimal(str(getattr(finding, "inventory", "0")))
+        vwap = self.machine._fill_vwap_for_inventory(coin=coin, inventory=inventory)
+        snapshot = self.stream_health.fresh_book_top(market, coin)
+        if not coin or inventory <= 0 or vwap is None or snapshot is None:
+            return
+        provenance = self._resolve_holding_entry_provenance(
+            market=market, coin=coin, inventory=inventory, fill_vwap=vwap,
+        )
+        if not provenance:
+            return
+        try:
+            filled_at = datetime.fromisoformat(str(provenance["entry_filled_at"])).timestamp()
+            trade_id = str(provenance["entry_trade_id"])
+            order_id = str(provenance["entry_order_id"])
+        except (KeyError, TypeError, ValueError):
+            return
+        payload = self.entry_quality_shadow.evaluate_post_fill(OutcomePostFillQualityInput(
+            outcome_id=market.outcome_id, period=market.period, coin=coin,
+            order_id=order_id, fill_trade_id=trade_id, fill_vwap=vwap,
+            holding_age_sec=max(0.0, time.time() - filled_at),
+            best_bid=Decimal(str(snapshot["bid"])), best_ask=Decimal(str(snapshot["ask"])),
+            top3_bid_depth=Decimal(str(snapshot["top3_bid_depth"])),
+        ))
+        action = str((payload.get("post_fill_scratch_shadow") or {}).get("action"))
+        previous, now = self._last_postfill_quality_record.get(trade_id), time.monotonic()
+        if previous is not None and previous[0] == action and now - previous[1] < 10.0:
+            return
+        self.ledger.journal.log_strategy_event(self.ledger.run_id, "OUTCOME_POST_FILL_QUALITY_SHADOW", payload)
+        self._last_postfill_quality_record[trade_id] = (action, now)
 
     def _continuation_entry_already_submitted(self, *, outcome_id: int) -> bool:
         """One continuation canary submit per daily market, including restarts."""
@@ -1626,6 +1667,7 @@ class OutcomeLiveExecutionRuntime:
             pending_owned_entry=pending_owned_entry,
             entry_side_index=entry_side_index, entry_reason=entry_reason,
             reduce_only=reduce_only, observed_monotonic=time.monotonic(),
+            market_context=dict(market_context or {}),
         )
         self._current_tick_snapshot = snapshot
         self._record_entry_gate_decision(

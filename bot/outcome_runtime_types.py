@@ -26,3 +26,6 @@ class OutcomeRuntimeTickSnapshot:
     entry_reason: str
     reduce_only: bool
     observed_monotonic: float
+    # Immutable caller-provided, as-of market context. It is observational
+    # only: execution services must not treat it as mutation truth.
+    market_context: dict[str, object] | None = None

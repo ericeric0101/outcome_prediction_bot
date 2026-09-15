@@ -16,6 +16,7 @@ from bot.outcome_entry_requote import (
     OutcomeEntryRequoteController,
 )
 from bot.outcome_execution_ledger import OutcomeExecutionLedger
+from bot.outcome_entry_quality_shadow import OutcomeEntryQualityShadow, OutcomeRestingBuyQualityInput
 from bot.outcome_live_strategy import OutcomeLiveStrategyConfig
 from bot.outcome_runtime_types import LiveExecutionResult, OutcomeRuntimeTickSnapshot
 
@@ -42,6 +43,7 @@ class OutcomeEntryExecutionService:
         record_result: Callable[..., LiveExecutionResult] | None = None,
         fast_risk_decision: Callable[..., tuple[bool, str, dict[str, object]]] | None = None,
         safety_preflight: Callable[..., tuple[bool, str]] | None = None,
+        entry_quality_shadow: OutcomeEntryQualityShadow | None = None,
     ) -> None:
         self.recovery = recovery
         self.gateway = gateway
@@ -54,6 +56,9 @@ class OutcomeEntryExecutionService:
         self.record_result = record_result
         self.fast_risk_decision = fast_risk_decision
         self.safety_preflight = safety_preflight
+        self.entry_quality_shadow = entry_quality_shadow
+        self._entry_quality_audits: dict[str, dict[str, object]] = {}
+        self._last_entry_quality_observation: dict[str, tuple[str, float]] = {}
 
     def preflight(
         self, *, snapshot: OutcomeRuntimeTickSnapshot,
@@ -149,6 +154,9 @@ class OutcomeEntryExecutionService:
         if lifecycle is None or lifecycle.order_id != str(buy_order_ids[0]):
             return LiveExecutionResult("blocked", "entry requote refuses unrecorded buy ownership", str(buy_order_ids[0]))
         age = None if lifecycle.updated_at_ts is None else max(0.0, time.time() - lifecycle.updated_at_ts)
+        self._observe_resting_buy_quality(
+            snapshot=snapshot, lifecycle=lifecycle, side_index=side_index, order_age_sec=age,
+        )
         fast_confirmed, fast_reason, fast_evidence = (False, "fast_risk_unavailable", {})
         if self.fast_risk_decision is not None:
             fast_confirmed, fast_reason, fast_evidence = self.fast_risk_decision(
@@ -195,6 +203,40 @@ class OutcomeEntryExecutionService:
         self._record_cancel(snapshot=snapshot, coin=coin, lifecycle=lifecycle,
                             result=result, reason=plan.reason, fast_risk=None)
         return LiveExecutionResult(result.state, result.detail, result.old_order_id)
+
+    def _observe_resting_buy_quality(
+        self, *, snapshot: OutcomeRuntimeTickSnapshot, lifecycle: OutcomeEntryLifecycle,
+        side_index: int, order_age_sec: float | None,
+    ) -> None:
+        """Persist a bounded Phase-A/B counterfactual, never an action."""
+        if self.entry_quality_shadow is None or self.ledger is None:
+            return
+        audit = self._entry_quality_audits.get(lifecycle.order_id)
+        if audit is None:
+            audit = self.store.submit_audit(order_id=lifecycle.order_id, coin=lifecycle.coin) if self.store else None
+            audit = dict(audit or {})
+            self._entry_quality_audits[lifecycle.order_id] = audit
+        payload = self.entry_quality_shadow.evaluate_resting_buy(OutcomeRestingBuyQualityInput(
+            outcome_id=snapshot.market.outcome_id, period=snapshot.market.period,
+            coin=lifecycle.coin, order_id=lifecycle.order_id, side_index=side_index,
+            order_price=lifecycle.price, order_age_sec=order_age_sec,
+            current_signal_side_index=snapshot.entry_side_index,
+            current_signal_reason=snapshot.entry_reason, entry_audit=audit,
+            market_context=dict(snapshot.market_context or {}),
+        ))
+        fingerprint = ":".join([
+            str(payload.get("signal_state")),
+            str((payload.get("stale_cancel_shadow") or {}).get("action")),
+            str(payload.get("quote_off_touch")),
+        ])
+        previous = self._last_entry_quality_observation.get(lifecycle.order_id)
+        now = time.monotonic()
+        if previous is not None and previous[0] == fingerprint and now - previous[1] < 10.0:
+            return
+        self.ledger.journal.log_strategy_event(
+            self.ledger.run_id, "OUTCOME_ENTRY_QUALITY_SHADOW", payload,
+        )
+        self._last_entry_quality_observation[lifecycle.order_id] = (fingerprint, now)
 
     def _record_cancel(
         self, *, snapshot: OutcomeRuntimeTickSnapshot, coin: str, lifecycle: Any,

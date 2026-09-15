@@ -14,6 +14,18 @@ from dotenv import dotenv_values
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
+# These keys are an explicitly authorized, bounded live-exit canary as a
+# pair.  Keep them separate from the broad local surface so a review can
+# verify that a canary cannot be half-configured merely because a new runtime
+# environment key was forgotten below.  They remain opt-in (both default to
+# disabled in .env.example) and the runtime still independently checks the
+# $11 caps and the durable shared episode store before it creates an IOC
+# controller.
+LIVE_EXIT_CANARY_LOCAL_ENV_KEYS = frozenset({
+    "OUTCOME_RISK_EPISODE_BUDGET_ENABLED",
+    "OUTCOME_NARROW_HARD_FAILURE_CANARY_ENABLED",
+})
+
 # Deliberately small, current Outcome-only local configuration surface. Legacy
 # keys may remain in an old private .env during migration but are never loaded.
 LOCAL_ENV_KEYS = frozenset({
@@ -32,7 +44,7 @@ LOCAL_ENV_KEYS = frozenset({
     "OUTCOME_LIVE_STRATEGY_OI_LOOKBACK_SEC", "OUTCOME_LIVE_STRATEGY_OI_MAX_AGE_SEC",
     "OUTCOME_TIER_B_ENABLED", "OUTCOME_LIVE_STRATEGY_MIN_ENTRY_PRICE",
     "OUTCOME_MAX_ENTRY_NOTIONAL_USDC", "OUTCOME_MAX_OUTCOME_EXPOSURE_USDC", "OUTCOME_MAX_OPEN_ORDERS",
-})
+}) | LIVE_EXIT_CANARY_LOCAL_ENV_KEYS
 
 
 def load_runtime_env(
