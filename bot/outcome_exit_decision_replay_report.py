@@ -25,6 +25,18 @@ RISK_EVENTS = (
 )
 NARROW_EXECUTION_TYPE = "narrow_hard_failure_price_protected_fak_ioc"
 
+# These are exact entry lifecycles, rather than outcome ids.  A single daily
+# market can contain several unrelated BUY/SELL lots, so an outcome-id lookup
+# would silently mix a tail with ordinary profitable round trips.
+CONTROL_LIFECYCLES: tuple[dict[str, str], ...] = (
+    {"case": "1993_tail", "entry_lifecycle_id": "official_buy:539350046368:965286494611543", "expected": "persistent"},
+    {"case": "2437_tail", "entry_lifecycle_id": "official_buy:542401099983:37264263716062", "expected": "persistent"},
+    {"case": "2820_tail", "entry_lifecycle_id": "official_buy:544175257282:916037474879419", "expected": "persistent"},
+    {"case": "2639_recovered_control", "entry_lifecycle_id": "official_buy:543149953671:599501425915030", "expected": "not_persistent"},
+    {"case": "3253_ioc_64815", "entry_lifecycle_id": "official_buy:545599571527:317333610957890", "expected": "persistent"},
+    {"case": "3253_ioc_70043", "entry_lifecycle_id": "official_buy:545872396577:992265207394277", "expected": "not_persistent"},
+)
+
 
 def _payload(raw: object) -> dict[str, Any]:
     try:
@@ -80,6 +92,93 @@ def _chop_label(*, samples: int, velocities: list[float], depths: list[float], s
     if _sign_flips(velocities) >= 1 and recovered_depth and contracted_spread:
         return "chop_depth_recovery_candidate"
     return "persistent_or_unresolved_deterioration"
+
+
+def _trend_efficiency(values: Iterable[float]) -> float | None:
+    """Absolute net move divided by total path length; 1 is one-way."""
+    items = list(values)
+    if len(items) < 3:
+        return None
+    path = sum(abs(current - prior) for prior, current in zip(items, items[1:]))
+    return abs(items[-1] - items[0]) / path if path > 0 else 0.0
+
+
+def _control_label(*, bids: list[float], depths: list[float], spreads: list[float], thesis_state: str) -> str:
+    """Read-only, predeclared replay label; never an execution instruction."""
+    if len(bids) < 3 or len(depths) < 3 or len(spreads) < 3 or thesis_state == "unavailable":
+        return "insufficient_data"
+    efficiency = _trend_efficiency(bids)
+    if efficiency is None:
+        return "insufficient_data"
+    latest_depth, min_depth = depths[-1], min(depths)
+    latest_spread, max_spread = spreads[-1], max(spreads)
+    depth_recovered = min_depth > 0 and latest_depth / min_depth >= 1.25
+    spread_contracted = max_spread > 0 and latest_spread / max_spread <= 0.80
+    bid_changes = [current - prior for prior, current in zip(bids, bids[1:])]
+    # A chop finding is deliberately conjunctive: one flip alone is ordinary
+    # noise and cannot veto a safety action in a future phase.
+    if (_sign_flips(bid_changes) >= 1 and efficiency <= 0.60
+            and depth_recovered and spread_contracted):
+        return "chop_recovery_candidate"
+    # The control replay does not infer that the underlying thesis is false:
+    # #2437 is an explicit counterexample.  Persistent book deterioration can
+    # still be an observed tail-risk regime while thesis remains intact.
+    return "persistent_or_unresolved_deterioration"
+
+
+def _raw_l2_window(
+    conn: sqlite3.Connection, *, coin: str, center: datetime, before_sec: int = 90,
+) -> list[tuple[datetime, float, float, float]]:
+    """Read one bounded raw-L2 interval, never a whole-journal raw scan."""
+    start = center - timedelta(seconds=before_sec)
+    rows = conn.execute(
+        """SELECT ts,payload_json FROM strategy_events
+           WHERE event_type='OUTCOME_WS_L2_BOOK' AND ts >= ? AND ts <= ? ORDER BY id""",
+        (start.isoformat(), center.isoformat()),
+    ).fetchall()
+    values: list[tuple[datetime, float, float, float]] = []
+    for ts, raw in rows:
+        payload = _payload(raw)
+        data = payload.get("raw", {}).get("data", {}) if isinstance(payload.get("raw"), dict) else {}
+        levels = data.get("levels") if isinstance(data, dict) else None
+        if str(data.get("coin") or "") != coin or not isinstance(levels, list) or len(levels) < 2:
+            continue
+        try:
+            bid, ask = float(levels[0][0]["px"]), float(levels[1][0]["px"])
+            depth = sum(float(level["sz"]) for level in levels[0][:3])
+        except (KeyError, TypeError, ValueError, IndexError):
+            continue
+        at = _timestamp(str(ts))
+        if at is not None and bid > 0 and ask > bid and depth > 0:
+            values.append((at, bid, ask, depth))
+    return values
+
+
+def _target_observation(
+    observations: list[tuple[datetime, dict[str, Any]]], *, entry_lifecycle_id: str,
+    narrow_exits: list[dict[str, Any]],
+) -> tuple[datetime, str] | None:
+    """Use the actual narrow submit when present; otherwise first -10% path boundary."""
+    exact_exit = next((
+        row for row in narrow_exits
+        if entry_lifecycle_id.startswith(f"official_buy:{row.get('entry_order_id')}:")
+    ), None)
+    if exact_exit is not None:
+        target = _timestamp(str(exact_exit.get("submit_ts") or ""))
+        return (target, "actual_narrow_ioc_submit") if target is not None else None
+    for at, payload in observations:
+        net = _number(payload.get("marketable_net_exit_vs_entry_pct") or payload.get("net_exit_vs_entry_pct"))
+        if net is not None and net <= -0.10:
+            return at, "first_executable_drawdown_at_or_below_10pct"
+    return None
+
+
+def _thesis_state(payload: dict[str, Any], *, side_index: int | None = None) -> str:
+    bps = _number(payload.get("spot_strike_bps"))
+    side = side_index if side_index in (0, 1) else payload.get("entry_side_index")
+    if bps is None or side not in (0, 1):
+        return "unavailable"
+    return "failed" if (side == 0 and bps <= 0) or (side == 1 and bps >= 0) else "intact"
 
 
 def _raw_l2_outcomes(
@@ -138,6 +237,7 @@ def _raw_l2_outcomes(
 def report(
     db_path: str | Path, *, period: str = "1d", monitor_window_sec: int = 90,
     include_raw_ws: bool = False, raw_ws_horizon_sec: int = 180,
+    include_control_raw: bool = False, control_cases: set[str] | None = None,
 ) -> dict[str, Any]:
     """Build factual exit/re-entry and pre-exit risk summaries from one journal."""
     path = Path(db_path)
@@ -147,7 +247,9 @@ def report(
         "period": period,
         "monitor_window_sec": monitor_window_sec,
         "raw_ws_requested": include_raw_ws,
+        "control_raw_requested": include_control_raw,
         "episodes": [],
+        "control_cases": [],
         "blockers": [],
         "limits": [
             "This report labels observed conditions; it never promotes a live exit threshold.",
@@ -234,6 +336,134 @@ def report(
                 "spread_bps": _summary(spreads),
                 "replay_label": _chop_label(samples=len(monitor), velocities=velocities, depths=depths, spreads=spreads),
             }
+
+        holding_paths: dict[str, list[tuple[datetime, dict[str, Any]]]] = defaultdict(list)
+        monitor_paths: dict[str, list[tuple[datetime, dict[str, Any]]]] = defaultdict(list)
+        for ts, event_type, payload in events:
+            if payload.get("period") != period:
+                continue
+            entry_lifecycle_id = str(payload.get("entry_lifecycle_id") or "")
+            observed = _timestamp(ts)
+            if not entry_lifecycle_id or observed is None:
+                continue
+            if event_type == "OUTCOME_HOLDING_PATH_OBSERVATION":
+                holding_paths[entry_lifecycle_id].append((observed, payload))
+            elif event_type in {"OUTCOME_MARKET_RISK_MONITOR_SHADOW", "OUTCOME_CRASH_CIRCUIT_SHADOW"}:
+                monitor_paths[entry_lifecycle_id].append((observed, payload))
+        for values in holding_paths.values():
+            values.sort(key=lambda item: item[0])
+        for values in monitor_paths.values():
+            values.sort(key=lambda item: item[0])
+
+        control_inputs: list[tuple[dict[str, str], list[tuple[datetime, dict[str, Any]]], datetime | None, str | None, dict[str, Any]]] = []
+        for control in CONTROL_LIFECYCLES:
+            if control_cases is not None and control["case"] not in control_cases:
+                continue
+            lifecycle_id = control["entry_lifecycle_id"]
+            observations = holding_paths.get(lifecycle_id, [])
+            selected = _target_observation(
+                observations, entry_lifecycle_id=lifecycle_id, narrow_exits=exits,
+            )
+            if selected is None:
+                control_inputs.append((control, observations, None, None, {}))
+                continue
+            target, selection_basis = selected
+            nearest = next((payload for observed, payload in reversed(observations) if observed <= target), {})
+            control_inputs.append((control, observations, target, selection_basis, nearest))
+
+        # The raw recorder table is multi-GB and indexes only event type.  One
+        # bounded OR query is therefore materially safer than six individual
+        # scans.  This remains read-only and loads only the six predeclared
+        # ninety-second windows.
+        raw_windows = [
+            (str(nearest.get("coin") or ""), target - timedelta(seconds=90), target)
+            for _, _, target, _, nearest in control_inputs if target is not None and nearest.get("coin")
+        ]
+        raw_by_window: dict[tuple[str, datetime], list[tuple[datetime, float, float, float]]] = defaultdict(list)
+        if include_control_raw and raw_windows:
+            # First locate the narrow id bands without reading any large JSON
+            # payload.  ``strategy_events`` has no ts index, while ``id`` is
+            # the primary key; this prevents a raw-payload scan for every
+            # control window on a multi-GB live journal.
+            id_windows: list[tuple[int, int]] = []
+            for _, start, end in raw_windows:
+                bounds = conn.execute(
+                    "SELECT MIN(id),MAX(id) FROM strategy_events WHERE ts >= ? AND ts <= ?",
+                    (start.isoformat(), end.isoformat()),
+                ).fetchone()
+                if bounds is not None and bounds[0] is not None and bounds[1] is not None:
+                    id_windows.append((int(bounds[0]), int(bounds[1])))
+            clauses = " OR ".join("(id >= ? AND id <= ?)" for _ in id_windows)
+            if not clauses:
+                id_windows = []
+            parameters = [value for start_id, end_id in id_windows for value in (start_id, end_id)]
+            raw_rows = conn.execute(
+                f"SELECT ts,payload_json FROM strategy_events WHERE event_type='OUTCOME_WS_L2_BOOK' AND ({clauses}) ORDER BY id",
+                parameters,
+            ).fetchall() if id_windows else []
+            for ts, raw in raw_rows:
+                payload = _payload(raw)
+                data = payload.get("raw", {}).get("data", {}) if isinstance(payload.get("raw"), dict) else {}
+                levels = data.get("levels") if isinstance(data, dict) else None
+                recorded_at = _timestamp(str(ts))
+                if not isinstance(levels, list) or len(levels) < 2 or recorded_at is None:
+                    continue
+                try:
+                    bid, ask = float(levels[0][0]["px"]), float(levels[1][0]["px"])
+                    depth = sum(float(level["sz"]) for level in levels[0][:3])
+                except (KeyError, TypeError, ValueError, IndexError):
+                    continue
+                coin = str(data.get("coin") or "")
+                if bid <= 0 or ask <= bid or depth <= 0:
+                    continue
+                for target_coin, start, end in raw_windows:
+                    if coin == target_coin and start <= recorded_at <= end:
+                        raw_by_window[(coin, end)].append((recorded_at, bid, ask, depth))
+
+        control_results: list[dict[str, Any]] = []
+        for control, observations, target, selection_basis, nearest in control_inputs:
+            lifecycle_id = control["entry_lifecycle_id"]
+            row: dict[str, Any] = {
+                "case": control["case"], "entry_lifecycle_id": lifecycle_id,
+                "expected": control["expected"], "holding_observation_count": len(observations),
+            }
+            if target is None:
+                row.update({"classification": "insufficient_data", "reason": "no_exact_hard_boundary_in_holding_path"})
+                control_results.append(row)
+                continue
+            coin = str(nearest.get("coin") or "")
+            raw = raw_by_window.get((coin, target), [])
+            bids = [item[1] for item in raw]
+            depths = [item[3] for item in raw]
+            spreads = [(item[2] / item[1] - 1.0) * 10_000 for item in raw]
+            entry_side = next((item.get("entry_side_index") for _, item in observations if item.get("entry_side_index") in (0, 1)), None)
+            monitor = next((
+                item for observed, item in reversed(monitor_paths.get(lifecycle_id, []))
+                if observed <= target and (target - observed).total_seconds() <= 15
+            ), {})
+            thesis = _thesis_state(monitor, side_index=entry_side)
+            label = _control_label(bids=bids, depths=depths, spreads=spreads, thesis_state=thesis)
+            expected = control["expected"]
+            matches = (label == "persistent_or_unresolved_deterioration" if expected == "persistent"
+                       else label == "chop_recovery_candidate")
+            row.update({
+                "target_ts": target.isoformat(), "selection_basis": selection_basis,
+                "coin": coin or None, "raw_l2_samples": len(raw),
+                "trend_efficiency": _trend_efficiency(bids),
+                "bid_direction_flips": _sign_flips([current - prior for prior, current in zip(bids, bids[1:])]),
+                "top3_depth": _summary(depths), "spread_bps": _summary(spreads),
+                "thesis_state": thesis, "classification": label, "matches_expected": matches,
+            })
+            control_results.append(row)
+        result["control_cases"] = control_results
+        result["control_validation"] = {
+            "status": (
+                "passed" if control_results and all(item.get("matches_expected") is True for item in control_results)
+                else "not_passed"
+            ),
+            "required": "all exact tail and recovery controls must match before a shadow veto is considered",
+            "raw_l2_required": True,
+        }
         if include_raw_ws:
             raw_outcomes = _raw_l2_outcomes(conn, exits=exits, horizon_sec=raw_ws_horizon_sec)
             for row in exits:
@@ -252,9 +482,15 @@ def main() -> None:
     parser.add_argument("--monitor-window-sec", type=int, default=90)
     parser.add_argument("--include-raw-ws", action="store_true")
     parser.add_argument("--raw-ws-horizon-sec", type=int, default=180)
+    parser.add_argument("--include-control-raw", action="store_true",
+                        help="Read bounded raw-L2 windows for the fixed exact-lifecycle control set.")
+    parser.add_argument("--control-case", action="append", default=None,
+                        help="One fixed control-case name; repeatable, useful for bounded offline reads.")
     args = parser.parse_args()
     print(json.dumps(report(args.db, period=args.period, monitor_window_sec=args.monitor_window_sec,
-                            include_raw_ws=args.include_raw_ws, raw_ws_horizon_sec=args.raw_ws_horizon_sec), indent=2, sort_keys=True))
+                            include_raw_ws=args.include_raw_ws, raw_ws_horizon_sec=args.raw_ws_horizon_sec,
+                            include_control_raw=args.include_control_raw,
+                            control_cases=set(args.control_case) if args.control_case else None), indent=2, sort_keys=True))
 
 
 if __name__ == "__main__":

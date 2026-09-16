@@ -37,10 +37,10 @@ class Gateway:
     def cancel_owned_order(self, **_): return {}
 
 
-def healthy_stream():
+def healthy_stream(*, received_at: float | None = None):
     health = OutcomeStreamHealth()
     health.configure_market(market()); health.on_lifecycle("connected"); health.mark_rest_resynced()
-    health.on_l2_book("#11530"); health.on_l2_book("#11531")
+    health.on_l2_book("#11530", received_at=received_at); health.on_l2_book("#11531", received_at=received_at)
     return health
 
 
@@ -173,7 +173,7 @@ def test_reduce_only_cancels_partial_fill_remainder_even_when_new_entry_is_unsaf
 
 def test_live_entry_fast_risk_requires_persistent_signal_invalidation(monkeypatch, tmp_path):
     journal = TradeJournalDB(tmp_path / "fast-risk.db")
-    health = healthy_stream()
+    health = healthy_stream(received_at=100.0)
     runtime = OutcomeLiveExecutionRuntime(
         account=CalibrationAccount(), wallet="w", gateway=Gateway(), stream_health=health,
         ledger=OutcomeExecutionLedger(journal, "run"),
@@ -411,6 +411,50 @@ def test_s0_blocks_second_buy_when_official_fill_precedes_account_inventory(monk
     assert reconciled.state == "sell_placed", reconciled.detail
     assert len(gateway.calls) == 2
     assert gateway.calls[-1]["is_buy"] is False
+
+
+def test_entry_lifecycle_terminalizes_only_after_prior_cancel_and_fresh_flat_truth(tmp_path):
+    """A failed cancel confirmation must not permanently poison a flat market."""
+    journal = TradeJournalDB(tmp_path / "terminal_cancel_reconcile.db")
+    ledger = OutcomeExecutionLedger(journal, "run")
+    account = Account()
+    runtime = OutcomeLiveExecutionRuntime(account=account, wallet="w", gateway=Gateway(), ledger=ledger)
+    lifecycle = OutcomeEntryLifecycle("w", 1153, "#11530", "cancelled-buy", Decimal("0.70"), 0, "BUY_RESTING")
+    runtime.entry_lifecycle_store.record(
+        lifecycle, reason="entry_fast_risk_cancel:adverse_bid_drift", extra={"state": "CANCEL_SUBMITTED"},
+    )
+    runtime.entry_lifecycle_store.record(
+        lifecycle, reason="old_order_still_open_after_cancel", extra={"state": "RECONCILE_REQUIRED"},
+    )
+    report = runtime.recovery.reconcile([market()])
+    assert runtime._entry_fill_visibility_barrier(market=market(), report=report, admission={}) is None
+    assert runtime.entry_lifecycle_store.recover(wallet="w", outcome_id=1153, coin="#11530") is None
+    with sqlite3.connect(journal.db_path) as conn:
+        terminal = conn.execute(
+            "SELECT payload_json FROM strategy_events WHERE event_type='OUTCOME_ENTRY_LIFECYCLE' ORDER BY id DESC LIMIT 1"
+        ).fetchone()[0]
+        cancel = conn.execute(
+            "SELECT status, reason FROM order_events WHERE venue_order_id='cancelled-buy' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    assert '"state": "CANCELLED"' in terminal
+    assert '"reason": "entry_fast_risk_cancel:adverse_bid_drift"' in terminal
+    assert cancel == ("CANCELLED", "entry_absent_after_prior_cancel_and_fresh_account_reconciliation")
+
+
+def test_entry_lifecycle_absence_without_prior_cancel_remains_fail_closed(tmp_path):
+    """Flat account truth alone cannot erase a possibly unobserved BUY fill."""
+    journal = TradeJournalDB(tmp_path / "no_terminal_without_cancel.db")
+    ledger = OutcomeExecutionLedger(journal, "run")
+    runtime = OutcomeLiveExecutionRuntime(account=Account(), wallet="w", gateway=Gateway(), ledger=ledger)
+    lifecycle = OutcomeEntryLifecycle("w", 1153, "#11530", "unknown-buy", Decimal("0.70"), 0, "BUY_RESTING")
+    runtime.entry_lifecycle_store.record(
+        lifecycle, reason="owned_entry_absent_without_terminal_evidence", extra={"state": "RECONCILE_REQUIRED"},
+    )
+    report = runtime.recovery.reconcile([market()])
+    result = runtime._entry_fill_visibility_barrier(market=market(), report=report, admission={})
+    assert result is not None
+    assert result.detail == "owned entry absent without terminal reconciliation evidence"
+    assert runtime.entry_lifecycle_store.recover(wallet="w", outcome_id=1153, coin="#11530") is not None
 
 
 def test_20_canary_submits_only_capacity_safe_partial_size(monkeypatch, tmp_path):

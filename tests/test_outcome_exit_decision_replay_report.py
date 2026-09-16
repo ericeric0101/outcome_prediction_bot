@@ -1,4 +1,4 @@
-from bot.outcome_exit_decision_replay_report import report
+from bot.outcome_exit_decision_replay_report import _control_label, _trend_efficiency, report
 from monitoring.trade_journal_db import TradeJournalDB
 
 
@@ -30,3 +30,13 @@ def test_replay_joins_existing_hard_exit_reentry_and_monitor_facts(tmp_path):
     assert episode["exit_fill_price"] == 0.70
     assert episode["first_reentry"]["fill_price"] == 0.73
     assert episode["pre_exit_monitor"]["replay_label"] == "chop_depth_recovery_candidate"
+
+
+def test_control_label_requires_joint_chop_evidence_not_a_single_bid_flip():
+    assert _trend_efficiency([1.0, 0.9, 1.0]) == 0.0
+    assert _control_label(
+        bids=[1.0, 0.9, 1.0], depths=[100, 50, 100], spreads=[500, 400, 300], thesis_state="intact",
+    ) == "chop_recovery_candidate"
+    assert _control_label(
+        bids=[1.0, 0.9, 0.8], depths=[100, 50, 55], spreads=[500, 400, 450], thesis_state="intact",
+    ) == "persistent_or_unresolved_deterioration"

@@ -92,7 +92,7 @@ supervisor 目前仍負責不可交換的順序：`protect → read-only holding
 | Quote economics／報價計畫：`quoting.py`、`quote_service.py`、`quote_runtime.py`、`execution/maker_engine.py`、`execution/rebate_model.py` | `OutcomePricingState` 重用 `QuoteEconomics`；`OutcomeMakerStateMachine` / official SDK gateway 可 ALO buy、fill 後 ALO sell、取消與 restart recovery。 | 原 `test_quote_plan.py`、`test_quoting.py`、`test_execution_penalty_calibration.py`；`test_outcome_pricing.py`、`test_outcome_maker_state_machine.py`、`test_outcome_execution_gateway.py` | **部分移植**。基本 maker lifecycle 已實測；原 QuoteService 的 fair-edge、re-quote、queue/cancel economics 尚未接入 Outcome live path，且 Polymarket rebate/fee schedule 不可沿用。 |
 | 倉位與 exit：`position_manager.py`、`exit_engine.py`、`execution/exit_policy.py` | account bridge 將真實 balances 餵入未修改的 `PositionManager`；shadow 以未修改的 `ExitPolicyEngine` 產生 exit decisions。 | 原 `test_adaptive_min_hold.py`、`test_adaptive_trailing.py`、`test_exit_audit.py`；`test_outcome_account_sync.py`、`test_outcome_shadow_runner.py` | **部分移植**。正式 live runtime 現在只管理「ALO buy → inventory → ALO take-profit sell」；尚未把 `ExitPolicyEngine` 的完整決策轉為 Outcome cancel/replace/reduce-only 操作。 |
 | Recovery／止損階梯：`recovery_exit_ladder.py`、`taker_exit.py`、`risk_policy.py` | `OutcomeAccountRecovery`、`OutcomeMakerStateMachine` 與 `OutcomePreTradeRiskGate` 實作 restart reconciliation、未知曝險 fail-closed、owned buy cancel；P1 stream health 阻擋新 entry。 | 原 `test_recovery_exit_ladder.py`、`test_risk_policy_recovery.py`、`test_f2_trailing_profit_release.py`、`test_f3_catastrophic_sl_gate.py`、`test_f4_last_resort_guard.py`；`test_outcome_account_recovery.py`、`test_outcome_risk_gate.py`、`test_outcome_stream_health.py` | **部分移植**。帳戶／資料故障防線已對應；原 P5 recovery ladder 的 passive→IOC/taker exit 不可自動沿用，因 Outcome live policy 目前只准 post-only，且尚無費後 recovery fill evidence。 |
-| Hold-to-redeem／結算 PnL：`exit_engine.py`、`post_trade.py`、`merge_ops.py`、redeem scripts | shadow 可產生原 `HOLD_TO_REDEEM` 決策；`OutcomeSettlementAdapter` 只接受 SDK `fetchSettledOutcome`，sidecar 的 `merge_outcome` 僅限成對 YES+NO conversion 且另有 gate。 | 原 `test_hold_to_redeem_reversal.py`、`test_adversarial_real_pnl.py`；`test_outcome_settlement.py`、`test_outcome_spec_audit.py` | **部分移植／結算 blocker**。Outcome 無已證實的 generic one-sided redeem API，故不能把 Polymarket redeem/allowance code 直接移植；必須等 official settlement 與帳戶 payout evidence，才可正式入帳。 |
+| Hold-to-redeem／結算 PnL：`exit_engine.py`、`post_trade.py`、`merge_ops.py`、redeem scripts | shadow 可產生原 `HOLD_TO_REDEEM` 決策；`OutcomeSettlementAdapter` 只接受 SDK `fetchSettledOutcome`，sidecar 的 `merge_outcome` 是成對 YES+NO conversion，**目前 repo 自行限制為 settled market**。 | 原 `test_hold_to_redeem_reversal.py`、`test_adversarial_real_pnl.py`；`test_outcome_settlement.py`、`test_outcome_spec_audit.py` | **部分移植／結算 blocker**。Outcome 無已證實的 generic one-sided redeem API，故不能把 Polymarket redeem/allowance code直接移植；官方 SDK 可在未結算時 merge paired shares，但本 repo 尚未授權此 conversion 作為交易策略；one-sided hold-to-settlement 仍須等待 official settlement 與帳戶 payout evidence，才可正式入帳。 |
 | 市場發現與週期 rollover：`market_discovery.py`、`market_data.py`、`lifecycle.py` | `lifecycle/outcome_lifecycle.py` 解析 `outcomeMeta`、expiry、target、side metadata，並以 `OUTCOME_MARKET_PERIODS` / fallback 選擇 15m、1d 等實際存在市場。 | 原 `test_runtime_env.py`；`test_outcome_lifecycle.py`、`test_outcome_market_selection.py`、`test_outcome_market_metadata.py` | **已移植**。Gamma slug／CLOB instrument discovery 為 **不適用**；現時無 15m 時安全 fallback 到 1d，strict 15m 時等待而不錯選。 |
 | 行情與 book freshness：`spot_pricer.py`、`price_streams.py`、`market_runtime.py` | `OutcomeClient allMids/l2Book`、`OutcomePricingState`、`OutcomeWebSocketRecorder`、`OutcomeStreamHealth`；重連後 REST resync，雙側 L2 必須新鮮才允許新 entry。 | 原 `test_price_streams.py`、`test_quote_freshness.py`；`test_outcome_client.py`、`test_outcome_pricing.py`、`test_outcome_ws_recorder.py`、`test_outcome_stream_health.py` | **已移植（venue boundary）**。Polymarket Chainlink TWAP／Gamma opening strike stream 不適用於 Outcome settlement；其資料品質與 freshness 原則保留，但 data source 必須是 HIP-4／HyperCore。 |
 | 下單、取消、order lifecycle：`execution/polymarket_client.py`、`order_submission.py`、`order_runtime.py`、`adapter_overrides.py` | official TypeScript SDK sidecar → `OutcomeExecutionGateway` → `OutcomeLiveExecutionRuntime`；整數 shares、$10 minimum、ALO crossing precheck、wallet ownership cancel、execution ledger。 | 原 `test_live_path_regressions.py`、`test_quote_watchdog_recovery_scope.py`；`test_outcome_sdk_sidecar.py`、`test_outcome_execution_gateway.py`、`test_outcome_live_execution_runtime.py`、`test_outcome_execution_ledger.py` | **已移植（基本交易生命週期）**。Polymarket CLOB API／Nautilus monkey patch 不適用；advanced quote replacement 尚屬上一列的未完成項。 |
@@ -205,7 +205,7 @@ Runner 重啟時先做 account reconciliation：若已有相同 outcome 的 inve
 1. [`bot/launcher.py`](bot/launcher.py) 的 live path 已移除對 legacy Python direct-signing `OutcomeExecutionAdapter` 的依賴，唯一執行出口是 `OutcomeLiveExecutionRuntime` → `OutcomeExecutionGateway` → official TypeScript SDK sidecar。Python direct client 保留唯讀帳戶／市場相容層，不再是 launcher 的簽名下單路徑。
 2. [`bot/outcome_maker_state_machine.py`](bot/outcome_maker_state_machine.py) 是非阻塞、可重入的每-tick state machine：flat → ALO buy resting → fill detected from spot balance → cancel buy remainder → ALO sell resting。每次 tick 最多提交一個交易所 mutation；不會因等待 fill 阻塞策略 loop，也不會 fallback 為 taker。partial fill 小於交易所最低 $10 exit notional 時會停止並要求對帳，絕不虛增 sell size。
 3. [`bot/outcome_account_recovery.py`](bot/outcome_account_recovery.py) 在每個 live tick 以 wallet 的 spot balances 與 frontend open orders 重建狀態。未知 Outcome 曝險、雙邊衝突訂單、無庫存 sell、或無 covering sell 的庫存都 fail-closed；只有 flat、已掛買單、或完全受保護的庫存可繼續。此設計使 process restart／資料中斷不依賴記憶體中的 oid。
-4. [`bot/outcome_settlement.py`](bot/outcome_settlement.py) 只接受官方 SDK `fetchSettledOutcome` 作為結算證據；不再由 BTC mid、strike 或本地策略推論 winner。SDK sidecar 新增唯讀 `fetch_settled_outcome`／`fetch_account_snapshot`，並提供受 `OUTCOME_SETTLEMENT_ACTION_ENABLED=1` 額外保護的 `merge_outcome`。這是 paired Yes+No 的 conversion，不是對 standalone binary winning share 臆造的「redeem」操作；官方 SDK 未提供 generic one-sided redeem method，因此 hold-to-settlement 必須等待官方 balance/activity 顯示實際 payout 後再做 PnL 入帳。
+4. [`bot/outcome_settlement.py`](bot/outcome_settlement.py) 只接受官方 SDK `fetchSettledOutcome` 作為結算證據；不再由 BTC mid、strike 或本地策略推論 winner。SDK sidecar 新增唯讀 `fetch_settled_outcome`／`fetch_account_snapshot`，並提供受 `OUTCOME_SETTLEMENT_ACTION_ENABLED=1` 額外保護的 `merge_outcome`。這是 paired Yes+No 的 conversion，不是對 standalone binary winning share 臆造的「redeem」操作；官方 SDK 允許 pair merge 不受 settlement 限制，但本 repo 的 settlement adapter 刻意要求 settled evidence。SDK 仍未提供 generic one-sided redeem method，因此 one-sided hold-to-settlement 必須等待官方 balance/activity 顯示實際 payout 後再做 PnL 入帳。
 
 **P0 驗證（2026-08-24；歷史 gate 狀態）：** official sidecar `npm run build` 通過；P0 相關 Python 測試共 **28 passed**，涵蓋 SDK gateway、整數 size、non-blocking state transition、partial-fill cancellation、restart recovery、cross-side exposure block、reduce-only cancellation、official settlement confirmation 與 merge guard。當時自動策略 dispatch 仍需 operator 明示 `OUTCOME_AUTOMATED_EXECUTION_ENABLED=1` 與 `OUTCOME_SDK_EXECUTION_ENABLED=1`，P2/P3 未通過便不得啟用。後續 `launcher --live` 已將這些正式 execution gate 納入 typed-`yes` 啟動流程；P2/P3 經濟研究仍未完成，但不能再把此段解讀為現行 S0 runtime 不可啟動。
 
@@ -1084,6 +1084,160 @@ flowchart TD
 ## 陸、歷史環境與維運配置（2026-09-06 前；不是現行設定）
 
 > 現行 supported local configuration 僅以 `.env.example` 為準。`VENUE`、`POLYMARKET_*`、profiles、legacy entry/exit knobs 均不會由 `runtime_env` 載入。
+
+### 2026-09-17 — Official Outcome HIP-4 SDK review and follow-up plan (planning only; no new live authority)
+
+**Scope and evidence.** This review cross-checked the official Outcome SDK
+introduction/market-fetch guide and the public
+[`Outcome-xyz/hip4`](https://github.com/Outcome-xyz/hip4) source/README. The
+official SDK exposes typed market discovery, L2/price/trade subscriptions,
+account reads, and the mutation primitives `placeOrder`, `modifyOrder`,
+`cancelOrder`, `scheduleCancel`, `splitOutcome`, `mergeOutcome`,
+`mergeQuestion`, and `negateOutcome`. The following is a prioritized plan,
+not evidence of a trading edge and not authorization to change a live order.
+
+#### Findings: verified, corrected, and deliberately deferred
+
+| Claim from review | Verdict against official SDK and this repo | Current repo state / consequence |
+|---|---|---|
+| `scheduleCancel(time)` is an exchange-side dead-man's switch | **Verified, but the proposed use is unsafe as stated.** The SDK says it cancels **every open order from the signing agent** at the future timestamp; passing `null` clears it. | A same-agent heartbeat would cancel resting BUYs **and protective SELLs**. It therefore does **not** mean the account becomes flat after 60 seconds: a pre-existing filled Outcome inventory could be left unprotected when its SELL is cancelled. Do not add a production heartbeat until scope/agent separation and holding behaviour are verified. |
+| `modifyOrder` can replace cancel → confirm → rebook | **Partly verified.** It is one venue action; the SDK explicitly promises queue-priority preservation only for a size-only change. It makes no corresponding promise for a price change. | It may reduce the cancel/rebook no-order window, but does not remove lost-ACK ambiguity, ownership recovery, or price-change queue-reset risk. It cannot replace the hardened exit lifecycle without a dedicated equivalence test. |
+| `splitOutcome`/`mergeOutcome` enable YES+NO parity/arbitrage research | **Verified as protocol capability; not a ready strategy.** The SDK permits `mergeOutcome` before settlement: it burns paired YES+NO and mints USDC without order-book liquidity. | The sidecar's current settlement gate is a **repo-local conservative restriction**, not an SDK requirement. A live parity lane would still need simultaneous executable two-sided depth, all fees, inventory/reconciliation, partial-fill handling, and a separately authorized risk budget. |
+| Hyperliquid native `subscribeActiveAssetCtx` / `subscribePerpAssetCtx` makes Binance OI obsolete | **Not established.** These are native spot/perp context feeds, not documented proof of a superior HIP-4 Outcome directional OI signal. | Current S0 deliberately uses fresh **Binance BTCUSDT** OI as an external activity feature. Native BTC-perp mark/oracle/funding/OI can be a shadow comparison feature, but it must not silently replace S0 or be called "Outcome OI". |
+| Builder fee is silently leaking from SDK orders | **No per-order leakage found; account-level builder configuration still matters.** | `createHIP4Adapter({ testnet })` supplies neither `builderAddress` nor `builderFee`; no per-order override is present. Outcome documents a mandatory account builder code whose fee is currently zero and may change, so fee recording remains required. |
+| SDK market order should be used for quicker exits/entries | **Rejected as a replacement for the existing exit path.** | Official SDK `market` derives a price from current mid with an 8% buy/sell slippage band and clamps it to `[0.0001, 0.9999]`; it is not an unbounded extreme-price order. It still lacks this bot's fresh full-depth full-position walk, fee-aware decision cap and durable emergency lifecycle, so price-protected FAK/IOC remains safer for exits. |
+| `fetchActivity(address)` is missing from exchange-truth reconciliation | **Partly addressed, not independently audited.** | The sidecar's read-only `fetch_account_snapshot` already fetches positions, balances, open orders **and** 30-day activity. It is not yet a scheduled journal-vs-venue reconciliation report, so it cannot yet detect historical local-ledger drift as an independent control. |
+
+#### Priority order
+
+**O1 — exchange-side cancellation semantics test (highest safety value; testnet only first).**
+
+Before any production configuration, create a dedicated testnet agent/wallet
+probe that creates a BUY and a protective SELL, arms `scheduleCancel` with a
+short documented timestamp, refreshes it once, and observes exactly which
+orders are cancelled at expiry. Record the timestamp unit, extension/clear
+semantics, agent scope, acknowledgement shape, timeout behaviour and account
+visibility delay. This probe must never use the production wallet or live
+Outcome market. A passing test that confirms all same-agent orders are
+cancelled is **evidence against** using it with the current single-agent
+holding architecture, not authorization to enable it.
+
+A future production design can proceed only after choosing and validating one
+of these explicit alternatives:
+
+1. Separate, least-privilege agents with independently verified ability to
+   maintain a protective SELL; or
+2. A side-specific venue liveness design that demonstrably cancels stale
+   **entries** without cancelling a valid protection order. The SDK's current
+   `GTD` label maps to GTC rather than true expiry, so it is not assumed to
+   provide this mechanism.
+
+Both require a new threat-model review, durable startup/shutdown audit,
+restart tests, `SIGKILL`/network-loss simulation and explicit operator
+approval. The current SIGINT/SIGTERM cleanup and exchange-account recovery
+remain authoritative until then.
+
+**O2 — daily official activity reconciliation (safe to implement now, read-only).**
+
+Add a bounded, read-only daily audit that consumes the existing official
+sidecar account snapshot/activity response and compares immutable official
+fills/order ids against local `order_events`/canonical FIFO. It must record
+missing-on-venue, missing-locally, duplicate, delayed-visibility and
+unmatchable rows separately; no audit result may cancel, submit, resize or
+reconcile a live position automatically. Cursoring/deduplication must follow
+the existing settlement `userFillsByTime` discipline and preserve raw source
+ids, so a rolling 30-day activity window cannot be misread as a complete
+history. This is the only item in this review that is ready for immediate
+implementation without changing live strategy or execution authority.
+
+**Implementation status (2026-09-17).** Implemented as the read-only
+`scripts/outcome_activity_reconciliation_report.py`. It calls the existing
+official sidecar `fetch_account_snapshot` only when invoked (or accepts an
+offline activity fixture), then compares exact official `PredictionActivity`
+`trade.id` values with local `ORDER_FILLED.actual_fill=true` trade ids and
+checks FIFO references. It does not write journal rows or call any mutation
+method. First production read found **477** official trade ids, **471** local
+fill ids and **470** exact matches: seven official ids were missing locally,
+one local id was absent from the rolling official window, and two synthetic
+`settlement:<outcome>:<side>` FIFO references were correctly surfaced as
+non-trade ids. The report is therefore `DRIFT_DETECTED`, not a clean audit.
+The one local-only id is not automatically an error because the official SDK
+view is a 30-day window; the seven official-only ids need a separate
+read-only provenance investigation before any repair is contemplated.
+
+**O3 — native Hyperliquid BTC-perp context comparator (shadow research).**
+
+After the current five-market D1/D2 health review, add a bounded subscription
+for the documented BTC perp context (mark, oracle, funding and OI) as a
+separate as-of feature source. Compare it against the existing Binance OI
+feature on the same frozen D2/B walk-forward rows: freshness/availability,
+latency, incremental future executable-bid value, tail-warning recall and
+recover-winner false-exit cost. It must remain unavailable rather than
+imputed on a WS gap, must not add an execution-loop REST request, and must not
+change S0 until a separately reviewed out-of-sample result proves incremental
+value. This comparator is lower priority than the existing tail-risk and
+Deribit data-quality work.
+
+**Implementation status (2026-09-17).** `OutcomeWebSocketRecorder` now owns
+one public `activeAssetCtx:BTC` subscription and persists a compact,
+one-second-capped `hyperliquid_perp_context_observations` row (mark, oracle,
+funding, OI, premium and volume provenance). It neither reads account truth
+nor changes a strategy decision. `scripts/hyperliquid_oi_comparison_report.py`
+performs only causal as-of joins to existing live Binance OI rows and compares
+percentage changes, **not raw OI levels**, because contracts/units differ by
+venue. Initial report is expected to show `NO_HL_DATA` until the live bot is
+restarted with this build and has received a BTC context event; it must not be
+treated as model evidence before sufficient independent markets exist.
+
+**O4 — `modifyOrder` equivalence research (testnet then shadow).**
+
+Use a dedicated testnet order to compare price-only, size-only and combined
+modifications against the current `cancel_and_confirm → durable intent →
+rebook` path. Required evidence: queue/order-id semantics, order-view and
+fill-view visibility, price-change priority behaviour, lost-ACK recovery,
+partial-fill race, cancel/modify conflict and a full ambiguity-fence test.
+Only if it preserves or improves the existing ownership/recovery contract may
+it become a shadow implementation behind the existing
+`OutcomeExitLifecycleStore`; it must never create a second mutation path. No
+live change is scheduled from this review.
+
+**Implementation status (2026-09-17).** Added the isolated
+`outcome_sdk_sidecar/src/modify_order_testnet_probe.ts`. It is hard-coded to
+`testnet: true`, defaults to dry-run, is outside the long-lived Python
+sidecar command surface, and requires both `--execute` and
+`OUTCOME_MODIFY_TESTNET_EXECUTE=1` before it can modify an already-owned
+testnet resting order. It verifies wallet ownership, active market/side and
+post-mutation open orders. The TypeScript build and dry-run contract pass;
+**venue semantics are still unproven** until an operator deliberately runs it
+against a disposable testnet order. Separately, existing
+`OutcomeExitRequoteService` now emits a bounded `OUTCOME_MODIFY_ORDER_SHADOW`
+event for a real cancel/replace candidate. The event explicitly marks
+price-changing edits as `price_change_requeues_expected`; it has
+`live_authority=false` and cannot alter the existing
+cancel-confirm-durable-intent-rebook path.
+
+**O5 — parity/conversion research (low strategy priority).**
+
+A future read-only scanner may calculate fee-adjusted executable
+`YES_ask + NO_ask`, full-depth bundle cost and available merge capacity for
+one Outcome market. It must first prove a persistent positive net gap after
+all maker/taker/conversion/settlement costs and simulate partial fills. It is
+not a substitute for the tail-risk programme or the B/E fair-value work, and
+has no authority to call `splitOutcome`, `mergeOutcome` or `negateOutcome`.
+
+#### What remains intentionally unchanged
+
+- Market discovery remains scoped to `defaultBinary` BTC recurring markets.
+  The SDK also supports labelled, multi-outcome and price-bucket markets, but
+  those are outside the current strategy contract rather than silently
+  skipped eligible BTC 1d markets.
+- Current direct Hyperliquid WebSocket L2/account truth, official SDK
+  sidecar, price-protected emergency FAK/IOC, durable intent, ambiguity
+  fences, lifecycle stores and recovery stay in place.
+- No `scheduleCancel`, `modifyOrder`, native-perp signal, conversion or
+  `fetchActivity` audit can alter entry side, size, quote, exit, risk episode,
+  settlement or any existing live gate without a separate implementation and
+  explicit operator authorization.
 
 ### 關鍵環境變數清單
 

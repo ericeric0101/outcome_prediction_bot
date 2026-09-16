@@ -113,6 +113,40 @@ class OutcomeEntryLifecycleStore:
         except (TypeError, ValueError, sqlite3.Error, json.JSONDecodeError):
             return None
 
+    def latest_cancel_intent_reason(
+        self, *, wallet: str, outcome_id: int, coin: str, order_id: str,
+    ) -> str | None:
+        """Return the durable reason for a previously submitted owned cancel.
+
+        This is deliberately narrower than an absent-order lookup.  A later
+        flat account snapshot may close an entry lifecycle only when this
+        runtime had already durably recorded that it was cancelling this exact
+        owned BUY.  Without that intent, an absent order can still be an
+        unobserved fill or an account-view race and must remain fail-closed.
+        """
+        try:
+            with sqlite3.connect(f"file:{self.journal.db_path}?mode=ro", uri=True) as conn:
+                row = conn.execute(
+                    """SELECT payload_json FROM strategy_events
+                       WHERE event_type=?
+                         AND json_extract(payload_json, '$.venue')='hyperliquid_outcome'
+                         AND json_extract(payload_json, '$.wallet')=?
+                         AND CAST(json_extract(payload_json, '$.outcome_id') AS INTEGER)=?
+                         AND json_extract(payload_json, '$.coin')=?
+                         AND json_extract(payload_json, '$.order_id')=?
+                         AND json_extract(payload_json, '$.state')='CANCEL_SUBMITTED'
+                       ORDER BY id DESC LIMIT 1""",
+                    (self.EVENT, wallet, int(outcome_id), coin, str(order_id)),
+                ).fetchone()
+            if row is None:
+                return None
+            payload = json.loads(row[0] or "{}")
+            reason = payload.get("reason") if isinstance(payload, dict) else None
+            return str(reason) if reason else None
+        except (sqlite3.Error, TypeError, ValueError, json.JSONDecodeError):
+            # A journal-read failure must never authorize a new entry.
+            return None
+
     def pending_ambiguous_submit(self, *, wallet: str, outcome_id: int) -> dict[str, Any] | None:
         """Return an unresolved buy submission whose venue ACK was lost.
 

@@ -6,7 +6,8 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "start": "node dist/main.js",
-    "health": "printf '{\"id\":\"health\",\"command\":\"health\"}\\n' | node dist/main.js"
+    "health": "printf '{\"id\":\"health\",\"command\":\"health\"}\\n' | node dist/main.js",
+    "testnet:modify-probe": "node dist/modify_order_testnet_probe.js"
   },
   "dependencies": {
     "@outcome.xyz/hip4": "1.0.3-beta",

@@ -129,3 +129,22 @@ def test_all_mids_journal_payload_never_copies_unrelated_market_map(tmp_path):
     with sqlite3.connect(db) as conn:
         payload = json.loads(conn.execute("SELECT payload_json FROM strategy_events").fetchone()[0])
     assert payload["raw"]["data"]["mids"] == {"BTC": "80000", "#yes": "0.6", "#no": "0.4"}
+
+
+def test_native_perp_context_is_compact_and_rate_limited(tmp_path, monkeypatch):
+    db_path = tmp_path / "stream.db"
+    recorder = OutcomeWebSocketRecorder(CallbackClient(), TradeJournalDB(db_path), "stream-run")
+    monkeypatch.setattr("bot.outcome_ws_recorder.time.time", lambda: 10.0)
+    payload = {"channel": "activeAssetCtx", "data": {"coin": "BTC", "ctx": {
+        "markPx": "80000", "oraclePx": "79999", "funding": "0.0001", "openInterest": "123",
+        "premium": "0.001", "unrelated": "must_not_persist",
+    }}}
+    recorder._on_perp_asset_ctx(payload)
+    recorder._on_perp_asset_ctx(payload)
+    with sqlite3.connect(db_path) as conn:
+        rows = conn.execute(
+            "SELECT mark_price, oracle_price, funding, open_interest, raw_context_json FROM hyperliquid_perp_context_observations"
+        ).fetchall()
+    assert len(rows) == 1
+    assert rows[0][:4] == ("80000", "79999", "0.0001", "123")
+    assert "unrelated" not in rows[0][4]

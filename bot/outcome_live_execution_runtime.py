@@ -17,6 +17,7 @@ from bot.adapters.outcome_client import OutcomeClient
 from bot.lifecycle.outcome_lifecycle import OutcomeMarketSpec
 from bot.outcome_account_recovery import OutcomeAccountRecovery
 from bot.outcome_account_read_cache import OutcomeAccountReadCache
+from bot.outcome_coin import normalize_outcome_coin
 from bot.outcome_execution_gateway import OutcomeExecutionGateway, whole_share_size
 from bot.outcome_maker_state_machine import MakerTickResult, OutcomeMakerStateMachine
 from bot.outcome_risk_gate import OutcomePreTradeRiskGate, OutcomeRiskLimits
@@ -213,6 +214,10 @@ class OutcomeLiveExecutionRuntime:
         self._last_fast_failure_lane_record: dict[str, tuple[str, float]] = {}
         self._last_postfill_quality_record: dict[str, tuple[str, float]] = {}
         self._last_fill_sync_at = float("-inf")
+        # An unresolved, cancelled BUY is unusual.  Its terminal proof needs
+        # fresh REST account truth, but a venue/read failure must not turn the
+        # normal strategy tick into a retry storm.
+        self._last_absent_entry_terminal_reconcile_at: dict[tuple[int, str, str], float] = {}
         self.journal_view = OutcomeRuntimeJournalView(ledger.journal.db_path if ledger else None)
         # These narrow services own decision ordering.  Atomic execution and
         # recovery primitives remain injected above and keep their existing
@@ -1043,6 +1048,21 @@ class OutcomeLiveExecutionRuntime:
                     "action": "new_buy_refused_until_account_inventory_or_protective_sell_visible",
                 })
                 return LiveExecutionResult("blocked", "official buy fill pending account reconciliation", lifecycle.order_id)
+            cancel_reason = self.entry_lifecycle_store.latest_cancel_intent_reason(
+                wallet=self.recovery.wallet, outcome_id=market.outcome_id,
+                coin=coin, order_id=lifecycle.order_id,
+            )
+            if (
+                lifecycle.state == "RECONCILE_REQUIRED"
+                and cancel_reason is not None
+                and self._resolve_absent_entry_after_prior_cancel(
+                    market=market, lifecycle=lifecycle, cancel_reason=cancel_reason,
+                )
+            ):
+                # The fresh authoritative reads below prove this was a
+                # cancelled order rather than a delayed fill.  The lifecycle
+                # is terminal now; do not let it poison future admission.
+                continue
             # A durably owned entry disappearing without cancellation or fill
             # evidence is likewise unsafe to overwrite with another BUY.
             if lifecycle.state != "RECONCILE_REQUIRED":
@@ -1056,6 +1076,82 @@ class OutcomeLiveExecutionRuntime:
             }
             return LiveExecutionResult("blocked", "owned entry absent without terminal reconciliation evidence", lifecycle.order_id)
         return None
+
+    def _resolve_absent_entry_after_prior_cancel(
+        self, *, market: OutcomeMarketSpec, lifecycle: OutcomeEntryLifecycle, cancel_reason: str,
+    ) -> bool:
+        """Terminally reconcile one cancelled owned BUY from fresh account truth.
+
+        This is intentionally *not* a generic absent-order escape hatch.  It
+        runs only after a durable ``CANCEL_SUBMITTED`` for the same order, and
+        requires a cache-bypassing open-order read plus fresh balance and fill
+        reads to all be absent.  Any exception or contradictory evidence keeps
+        the lifecycle blocked.
+        """
+        if self.entry_lifecycle_store is None or self.ledger is None:
+            return False
+        key = (market.outcome_id, lifecycle.coin, lifecycle.order_id)
+        now = time.monotonic()
+        last = self._last_absent_entry_terminal_reconcile_at.get(key, float("-inf"))
+        if now - last < 15.0:
+            return False
+        self._last_absent_entry_terminal_reconcile_at[key] = now
+        try:
+            # ``reconcile()`` above may have used a same-tick cache or a
+            # cross-validated WS view.  Terminalising a durable lifecycle
+            # requires a fresh REST read instead.
+            self._account_reads.invalidate()
+            balance_snapshot = self._account_reads.get_spot_clearinghouse_state_sync(self.recovery.wallet)
+            orders = self._account_reads.force_open_orders_reconciliation_sync(self.recovery.wallet)
+            fills = self._account_reads.get_user_fills_sync(self.recovery.wallet)
+            if not isinstance(balance_snapshot, dict) or not isinstance(orders, list) or not isinstance(fills, list):
+                return False
+            self.ledger.sync_fills(fills=fills, market_key=str(market.outcome_id), period=market.period)
+            normalized_coin = normalize_outcome_coin(lifecycle.coin)
+            inventory = sum(
+                (
+                    Decimal(str(row.get("total", "0")))
+                    for row in balance_snapshot.get("balances", [])
+                    if isinstance(row, dict) and normalize_outcome_coin(row.get("coin")) == normalized_coin
+                ),
+                Decimal("0"),
+            )
+            coin_orders = [
+                row for row in orders
+                if isinstance(row, dict) and normalize_outcome_coin(row.get("coin")) == normalized_coin
+            ]
+            matching_fill = any(
+                isinstance(row, dict) and str(row.get("oid") or "") == lifecycle.order_id
+                for row in fills
+            )
+            if inventory > 0 or coin_orders or matching_fill:
+                return False
+        except Exception:
+            # This is a read-only safety boundary: a transport, schema, or
+            # journal-sync failure is never evidence that a BUY was cancelled.
+            return False
+
+        self.entry_lifecycle_store.record(
+            lifecycle, reason=cancel_reason,
+            extra={
+                "state": "CANCELLED",
+                "terminal_reconciliation": "fresh_account_truth_after_prior_cancel",
+                "fresh_inventory": "0",
+                "fresh_open_orders_for_coin": 0,
+                "fresh_matching_user_fill": False,
+            },
+        )
+        self.ledger.journal.log_order_event(
+            self.ledger.run_id, "ORDER_CANCEL", venue_order_id=lifecycle.order_id,
+            side="BUY", status="CANCELLED", instrument_id=lifecycle.coin,
+            reason="entry_absent_after_prior_cancel_and_fresh_account_reconciliation",
+            payload={
+                "venue": "hyperliquid_outcome", "outcome_id": market.outcome_id,
+                "coin": lifecycle.coin, "prior_cancel_reason": cancel_reason,
+                "terminal_reconciliation": "fresh_account_truth_after_prior_cancel",
+            },
+        )
+        return True
 
     def _resolve_holding_entry_provenance(
         self, *, market: OutcomeMarketSpec, coin: str, inventory: Decimal, fill_vwap: Decimal,

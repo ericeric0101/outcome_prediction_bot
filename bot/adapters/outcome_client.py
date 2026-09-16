@@ -696,6 +696,23 @@ class OutcomeClient:
     async def unsubscribe_trades(self, coin: str) -> None:
         await self._unsubscribe(f"trades:{coin}")
 
+    async def subscribe_perp_asset_ctx(self, coin: str) -> None:
+        """Subscribe to Hyperliquid's native perpetual context for one coin.
+
+        This is a public market-data subscription only.  For BTC the venue
+        publishes mark, oracle, funding and open interest together on the
+        ``activeAssetCtx`` channel.  It is deliberately separate from the
+        Outcome books so research can compare it with Binance OI without
+        silently changing the existing S0 source.
+        """
+        sub = {"type": "activeAssetCtx", "coin": coin}
+        self._subscriptions[f"activeAssetCtx:{coin}"] = sub
+        if self._ws and not self._ws.closed:
+            await self._ws.send(json.dumps({"method": "subscribe", "subscription": sub}))
+
+    async def unsubscribe_perp_asset_ctx(self, coin: str) -> None:
+        await self._unsubscribe(f"activeAssetCtx:{coin}")
+
     async def _unsubscribe(self, key: str) -> None:
         sub = self._subscriptions.pop(key, None)
         if sub and self._ws and not self._ws.closed:

@@ -49,6 +49,40 @@ class OutcomeExitRequoteService:
         self.enabled = enabled
         self.canary_enabled = canary_enabled
         self.gate_audit = gate_audit
+        self._last_modify_shadow: dict[str, tuple[str, float]] = {}
+
+    def _record_modify_order_shadow(
+        self, *, market: OutcomeMarketSpec, lifecycle: Any, plan: ExitQuotePlan,
+        inventory: Decimal, bid: Decimal, ask: Decimal,
+    ) -> None:
+        """Record a would-modify candidate without changing execution behavior.
+
+        Price edits are expected to lose queue priority according to the SDK
+        contract.  The event is deliberately emitted only for a real existing
+        cancel/replace plan and is rate-limited, so it can later be joined to
+        fill quality without becoming a second execution pathway.
+        """
+        if plan.action is not ExitQuoteAction.CANCEL_REPLACE or plan.target_price is None:
+            return
+        target = str(plan.target_price)
+        fingerprint = f"{lifecycle.order_id}:{target}:{inventory}"
+        now = time.monotonic()
+        previous = self._last_modify_shadow.get(str(lifecycle.order_id))
+        if previous is not None and previous[0] == fingerprint and now - previous[1] < 10.0:
+            return
+        self.store.journal.log_strategy_event(self.store.run_id, "OUTCOME_MODIFY_ORDER_SHADOW", {
+            "venue": "hyperliquid_outcome", "read_only": True,
+            "outcome_id": market.outcome_id, "coin": lifecycle.coin,
+            "order_id": lifecycle.order_id, "current_price": str(lifecycle.target_price),
+            "proposed_price": target, "current_shares": str(lifecycle.inventory),
+            "proposed_shares": str(inventory), "best_bid": str(bid), "best_ask": str(ask),
+            "plan_reason": plan.reason,
+            "would_use_modify_order": True,
+            "size_only_edit": lifecycle.target_price == plan.target_price and lifecycle.inventory != inventory,
+            "price_change_requeues_expected": lifecycle.target_price != plan.target_price,
+            "live_authority": False,
+        })
+        self._last_modify_shadow[str(lifecycle.order_id)] = (fingerprint, now)
 
     def maybe_requote(self, *, market: OutcomeMarketSpec, finding: object) -> LiveExecutionResult | None:
         if not self.enabled() or self.store is None or self.controller is None:
@@ -166,6 +200,9 @@ class OutcomeExitRequoteService:
             return LiveExecutionResult("sell_resting", f"exit reprice keep: {plan.reason}", lifecycle.order_id)
         if plan.action is ExitQuoteAction.BLOCK:
             return LiveExecutionResult("blocked", f"exit reprice blocked: {plan.reason}", lifecycle.order_id)
+        self._record_modify_order_shadow(
+            market=market, lifecycle=lifecycle, plan=plan, inventory=inventory, bid=bid, ask=ask,
+        )
         result = self.controller.execute(
             market=market, side_index=side_index, lifecycle=lifecycle, plan=plan,
             replacement_context=replacement_context,

@@ -350,6 +350,27 @@ class TradeJournalDB:
         CREATE INDEX IF NOT EXISTS idx_outcome_deribit_features_source_time
             ON outcome_deribit_feature_rows(deribit_local_received_at_ms, deribit_valid);
 
+        -- O3: Hyperliquid-native BTC perpetual context.  This is public,
+        -- read-only shadow evidence used only to compare native OI/mark data
+        -- with the existing Binance source; no strategy path reads it.
+        CREATE TABLE IF NOT EXISTS hyperliquid_perp_context_observations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id TEXT NOT NULL,
+            coin TEXT NOT NULL,
+            local_received_at_ms INTEGER NOT NULL,
+            mark_price TEXT,
+            oracle_price TEXT,
+            funding TEXT,
+            open_interest TEXT NOT NULL,
+            premium TEXT,
+            day_notional_volume TEXT,
+            raw_context_json TEXT NOT NULL,
+            recorded_at TEXT NOT NULL,
+            UNIQUE(coin, local_received_at_ms)
+        );
+        CREATE INDEX IF NOT EXISTS idx_hl_perp_context_coin_time
+            ON hyperliquid_perp_context_observations(coin, local_received_at_ms);
+
         CREATE TABLE IF NOT EXISTS outcome_oi_fill_feature_rows (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             feature_schema_version INTEGER NOT NULL,
@@ -1605,6 +1626,44 @@ class TradeJournalDB:
                 return cursor.rowcount == 1
         except Exception as e:
             logger.debug(f"TradeJournalDB record_binance_oi_observation failed: {e}")
+            return False
+
+    def record_hyperliquid_perp_context(
+        self,
+        *,
+        run_id: str,
+        coin: str,
+        local_received_at_ms: int,
+        context: Mapping[str, Any],
+    ) -> bool:
+        """Append one compact public Hyperliquid perp context observation.
+
+        Values remain strings because OI units and precision differ by venue;
+        comparison code must normalize explicitly rather than treating raw
+        Binance and Hyperliquid quantities as interchangeable.
+        """
+        open_interest = context.get("openInterest")
+        if open_interest is None or not str(open_interest):
+            return False
+        sql = """
+        INSERT OR IGNORE INTO hyperliquid_perp_context_observations (
+          run_id,coin,local_received_at_ms,mark_price,oracle_price,funding,
+          open_interest,premium,day_notional_volume,raw_context_json,recorded_at
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+        """
+        try:
+            with self._connect() as conn:
+                cursor = conn.execute(
+                    sql,
+                    (str(run_id), str(coin), int(local_received_at_ms),
+                     context.get("markPx"), context.get("oraclePx"), context.get("funding"),
+                     str(open_interest), context.get("premium"), context.get("dayNtlVlm"),
+                     _json_dumps(dict(context)), _utc_now_iso()),
+                )
+                conn.commit()
+                return cursor.rowcount == 1
+        except Exception as exc:
+            logger.debug(f"TradeJournalDB record_hyperliquid_perp_context failed: {exc}")
             return False
 
     def log_order_event(

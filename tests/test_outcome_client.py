@@ -20,6 +20,14 @@ def test_open_orders_ws_subscription_is_user_scoped_and_all_dexes():
     assert not client._subscriptions
 
 
+def test_native_btc_perp_context_subscription_is_public_and_independent_of_outcome_books():
+    client = OutcomeClient(OutcomeAuth(wallet_address="0x" + "a" * 40, is_testnet=True))
+    asyncio.run(client.subscribe_perp_asset_ctx("BTC"))
+    assert client._subscriptions["activeAssetCtx:BTC"] == {"type": "activeAssetCtx", "coin": "BTC"}
+    asyncio.run(client.unsubscribe_perp_asset_ctx("BTC"))
+    assert not client._subscriptions
+
+
 def test_sync_info_retries_transient_502_then_returns_payload(monkeypatch):
     auth = OutcomeAuth(wallet_address="0x" + "a" * 40, is_testnet=True)
     client = OutcomeClient(auth)

@@ -32,6 +32,7 @@ class OutcomeWebSocketRecorder:
         self.resync_required = threading.Event()
         self.health = OutcomeStreamHealth()
         self.open_orders_cache = OutcomeOpenOrdersStreamCache(str(getattr(client, "wallet_address", "")))
+        self._last_perp_context_record_at_ms = 0
         self._registered = False
 
     @staticmethod
@@ -120,6 +121,34 @@ class OutcomeWebSocketRecorder:
     def _on_trades(self, payload: Mapping[str, Any]) -> None:
         self._record("OUTCOME_WS_TRADES", payload)
 
+    def _on_perp_asset_ctx(self, payload: Mapping[str, Any]) -> None:
+        """Persist compact native BTC-perp context for research comparison.
+
+        The WS event can be high frequency.  One observation per second is
+        sufficient for the Binance OI comparator and prevents this optional
+        shadow feed from recreating the multi-GB raw-journal problem.
+        """
+        data = payload.get("data")
+        if not isinstance(data, Mapping) or str(data.get("coin")) != "BTC":
+            return
+        ctx = data.get("ctx")
+        if not isinstance(ctx, Mapping):
+            return
+        now_ms = int(time.time() * 1000)
+        if now_ms - self._last_perp_context_record_at_ms < 1_000:
+            return
+        fields = ("markPx", "oraclePx", "funding", "openInterest", "dayNtlVlm", "premium", "prevDayPx")
+        compact = {key: str(ctx[key]) for key in fields if ctx.get(key) is not None}
+        if not compact.get("openInterest"):
+            return
+        self._last_perp_context_record_at_ms = now_ms
+        self.journal.record_hyperliquid_perp_context(
+            run_id=self.run_id,
+            coin="BTC",
+            local_received_at_ms=now_ms,
+            context=compact,
+        )
+
     def _on_open_orders(self, payload: Mapping[str, Any]) -> None:
         # Keep account truth in memory only.  Durable order/fill audit remains
         # owned by execution ledger and official REST/SDK confirmation.
@@ -147,6 +176,7 @@ class OutcomeWebSocketRecorder:
         self.client.register_callback("l2Book", self._on_l2)
         self.client.register_callback("allMids", self._on_mids)
         self.client.register_callback("trades", self._on_trades)
+        self.client.register_callback("activeAssetCtx", self._on_perp_asset_ctx)
         self.client.register_callback("openOrders", self._on_open_orders)
         self._registered = True
 
@@ -156,7 +186,7 @@ class OutcomeWebSocketRecorder:
         for channel, callback in (
             ("__lifecycle__", self._on_lifecycle), ("l2Book", self._on_l2),
             ("allMids", self._on_mids), ("trades", self._on_trades),
-            ("openOrders", self._on_open_orders),
+            ("openOrders", self._on_open_orders), ("activeAssetCtx", self._on_perp_asset_ctx),
         ):
             unregister = getattr(self.client, "unregister_callback", None)
             if unregister:
@@ -169,6 +199,7 @@ class OutcomeWebSocketRecorder:
     async def _serve(self) -> None:
         await self.client.subscribe_all_mids()
         await self.client.subscribe_open_orders()
+        await self.client.subscribe_perp_asset_ctx("BTC")
         for coin in self._coins:
             await self.client.subscribe_l2_book(coin)
             await self.client.subscribe_trades(coin)
@@ -180,6 +211,7 @@ class OutcomeWebSocketRecorder:
             await self.client.stop_ws()
             await self.client.unsubscribe_open_orders()
             await self.client.unsubscribe_all_mids()
+            await self.client.unsubscribe_perp_asset_ctx("BTC")
             for coin in self._coins:
                 await self.client.unsubscribe_l2_book(coin)
                 await self.client.unsubscribe_trades(coin)
