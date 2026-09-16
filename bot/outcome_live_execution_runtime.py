@@ -259,6 +259,7 @@ class OutcomeLiveExecutionRuntime:
             narrow_policy=(self.narrow_hard_failure_policy if self.narrow_hard_failure_canary_enabled else None),
             narrow_controller=self.narrow_hard_failure_controller,
             narrow_candidate=(self._narrow_hard_failure_candidate if self.narrow_hard_failure_canary_enabled else None),
+            confirmed_loss_recorder=self.loss_reentry_gate,
         )
         self.exit_requote_service = OutcomeExitRequoteService(
             recovery=self.recovery, machine=self.machine,

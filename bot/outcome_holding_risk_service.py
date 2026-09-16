@@ -41,6 +41,7 @@ class OutcomeHoldingRiskService:
         narrow_policy: OutcomeEmergencyExitPolicy | None = None,
         narrow_controller: OutcomeEmergencyExitController | None = None,
         narrow_candidate: Callable[..., dict[str, object] | None] | None = None,
+        confirmed_loss_recorder: Any | None = None,
     ) -> None:
         self.recovery = recovery
         self.machine = machine
@@ -53,6 +54,10 @@ class OutcomeHoldingRiskService:
         self.narrow_policy = narrow_policy
         self.narrow_controller = narrow_controller
         self.narrow_candidate = narrow_candidate
+        # The existing loss re-entry gate owns the durable cooldown/reclaim
+        # policy.  Emergency IOC exits must feed it only after account truth
+        # is flat and the official fill reconciliation has completed.
+        self.confirmed_loss_recorder = confirmed_loss_recorder
         self.reversal_windows = reversal_windows
         self.fresh_book = fresh_book
         self.official_holding_age = official_holding_age
@@ -305,6 +310,16 @@ class OutcomeHoldingRiskService:
             )
             fills = self.recovery.account.get_user_fills_sync(self.recovery.wallet)
             self.ledger.sync_fills(fills=fills, market_key=f"outcome:{market.outcome_id}", period=market.period)
+            if result.state == "emergency_exit_flat" and self.confirmed_loss_recorder is not None:
+                # This method independently verifies the complete official
+                # BUY/SELL lot and fee-inclusive loss.  A failed or partial
+                # reconciliation therefore cannot spend a re-entry token.
+                self.confirmed_loss_recorder.record_confirmed_loss_exit(
+                    outcome_id=market.outcome_id,
+                    period=market.period,
+                    coin=coin,
+                    order_id=str(result.emergency_order_id or ""),
+                )
         return LiveExecutionResult(result.state, result.detail, result.emergency_order_id or result.old_order_id)
 
     def _attempt_budget_exhausted(self, *, market: OutcomeMarketSpec, coin: str) -> bool:

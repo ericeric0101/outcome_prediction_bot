@@ -1025,6 +1025,53 @@ def test_narrow_hard_failure_canary_uses_the_shared_episode_and_existing_ioc_bou
     assert payload["execution_type"] == "narrow_hard_failure_price_protected_fak_ioc"
 
 
+def test_narrow_hard_failure_flat_exit_records_existing_loss_reentry_boundary(monkeypatch, tmp_path):
+    """A confirmed canary loss must enter the existing cooldown/reclaim gate."""
+    monkeypatch.setenv("OUTCOME_RISK_EPISODE_BUDGET_ENABLED", "1")
+    monkeypatch.setenv("OUTCOME_NARROW_HARD_FAILURE_CANARY_ENABLED", "1")
+    monkeypatch.setenv("OUTCOME_MAX_ENTRY_NOTIONAL_USDC", "10")
+    monkeypatch.setenv("OUTCOME_MAX_OUTCOME_EXPOSURE_USDC", "10")
+    journal = TradeJournalDB(tmp_path / "narrow_loss_reentry.db")
+    ledger = OutcomeExecutionLedger(journal, "run")
+    base = time.time() + 300
+
+    class FlatAfterIocAccount(CalibrationAccount):
+        def __init__(self):
+            super().__init__(balances=[{"coin": "+11530", "total": "10", "entryNtl": "8"}], orders=[{"coin": "#11530", "side": "A", "oid": "old-sell", "sz": "10"}])
+        def get_user_fills_sync(self, _): return [{"coin": "#11530", "side": "B", "px": "0.80", "sz": "10", "time": 1}]
+
+    class FlatIocGateway(Gateway):
+        def __init__(self, account): self.account, self.calls = account, []
+        def fetch_order_book(self, **_): return {"timestamp": int(base * 1000), "bids": [{"price": "0.70", "size": "20"}], "asks": [{"price": "0.71", "size": "20"}]}
+        def cancel_owned_order(self, **kwargs): self.calls.append(("cancel", kwargs)); self.account.orders = []; return {}
+        def place_price_protected_ioc_exit(self, **kwargs):
+            self.calls.append(("ioc", kwargs))
+            self.account.balances = []
+            return {"orderId": "narrow-flat", "status": "filled"}
+
+    class LossRecorder:
+        def __init__(self): self.calls = []
+        def record_confirmed_loss_exit(self, **kwargs): self.calls.append(kwargs); return True
+
+    account = FlatAfterIocAccount()
+    gateway = FlatIocGateway(account)
+    store = OutcomeExitLifecycleStore(journal, "run")
+    store.record(OutcomeExitLifecycle("w", 1153, "#11530", "old-sell", Decimal("10"), Decimal("0.76"), 0, "SELL_RESTING"), reason="fixture")
+    runtime = OutcomeLiveExecutionRuntime(account=account, wallet="w", gateway=gateway, ledger=ledger, exit_lifecycle_store=store)
+    recorder = LossRecorder()
+    runtime.holding_risk_service.confirmed_loss_recorder = recorder
+    runtime.holding_risk_service.official_holding_age = lambda **_: 120.0
+    runtime.holding_risk_service.narrow_candidate = lambda **_: {"state": "WARNING_CANDIDATE"}
+    monkeypatch.setattr("bot.outcome_holding_risk_service.time.time", lambda: base)
+    monkeypatch.setattr("bot.outcome_emergency_exit.time.time", lambda: base)
+    finding = type("Finding", (), {"coin": "#11530", "inventory": Decimal("10"), "sell_order_ids": ("old-sell",)})()
+
+    result = runtime.holding_risk_service.maybe_narrow_hard_failure(market=market(), finding=finding)
+
+    assert result is not None and result.state == "emergency_exit_flat"
+    assert recorder.calls == [{"outcome_id": 1153, "period": "15m", "coin": "#11530", "order_id": "narrow-flat"}]
+
+
 def test_s3_young_protected_holding_skips_fee_and_l2_reads(monkeypatch, tmp_path):
     """Ordinary holdings must not pay S3's expensive reads before eligibility."""
     journal = TradeJournalDB(tmp_path / "s3_fast_skip.db")
