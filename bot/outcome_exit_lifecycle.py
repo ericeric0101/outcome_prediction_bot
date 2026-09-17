@@ -375,7 +375,11 @@ class OutcomeExitLifecycleStore:
         lifecycle = self.recover(wallet=wallet, outcome_id=outcome_id, coin=coin)
         if lifecycle is None:
             return None
-        matching = [row for row in open_orders if str(row.get("oid")) == lifecycle.order_id and row.get("coin") == coin and row.get("side") == "A"]
+        candidate_sells = [
+            row for row in open_orders
+            if row.get("coin") == coin and row.get("side") == "A"
+        ]
+        matching = [row for row in candidate_sells if str(row.get("oid")) == lifecycle.order_id]
         # A closed lifecycle needs two independent account facts: no remaining
         # inventory and absence of the owned order.  Either fact alone can be
         # a partial-fill/cancel race and must remain reconciliation-only.
@@ -386,7 +390,11 @@ class OutcomeExitLifecycleStore:
             )
             self.record(closed, reason="inventory_flat_and_owned_sell_absent", extra={"prior_state": lifecycle.state})
             return None
-        if len(matching) != 1 or inventory <= 0 or Decimal(str(matching[0].get("sz", "0"))) < inventory:
+        # An owned OID alone is not sufficient when another same-coin SELL is
+        # also resting: it is ambiguous whether the other order is manual or
+        # a stale replacement.  Do not choose one and continue mutating.
+        if (len(candidate_sells) != 1 or len(matching) != 1 or inventory <= 0
+                or Decimal(str(matching[0].get("sz", "0"))) < inventory):
             self.record(lifecycle, reason="account_truth_does_not_match_owned_sell", extra={"state": "RECONCILE_REQUIRED"})
             return None
         return lifecycle

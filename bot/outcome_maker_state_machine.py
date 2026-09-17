@@ -200,7 +200,34 @@ class OutcomeMakerStateMachine:
             )
             if minimum_return_pct is not None and profit_target is None:
                 return MakerTickResult("blocked", "calibration take-profit target is not executable; inventory requires explicit reconciliation", audit=audit)
-            covering = next((order for order in sells if Decimal(str(order.get("sz", "0"))) >= inventory), None)
+            # A stale or manual same-coin SELL must never become a substitute
+            # for the lifecycle-owned protection.  In particular, do not use
+            # ``next(...)`` here: picking the first covering order would make
+            # a later loss-band cancellation capable of cancelling the wrong
+            # order.  The durable lifecycle store accepts exactly one
+            # account-truth SELL only.
+            covering = None
+            if sells:
+                if len(sells) != 1:
+                    return MakerTickResult(
+                        "blocked", "multiple same-coin sells require explicit reconciliation", audit=audit,
+                    )
+                candidate = sells[0]
+                if Decimal(str(candidate.get("sz", "0"))) < inventory:
+                    return MakerTickResult(
+                        "blocked", "existing sell does not cover verified inventory; explicit reconciliation required", audit=audit,
+                    )
+                if self.exit_lifecycle_store is not None:
+                    owned = self.exit_lifecycle_store.reconcile_owned_sell(
+                        wallet=self.wallet, outcome_id=market.outcome_id, coin=coin,
+                        inventory=inventory, open_orders=orders,
+                    )
+                    if owned is None or owned.order_id != str(candidate.get("oid")):
+                        return MakerTickResult(
+                            "blocked", "existing sell is not uniquely lifecycle-owned; reconciliation required",
+                            str(candidate.get("oid")), audit,
+                        )
+                covering = candidate
             if covering:
                 # ALO cannot guarantee an immediate stop.  Once the midpoint
                 # has crossed the configured loss threshold, cancel the old
@@ -317,11 +344,60 @@ class OutcomeMakerStateMachine:
                     )
                 raise
             self._invalidate_account_reads()
+            acknowledged_order_id = str(result.get("orderId") or "")
+            if not acknowledged_order_id:
+                if self.exit_lifecycle_store is not None and intent is not None:
+                    self.exit_lifecycle_store.record_ambiguous_submit(
+                        wallet=self.wallet, outcome_id=market.outcome_id, coin=coin,
+                        intent_id=intent[0], intent_event_id=intent[1],
+                        order_kind="initial_protective_alo", price=requested_price, shares=inventory,
+                        old_order_id=None, replacement_count=0, intended_state="SELL_RESTING",
+                        sidecar_request_id="sdk_ack_missing_order_id", command="place_limit_order",
+                        detail="acknowledged initial protective SELL has no order id",
+                    )
+                return MakerTickResult("blocked", "initial protective SELL ACK lacks order identity; reconciliation required", audit=audit)
+            # Initial protection and later replacements share the same
+            # authority rule: the SDK response is transport evidence, while a
+            # fresh account snapshot proves the currently resting OID.  This
+            # catches a rotated/stale ACK before the runtime records ownership.
+            if self.exit_lifecycle_store is not None and intent is not None:
+                refreshed_orders = self._fresh_orders_before_submit()
+                exact_ack = [
+                    row for row in refreshed_orders
+                    if (str(row.get("oid")) == acknowledged_order_id and row.get("coin") == coin
+                        and row.get("side") == "A" and Decimal(str(row.get("sz", "0"))) >= inventory)
+                ]
+                same_coin_sells = [
+                    row for row in refreshed_orders if row.get("coin") == coin and row.get("side") == "A"
+                ]
+                if len(exact_ack) != 1 or len(same_coin_sells) != 1:
+                    ambiguity_id = self.exit_lifecycle_store.record_ambiguous_submit(
+                        wallet=self.wallet, outcome_id=market.outcome_id, coin=coin,
+                        intent_id=intent[0], intent_event_id=intent[1],
+                        order_kind="initial_protective_alo", price=requested_price, shares=inventory,
+                        old_order_id=None, replacement_count=0, intended_state="SELL_RESTING",
+                        sidecar_request_id="sdk_ack_oid_unverified", command="place_limit_order",
+                        detail="acknowledged initial protective SELL OID absent or ambiguous in fresh account truth",
+                    )
+                    if ambiguity_id is None:
+                        raise RuntimeError("initial protective SELL could not persist account-truth fence")
+                    status, adopted = self.exit_lifecycle_store.reconcile_ambiguous_submit(
+                        wallet=self.wallet, outcome_id=market.outcome_id, coin=coin,
+                        inventory=inventory, open_orders=refreshed_orders,
+                    )
+                    if status == "adopted" and adopted is not None:
+                        return MakerTickResult(
+                            "sell_resting", "account_truth_adopted_initial_protective_sell_oid",
+                            adopted.order_id, audit,
+                        )
+                    return MakerTickResult(
+                        "blocked", "initial protective SELL ACK OID not verified from account truth", audit=audit,
+                    )
             timing = getattr(self.gateway, "last_sidecar_timing", None)
             if isinstance(timing, dict):
                 audit["sdk_submit_timing"] = dict(timing)
             detail = "placed maker-only loss-band protection sell" if loss_triggered else "placed net take-profit ALO sell for reconciled inventory"
-            return MakerTickResult("sell_placed", detail, str(result["orderId"]), audit)
+            return MakerTickResult("sell_placed", detail, acknowledged_order_id, audit)
 
         if sells:
             return MakerTickResult("blocked", "wallet has sell order without inventory; reconcile explicitly", str(sells[0].get("oid")))

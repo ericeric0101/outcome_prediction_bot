@@ -20,8 +20,10 @@ class Account:
 
 
 class Gateway:
-    def __init__(self, account, *, cancel_removes=True, book=None, place_raises=False):
+    def __init__(self, account, *, cancel_removes=True, book=None, place_raises=False,
+                 acknowledged_order_id="new-9", actual_order_id="new-9", duplicate_actual=False):
         self.account, self.cancel_removes, self.book, self.place_raises = account, cancel_removes, book or {"bids": [{"price": "0.70"}], "asks": [{"price": "0.71"}]}, place_raises
+        self.acknowledged_order_id, self.actual_order_id, self.duplicate_actual = acknowledged_order_id, actual_order_id, duplicate_actual
         self.calls = []
     def cancel_owned_order(self, **kwargs):
         self.calls.append(("cancel", kwargs))
@@ -31,7 +33,16 @@ class Gateway:
     def place_alo(self, **kwargs):
         self.calls.append(("place", kwargs))
         if self.place_raises: raise RuntimeError("rejected")
-        return {"orderId": "new-9"}
+        self.account.orders.append({
+            "oid": self.actual_order_id, "coin": "#11530", "side": "A",
+            "sz": str(kwargs["requested_shares"]), "limitPx": str(kwargs["price"]),
+        })
+        if self.duplicate_actual:
+            self.account.orders.append({
+                "oid": "manual-same-intent", "coin": "#11530", "side": "A",
+                "sz": str(kwargs["requested_shares"]), "limitPx": str(kwargs["price"]),
+            })
+        return {"orderId": self.acknowledged_order_id}
 
 
 def _setup(tmp_path, **gateway_kwargs):
@@ -129,3 +140,27 @@ def test_controller_persists_intent_and_fence_on_ambiguous_replacement(tmp_path)
     pending = store.pending_ambiguous_submit(wallet="w", outcome_id=1153, coin="#11530")
     assert pending is not None
     assert pending["sidecar_request_id"] == "request-9"
+
+
+def test_controller_adopts_unique_account_truth_oid_when_ack_is_stale(tmp_path):
+    controller, lifecycle, _, store, _ = _setup(
+        tmp_path, acknowledged_order_id="old-7", actual_order_id="rotated-10",
+    )
+    result = controller.execute(market=market(), side_index=0, lifecycle=lifecycle, plan=_plan())
+    assert result.state == "sell_resting"
+    assert result.new_order_id == "rotated-10"
+    restored = store.recover(wallet="w", outcome_id=1153, coin="#11530")
+    assert restored is not None and restored.order_id == "rotated-10"
+    assert store.pending_ambiguous_submit(wallet="w", outcome_id=1153, coin="#11530") is None
+
+
+def test_controller_refuses_duplicate_replacement_candidates_instead_of_picking_first(tmp_path):
+    controller, lifecycle, _, store, _ = _setup(
+        tmp_path, acknowledged_order_id="old-7", actual_order_id="rotated-10", duplicate_actual=True,
+    )
+    result = controller.execute(market=market(), side_index=0, lifecycle=lifecycle, plan=_plan())
+    assert result.state == "reconcile_required"
+    assert result.detail == "replacement_ack_oid_not_verified_from_account_truth"
+    restored = store.recover(wallet="w", outcome_id=1153, coin="#11530")
+    assert restored is not None and restored.order_id == "old-7" and restored.state == "CANCEL_SUBMITTED"
+    assert store.pending_ambiguous_submit(wallet="w", outcome_id=1153, coin="#11530") is not None

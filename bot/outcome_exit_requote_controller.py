@@ -51,6 +51,13 @@ class OutcomeExitRequoteController:
         if callable(invalidate):
             invalidate()
 
+    def _fresh_open_orders(self) -> list[dict[str, Any]]:
+        """Use REST truth after a mutation; an SDK ACK does not own an OID."""
+        force = getattr(self.account, "force_open_orders_reconciliation_sync", None)
+        if callable(force):
+            return force(self.wallet)
+        return self.account.get_open_orders_sync(self.wallet)
+
     def execute(self, *, market: OutcomeMarketSpec, side_index: int, lifecycle: OutcomeExitLifecycle,
                 plan: ExitQuotePlan, replacement_context: dict[str, Any] | None = None) -> ExitRequoteResult:
         key = (market.outcome_id, lifecycle.coin)
@@ -141,6 +148,46 @@ class OutcomeExitRequoteController:
             if not new_id:
                 self.store.record(lifecycle, reason="replacement_missing_order_id", extra={"state": "RECONCILE_REQUIRED"})
                 return ExitRequoteResult("reconcile_required", "replacement_unconfirmed", lifecycle.order_id)
+            # The venue's modify probe demonstrated that an acknowledged SDK
+            # result can carry an obsolete OID.  Rebooking is normally a new
+            # order too, so establish ownership from a fresh account snapshot
+            # before finalizing the durable intent.  A unique strict intent
+            # match may adopt a rotated OID; zero or multiple candidates stay
+            # behind the ambiguity fence.
+            refreshed_orders = self._fresh_open_orders()
+            exact_ack = [
+                row for row in refreshed_orders
+                if (str(row.get("oid")) == new_id and row.get("coin") == lifecycle.coin
+                    and row.get("side") == "A"
+                    and Decimal(str(row.get("sz", "0"))) >= inventory_after_cancel)
+            ]
+            same_coin_sells = [
+                row for row in refreshed_orders
+                if row.get("coin") == lifecycle.coin and row.get("side") == "A"
+            ]
+            if len(exact_ack) != 1 or len(same_coin_sells) != 1:
+                ambiguity_id = self.store.record_ambiguous_submit(
+                    wallet=self.wallet, outcome_id=market.outcome_id, coin=lifecycle.coin,
+                    intent_id=intent_id, intent_event_id=intent_event_id,
+                    order_kind="exit_replacement_alo", price=price, shares=inventory_after_cancel,
+                    old_order_id=lifecycle.order_id, replacement_count=lifecycle.replacement_count + 1,
+                    intended_state=state, sidecar_request_id="sdk_ack_oid_unverified",
+                    command="place_limit_order", detail="acknowledged replacement OID absent or ambiguous in fresh account truth",
+                )
+                if ambiguity_id is None:
+                    raise RuntimeError("acknowledged replacement could not persist account-truth fence")
+                status, adopted = self.store.reconcile_ambiguous_submit(
+                    wallet=self.wallet, outcome_id=market.outcome_id, coin=lifecycle.coin,
+                    inventory=inventory_after_cancel, open_orders=refreshed_orders,
+                )
+                if status == "adopted" and adopted is not None:
+                    return ExitRequoteResult(
+                        "sell_resting", "account_truth_adopted_replacement_oid",
+                        lifecycle.order_id, adopted.order_id,
+                    )
+                return ExitRequoteResult(
+                    "reconcile_required", "replacement_ack_oid_not_verified_from_account_truth", lifecycle.order_id,
+                )
             new_lifecycle = OutcomeExitLifecycle(self.wallet, market.outcome_id, lifecycle.coin, new_id,
                                                   inventory_after_cancel, price, lifecycle.replacement_count + 1, state)
             trigger_bbo = context.get("trigger_bbo")

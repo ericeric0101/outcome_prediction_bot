@@ -77,7 +77,14 @@ class OutcomeAccountRecovery:
                 buys = tuple(str(order.get("oid")) for order in coin_orders if order.get("side") == "B")
                 sells = tuple(str(order.get("oid")) for order in coin_orders if order.get("side") == "A")
                 covering = any(Decimal(str(order.get("sz", "0"))) >= inventory for order in coin_orders if order.get("side") == "A")
-                if inventory > 0 and covering:
+                # A position may have only one protective SELL under bot
+                # control.  Multiple sells can include a manual order or a
+                # stale replacement; treating either one as interchangeable
+                # would let a later lifecycle mutation select the wrong OID.
+                if inventory > 0 and len(sells) > 1:
+                    state = "ambiguous_protective_sells"
+                    unsafe.append(f"{coin} inventory has multiple resting sells; explicit reconciliation required")
+                elif inventory > 0 and covering:
                     state = "protected_inventory"
                 elif inventory > 0:
                     state = "unprotected_inventory"

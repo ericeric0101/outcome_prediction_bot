@@ -24,6 +24,13 @@ function required(value: string | boolean | undefined, name: string): string {
   if (typeof value !== "string" || !value) throw new Error(`${name} is required`);
   return value;
 }
+function wholeShareText(value: string, name: string): string {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0 || !Number.isInteger(parsed)) {
+    throw new Error(`${name} must be a positive whole-share count`);
+  }
+  return String(parsed);
+}
 function output(value: unknown): never { console.log(JSON.stringify(value, null, 2)); process.exit(0); }
 
 const input = args();
@@ -57,8 +64,7 @@ if (!owned || owned.coin !== outcome) throw new Error("target is not an owned, o
 const market = markets.find((candidate) => String(candidate.outcomeId) === marketId);
 if (!market || !market.sides.some((side) => side.coin === outcome)) throw new Error("market/outcome is not an active testnet defaultBinary side");
 const price = newPrice ?? owned.limitPx;
-const amount = newSize ?? owned.sz;
-if (!/^\d+$/.test(amount) || Number(amount) <= 0) throw new Error("effective amount must be a positive integer share count");
+const amount = wholeShareText(newSize ?? owned.sz, "effective amount");
 if (!Number.isFinite(Number(price)) || Number(price) <= 0 || Number(price) >= 1) throw new Error("effective price must be strictly between 0 and 1");
 const result = await hip4.trading.modifyOrder({
   marketId, outcome, orderId, side: owned.side === "B" ? "buy" : "sell", type: "limit", price, amount,

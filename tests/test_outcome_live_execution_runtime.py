@@ -357,14 +357,21 @@ def test_s0_blocks_second_buy_when_official_fill_precedes_account_inventory(monk
     class TrackingGateway(Gateway):
         def __init__(self):
             self.calls = []
+            self.account = None
 
         def place_alo(self, **kwargs):
             self.calls.append(kwargs)
             if kwargs["is_buy"]:
                 return {"orderId": "first-buy"}
+            assert self.account is not None
+            self.account.orders.append({
+                "coin": "#11531", "side": "A", "oid": "protective-sell",
+                "sz": str(kwargs["requested_shares"]), "limitPx": str(kwargs["price"]),
+            })
             return {"orderId": "protective-sell"}
 
     account, gateway = FillLagAccount(), TrackingGateway()
+    gateway.account = account
     runtime = OutcomeLiveExecutionRuntime(
         account=account, wallet="w", gateway=gateway, stream_health=healthy_stream(),
         ledger=OutcomeExecutionLedger(journal, "run"),
@@ -572,14 +579,14 @@ def test_s0_live_strategy_blocks_selected_bid_in_50_to_55_no_trade_band(monkeypa
     assert '"execution_submitted": false' in payload
 
 
-def test_s0_live_strategy_pauses_new_expensive_side_entry_at_85_cents(monkeypatch, tmp_path):
+def test_s0_live_strategy_pauses_new_expensive_side_entry_at_90_cents(monkeypatch, tmp_path):
     monkeypatch.setenv("OUTCOME_AUTOMATED_EXECUTION_ENABLED", "1")
     monkeypatch.setenv("OUTCOME_SDK_EXECUTION_ENABLED", "1")
     monkeypatch.setenv("OUTCOME_LIVE_STRATEGY_ENABLED", "1")
     journal = TradeJournalDB(tmp_path / "high_premium_pause.db")
     class HighGateway(Gateway):
         def __init__(self): self.calls = []
-        def fetch_order_book(self, **_): return {"bids": [{"price": "0.85"}], "asks": [{"price": "0.851"}]}
+        def fetch_order_book(self, **_): return {"bids": [{"price": "0.90"}], "asks": [{"price": "0.901"}]}
         def place_alo(self, **kwargs): self.calls.append(kwargs); return {"orderId": "must-not-place"}
     gateway = HighGateway()
     runtime = OutcomeLiveExecutionRuntime(
@@ -682,7 +689,12 @@ def test_s0_filled_owned_buy_cancels_remainder_then_places_protective_sell_same_
         def fetch_order_book(self, **_):
             self.calls.append(("book", {})); return {"bids": [{"price": "0.61"}], "asks": [{"price": "0.62"}]}
         def place_alo(self, **kwargs):
-            self.calls.append(("place", kwargs)); return {"orderId": "protective-sell"}
+            self.calls.append(("place", kwargs))
+            self.account.orders.append({
+                "coin": "#11530", "side": "A", "oid": "protective-sell",
+                "sz": str(kwargs["requested_shares"]), "limitPx": str(kwargs["price"]),
+            })
+            return {"orderId": "protective-sell"}
 
     account = FilledAccount(); gateway = TrackingGateway(account)
     runtime = OutcomeLiveExecutionRuntime(
@@ -764,15 +776,19 @@ def test_s0_initial_protective_sell_keeps_five_percent_target_with_e4_enabled(mo
         def get_user_fills_sync(self, _):
             return [{"coin": "#11530", "side": "B", "px": "0.74868", "sz": "14", "time": 1}]
     class TrackingGateway(Gateway):
-        def __init__(self): self.calls = []
+        def __init__(self): self.calls = []; self.account = None
         def fetch_order_book(self, **_): return {"bids": [{"price": "0.72"}], "asks": [{"price": "0.73"}]}
-        def place_alo(self, **kwargs): self.calls.append(kwargs); return {"orderId": "sell-1"}
+        def place_alo(self, **kwargs):
+            self.calls.append(kwargs); assert self.account is not None
+            self.account.orders.append({"coin": "#11530", "side": "A", "oid": "sell-1", "sz": str(kwargs["requested_shares"]), "limitPx": str(kwargs["price"])})
+            return {"orderId": "sell-1"}
     gateway = TrackingGateway()
     runtime = OutcomeLiveExecutionRuntime(
         account=FilledAccount(balances=[{"coin": "+11530", "total": "14", "entryNtl": "10.48152"}]),
         wallet="w", gateway=gateway, stream_health=healthy_stream(),
         ledger=OutcomeExecutionLedger(journal, "run"),
     )
+    gateway.account = runtime._account_reads._account
     finding = type("Finding", (), {"coin": "#11530"})()
     result = runtime.holding_execution_service.advance_persisted_exit(market=market(), finding=finding)
     assert result is not None and result.state == "sell_placed"
@@ -791,15 +807,19 @@ def test_generic_recovery_restores_persisted_p3_exit_policy(monkeypatch, tmp_pat
         def get_user_fills_sync(self, _):
             return [{"coin": "#11530", "side": "B", "px": "0.67329", "sz": "15", "time": 1}]
     class TrackingGateway(Gateway):
-        def __init__(self): self.calls = []
+        def __init__(self): self.calls = []; self.account = None
         def fetch_order_book(self, **_): return {"bids": [{"price": "0.67"}], "asks": [{"price": "0.68"}]}
-        def place_alo(self, **kwargs): self.calls.append(kwargs); return {"orderId": "sell-1"}
+        def place_alo(self, **kwargs):
+            self.calls.append(kwargs); assert self.account is not None
+            self.account.orders.append({"coin": "#11530", "side": "A", "oid": "sell-1", "sz": str(kwargs["requested_shares"]), "limitPx": str(kwargs["price"])})
+            return {"orderId": "sell-1"}
     gateway = TrackingGateway()
     account = FilledAccount(balances=[{"coin": "+11530", "total": "15", "entryNtl": "10.09935"}])
     runtime = OutcomeLiveExecutionRuntime(
         account=account, wallet="w", gateway=gateway, stream_health=healthy_stream(),
         ledger=OutcomeExecutionLedger(journal, "restarted-run"),
     )
+    gateway.account = account
     result = runtime.tick_market(market=market(), entry_side_index=None)
     assert result.state == "sell_placed"
     assert gateway.calls[0]["is_buy"] is False
@@ -881,7 +901,12 @@ def test_e4_new_sell_is_written_as_durable_owned_lifecycle(monkeypatch, tmp_path
     })
     class FilledAccount(Account):
         def get_user_fills_sync(self, _): return [{"coin": "#11530", "side": "B", "px": "0.80", "sz": "13", "time": 1}]
-    runtime = OutcomeLiveExecutionRuntime(account=FilledAccount(balances=[{"coin": "+11530", "total": "13", "entryNtl": "10.4"}]), wallet="w", gateway=Gateway(), ledger=OutcomeExecutionLedger(journal, "run"))
+    account = FilledAccount(balances=[{"coin": "+11530", "total": "13", "entryNtl": "10.4"}])
+    class TruthGateway(Gateway):
+        def place_alo(self, **kwargs):
+            account.orders.append({"coin": "#11530", "side": "A", "oid": "1", "sz": str(kwargs["requested_shares"]), "limitPx": str(kwargs["price"])})
+            return {"orderId": "1"}
+    runtime = OutcomeLiveExecutionRuntime(account=account, wallet="w", gateway=TruthGateway(), ledger=OutcomeExecutionLedger(journal, "run"))
     assert runtime.tick_market(market=market(), entry_side_index=None).state == "sell_placed"
     restored = runtime.exit_lifecycle_store.recover(wallet="w", outcome_id=1153, coin="#11530")
     assert restored is not None and restored.order_id == "1"
@@ -901,13 +926,17 @@ def test_e4_does_not_block_first_protective_sell_for_newly_filled_inventory(monk
         def get_user_fills_sync(self, _):
             return [{"coin": "#11530", "side": "B", "px": "0.80", "sz": "13", "time": 1}]
     class TrackingGateway(Gateway):
-        def __init__(self): self.calls = []
-        def place_alo(self, **kwargs): self.calls.append(kwargs); return {"orderId": "first-sell"}
+        def __init__(self): self.calls = []; self.account = None
+        def place_alo(self, **kwargs):
+            self.calls.append(kwargs); assert self.account is not None
+            self.account.orders.append({"coin": "#11530", "side": "A", "oid": "first-sell", "sz": str(kwargs["requested_shares"]), "limitPx": str(kwargs["price"])})
+            return {"orderId": "first-sell"}
     gateway = TrackingGateway()
     runtime = OutcomeLiveExecutionRuntime(
         account=FilledAccount(balances=[{"coin": "+11530", "total": "13", "entryNtl": "10.4"}]),
         wallet="w", gateway=gateway, ledger=OutcomeExecutionLedger(journal, "run"),
     )
+    gateway.account = runtime._account_reads._account
     result = runtime.tick_market(market=market(), entry_side_index=None)
     assert result.state == "sell_placed"
     assert gateway.calls[0]["is_buy"] is False

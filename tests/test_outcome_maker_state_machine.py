@@ -2,7 +2,7 @@ from decimal import Decimal
 
 from bot.lifecycle.outcome_lifecycle import OutcomeMarketSpec
 from bot.outcome_maker_state_machine import OutcomeMakerStateMachine
-from bot.outcome_exit_lifecycle import OutcomeExitLifecycleStore
+from bot.outcome_exit_lifecycle import OutcomeExitLifecycle, OutcomeExitLifecycleStore
 from bot.outcome_sdk_sidecar import OutcomeSdkAmbiguousExecutionError
 from monitoring.trade_journal_db import TradeJournalDB
 
@@ -158,6 +158,28 @@ def test_calibration_loss_band_cancels_old_profit_sell_without_taking():
     assert gateway.calls[0][1]["order_id"] == "9"
 
 
+def test_calibration_never_cancels_external_sell_when_lifecycle_ownership_is_ambiguous(tmp_path):
+    gateway = Gateway()
+    account = Account("0", [
+        {"coin": "#11530", "side": "A", "oid": "bot-sell", "sz": "13", "limitPx": "0.85"},
+        {"coin": "#11530", "side": "A", "oid": "manual-sell", "sz": "13", "limitPx": "0.86"},
+    ])
+    account.get_spot_clearinghouse_state_sync = lambda _: {"balances": [{"coin": "+11530", "total": "13", "entryNtl": "10"}]}
+    account.get_user_fills_sync = lambda _: [{"coin": "#11530", "side": "B", "px": "0.80", "sz": "13", "time": 1}]
+    store = OutcomeExitLifecycleStore(TradeJournalDB(tmp_path / "journal.db"), "run")
+    store.record(OutcomeExitLifecycle("w", 1153, "#11530", "bot-sell", Decimal("13"), Decimal("0.85"), 0, "SELL_RESTING"), reason="fixture")
+    result = OutcomeMakerStateMachine(
+        account=account, gateway=gateway, wallet="w", exit_lifecycle_store=store,
+    ).tick(
+        market=market(), side_index=0, entry_permitted=False,
+        minimum_return_pct=Decimal("0.05"), maker_close_fee_rate=Decimal("0.0004"),
+        loss_reprice_pct=Decimal("0.05"), loss_band_authorized=True,
+    )
+    assert result.state == "blocked"
+    assert result.detail == "multiple same-coin sells require explicit reconciliation"
+    assert gateway.calls == []
+
+
 def test_tier_b_submit_drift_guard_refuses_late_higher_bid_without_placing():
     class ChasingGateway(Gateway):
         def fetch_order_book(self, **_): return {"bids": [{"price": "0.805"}], "asks": [{"price": "0.806"}]}
@@ -214,3 +236,35 @@ def test_initial_protective_sell_ambiguity_is_durably_fenced(tmp_path):
     assert result.state == "blocked" and "ambiguous protective SELL" in result.detail
     pending = store.pending_ambiguous_submit(wallet="w", outcome_id=1153, coin="#11530")
     assert pending is not None and pending["order_kind"] == "initial_protective_alo"
+
+
+def test_initial_protective_sell_adopts_unique_account_truth_oid_when_ack_is_stale(tmp_path):
+    class RotatingGateway(Gateway):
+        def place_alo(self, **kwargs):
+            self.calls.append(("place", kwargs))
+            account.orders.append({
+                "coin": "#11530", "side": "A", "oid": "rotated-sell",
+                "sz": str(kwargs["requested_shares"]), "limitPx": str(kwargs["price"]),
+            })
+            return {"orderId": "stale-sell"}
+
+    journal = TradeJournalDB(tmp_path / "journal.db")
+    store = OutcomeExitLifecycleStore(journal, "run")
+    account = Account("0")
+    account.get_spot_clearinghouse_state_sync = lambda _: {
+        "balances": [{"coin": "+11530", "total": "13", "entryNtl": "10"}],
+    }
+    account.get_user_fills_sync = lambda _: [
+        {"coin": "#11530", "side": "B", "px": "0.80", "sz": "13", "time": 1},
+    ]
+    result = OutcomeMakerStateMachine(
+        account=account, gateway=RotatingGateway(), wallet="w", journal=journal,
+        exit_lifecycle_store=store,
+    ).tick(
+        market=market(), side_index=0, entry_permitted=False,
+        minimum_return_pct=Decimal("0.05"), maker_close_fee_rate=Decimal("0.0004"),
+    )
+    assert result.state == "sell_resting"
+    assert result.order_id == "rotated-sell"
+    lifecycle = store.recover(wallet="w", outcome_id=1153, coin="#11530")
+    assert lifecycle is not None and lifecycle.order_id == "rotated-sell"
