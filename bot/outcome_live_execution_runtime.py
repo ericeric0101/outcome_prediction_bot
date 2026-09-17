@@ -448,6 +448,25 @@ class OutcomeLiveExecutionRuntime:
         except (ArithmeticError, ValueError):
             return None
 
+    def _log_best_effort_strategy_event(
+        self, event_type: str, payload: dict[str, object],
+    ) -> int | None:
+        """Write shadow/admission telemetry without delaying live safety work.
+
+        Execution intent, lifecycle, fills, and reconciliation deliberately do
+        not call this helper.  They retain their existing durable writes and
+        fail-closed behaviour.  Lightweight test journals may not implement
+        the new best-effort method, so their normal in-memory write is a safe
+        compatibility fallback.
+        """
+        if self.ledger is None:
+            return None
+        journal = self.ledger.journal
+        writer = getattr(journal, "log_best_effort_strategy_event", None)
+        if callable(writer):
+            return writer(self.ledger.run_id, event_type, payload)
+        return journal.log_strategy_event(self.ledger.run_id, event_type, payload)
+
     def _record_wide_spread_candidate(
         self, *, market: OutcomeMarketSpec, coin: str, bid: Decimal, ask: Decimal | None,
         quality: object, entry_tier: str, requested_shares: int, admission: dict[str, object],
@@ -510,7 +529,7 @@ class OutcomeLiveExecutionRuntime:
             # 30-second cadence.  The in-memory classifier still sees every
             # strategy tick, so rate limiting storage cannot change a state.
             if previous is None or previous[0] != str(decision.state) or now - previous[1] >= 30.0:
-                event_id = self.ledger.journal.log_strategy_event(self.ledger.run_id, "OUTCOME_MARKET_REGIME_SHADOW", payload)
+                event_id = self._log_best_effort_strategy_event("OUTCOME_MARKET_REGIME_SHADOW", payload)
                 payload["event_id"] = event_id
                 self._last_regime_shadow_record[market.outcome_id] = (str(decision.state), now)
         self._latest_regime_shadow[market.outcome_id] = dict(payload)
@@ -529,7 +548,7 @@ class OutcomeLiveExecutionRuntime:
             previous = self._last_efficiency_shadow_record.get(key)
             now = time.monotonic()
             if previous is None or previous[0] != fingerprint or now - previous[1] >= 30.0:
-                self.ledger.journal.log_strategy_event(self.ledger.run_id, "OUTCOME_CONFIDENCE_ENTRY_SHADOW", payload)
+                self._log_best_effort_strategy_event("OUTCOME_CONFIDENCE_ENTRY_SHADOW", payload)
                 self._last_efficiency_shadow_record[key] = (fingerprint, now)
         return payload
 
@@ -554,7 +573,7 @@ class OutcomeLiveExecutionRuntime:
             previous = self._last_efficiency_shadow_record.get(key)
             now = time.monotonic()
             if previous is None or previous[0] != fingerprint or now - previous[1] >= 30.0:
-                self.ledger.journal.log_strategy_event(self.ledger.run_id, "OUTCOME_ACTIVE_CHALLENGER_SHADOW", payload)
+                self._log_best_effort_strategy_event("OUTCOME_ACTIVE_CHALLENGER_SHADOW", payload)
                 self._last_efficiency_shadow_record[key] = (fingerprint, now)
         return payload
 
@@ -575,7 +594,7 @@ class OutcomeLiveExecutionRuntime:
             previous = self._last_efficiency_shadow_record.get(key)
             now = time.monotonic()
             if previous is None or previous[0] != fingerprint or now - previous[1] >= 30.0:
-                self.ledger.journal.log_strategy_event(self.ledger.run_id, "OUTCOME_QUEUE_PRICING_SHADOW", payload)
+                self._log_best_effort_strategy_event("OUTCOME_QUEUE_PRICING_SHADOW", payload)
                 self._last_efficiency_shadow_record[key] = (fingerprint, now)
         return payload
 
@@ -609,7 +628,7 @@ class OutcomeLiveExecutionRuntime:
         # every state change.  No raw L2 levels are copied to the journal.
         if previous is not None and previous[0] == str(decision.state) and now - previous[1] < 10.0:
             return
-        self.ledger.journal.log_strategy_event(self.ledger.run_id, "OUTCOME_TOXIC_FILL_SHADOW", {
+        self._log_best_effort_strategy_event("OUTCOME_TOXIC_FILL_SHADOW", {
             "venue": "hyperliquid_outcome", "read_only": True,
             "outcome_id": market.outcome_id, "period": market.period, "coin": coin,
             "state": decision.state, "reason": decision.reason,
@@ -662,7 +681,7 @@ class OutcomeLiveExecutionRuntime:
         previous, now = self._last_postfill_quality_record.get(trade_id), time.monotonic()
         if previous is not None and previous[0] == action and now - previous[1] < 10.0:
             return
-        self.ledger.journal.log_strategy_event(self.ledger.run_id, "OUTCOME_POST_FILL_QUALITY_SHADOW", payload)
+        self._log_best_effort_strategy_event("OUTCOME_POST_FILL_QUALITY_SHADOW", payload)
         self._last_postfill_quality_record[trade_id] = (action, now)
 
     def _continuation_entry_already_submitted(self, *, outcome_id: int) -> bool:
@@ -913,7 +932,7 @@ class OutcomeLiveExecutionRuntime:
         """
         if self.ledger is None:
             return
-        self.ledger.journal.log_strategy_event(self.ledger.run_id, "OUTCOME_ENTRY_GATE_DECISION", {
+        self._log_best_effort_strategy_event("OUTCOME_ENTRY_GATE_DECISION", {
             "venue": "hyperliquid_outcome", "read_only": True,
             "outcome_id": market.outcome_id, "period": market.period,
             "entry_side_index": entry_side_index, "entry_reason": entry_reason,
@@ -948,7 +967,7 @@ class OutcomeLiveExecutionRuntime:
         else:
             status = self.stream_health.check(market)
             stream = {"ready": status.ready, "reason": status.reason}
-        self.ledger.journal.log_strategy_event(self.ledger.run_id, "OUTCOME_ENTRY_ADMISSION_DECISION", {
+        self._log_best_effort_strategy_event("OUTCOME_ENTRY_ADMISSION_DECISION", {
             "venue": "hyperliquid_outcome", "outcome_id": market.outcome_id,
             "period": market.period, "read_only": True,
             "raw_signal_side_index": entry_side_index, "raw_signal_reason": entry_reason,
@@ -1678,10 +1697,12 @@ class OutcomeLiveExecutionRuntime:
         journal_write_ms = round((time.monotonic() - journal_started_at) * 1000, 3)
         total_ms = round((time.monotonic() - started_at) * 1000, 3)
         if self.ledger is not None and (total_ms >= 1000 or result.state in {"buy_placed", "sell_placed", "sell_resting"}):
-            self.ledger.journal.log_strategy_event(self.ledger.run_id, "OUTCOME_RUNTIME_TIMING", {
+            self._log_best_effort_strategy_event("OUTCOME_RUNTIME_TIMING", {
                 "venue": "hyperliquid_outcome", "outcome_id": market.outcome_id,
                 "runtime_state": result.state, "total_ms": total_ms,
                 "account_recovery_ms": admission.get("timing_account_recovery_ms"),
+                "research_shadow_ms": admission.get("timing_research_shadow_ms"),
+                "research_shadow_stages_ms": admission.get("timing_research_shadow_stages_ms"),
                 "book_request_ms": admission.get("timing_entry_book_request_ms"),
                 "journal_write_ms": journal_write_ms,
                 "journal_writer_last_ms": dict(getattr(self.ledger.journal, "last_write_timing_ms", {})),
@@ -1710,11 +1731,14 @@ class OutcomeLiveExecutionRuntime:
         if self.ledger is None:
             return LiveExecutionResult("blocked", "live strategy requires an execution ledger")
         self._holding_context[market.outcome_id] = dict(market_context or entry_evidence)
-        self.research_supervisor.observe_entry(
+        research_started_at = time.monotonic()
+        research_timings = self.research_supervisor.observe_entry(
             self, market=market, entry_side_index=entry_side_index,
             entry_reason=entry_reason, entry_evidence=entry_evidence,
             market_context=market_context, admission=admission,
         )
+        admission["timing_research_shadow_ms"] = round((time.monotonic() - research_started_at) * 1000, 3)
+        admission["timing_research_shadow_stages_ms"] = research_timings
         config = OutcomeLiveStrategyConfig.from_env()
         tracked_markets = (market, *retiring_markets)
         recovery_started_at = time.monotonic()

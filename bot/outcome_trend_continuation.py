@@ -98,7 +98,7 @@ class OutcomeTrendContinuationRecorder:
                     self._last_recorded_at.pop(key, None)
                     self._closed_episode_keys.add(key)
                 continue
-            self.journal.log_strategy_event(self.run_id, "OUTCOME_TREND_CONTINUATION_PATH", {
+            payload = {
                 "venue": "hyperliquid_outcome", "read_only": True,
                 "outcome_id": path.outcome_id, "period": path.period,
                 "episode_id": path.episode_id, "side_index": path.side_index,
@@ -107,7 +107,12 @@ class OutcomeTrendContinuationRecorder:
                 "gross_bid_return_pct": str(bid / path.entry_bid - Decimal("1")),
                 "terminal_observation": terminal,
                 "counterfactual_limit": "public_bbo_path_only_no_maker_fill_or_pnl_inference",
-            })
+            }
+            writer = getattr(self.journal, "log_best_effort_strategy_event", None)
+            if callable(writer):
+                writer(self.run_id, "OUTCOME_TREND_CONTINUATION_PATH", payload)
+            else:
+                self.journal.log_strategy_event(self.run_id, "OUTCOME_TREND_CONTINUATION_PATH", payload)
             self._last_recorded_at[key] = now
             if terminal:
                 self._paths.pop(key, None)

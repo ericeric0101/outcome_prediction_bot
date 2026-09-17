@@ -7,6 +7,7 @@ research, holding and entry concerns from growing one monolithic tick method.
 """
 from __future__ import annotations
 
+import time
 from typing import Any
 
 from bot.lifecycle.outcome_lifecycle import OutcomeMarketSpec
@@ -21,23 +22,34 @@ class OutcomeResearchSupervisor:
         self, runtime: Any, *, market: OutcomeMarketSpec, entry_side_index: int | None,
         entry_reason: str, entry_evidence: dict[str, object],
         market_context: dict[str, object] | None, admission: dict[str, object],
-    ) -> None:
+    ) -> dict[str, float]:
+        """Run observers and expose their cost without giving them authority."""
+        timings: dict[str, float] = {}
+        started_at = time.monotonic()
         admission["market_regime_shadow"] = runtime._observe_market_regime_shadow(
             market=market, entry_side_index=entry_side_index,
             entry_evidence=entry_evidence, market_context=market_context,
         )
+        timings["market_regime_shadow_ms"] = round((time.monotonic() - started_at) * 1000, 3)
+        started_at = time.monotonic()
         admission["confidence_entry_shadow"] = runtime._observe_confidence_entry_shadow(
             market=market, market_context=market_context,
         )
+        timings["confidence_entry_shadow_ms"] = round((time.monotonic() - started_at) * 1000, 3)
+        started_at = time.monotonic()
         admission["active_challenger_shadow"] = runtime._observe_active_challenger_shadow(
             market=market, market_context=market_context,
             production_side_index=entry_side_index, production_reason=entry_reason,
             regime=(admission["market_regime_shadow"]
                     if isinstance(admission.get("market_regime_shadow"), dict) else None),
         )
+        timings["active_challenger_shadow_ms"] = round((time.monotonic() - started_at) * 1000, 3)
+        started_at = time.monotonic()
         runtime._capture_trend_continuation_path(
             market=market, entry_evidence=entry_evidence, market_context=market_context,
         )
+        timings["trend_continuation_path_ms"] = round((time.monotonic() - started_at) * 1000, 3)
+        return timings
 
 
 class OutcomeHoldingSupervisor:

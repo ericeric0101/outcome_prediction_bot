@@ -1,10 +1,30 @@
 import json
 import sqlite3
+import time
 from decimal import Decimal
 
 import pytest
 
 from monitoring.trade_journal_db import TradeJournalDB
+
+
+def test_best_effort_telemetry_does_not_wait_for_contended_writer(tmp_path):
+    db = TradeJournalDB(tmp_path / "journal.db")
+    # Keep a writer transaction open from a different connection.  Strategy
+    # telemetry may be dropped, but must never inherit SQLite's canonical
+    # ten-second busy timeout and delay a live protective decision.
+    lock = sqlite3.connect(db.db_path, timeout=0.1)
+    lock.execute("BEGIN IMMEDIATE")
+    try:
+        started_at = time.monotonic()
+        event_id = db.log_best_effort_strategy_event("run", "TEST_SHADOW", {"read_only": True})
+        elapsed = time.monotonic() - started_at
+    finally:
+        lock.rollback()
+        lock.close()
+
+    assert event_id is None
+    assert elapsed < 0.5
 
 
 def test_journal_serializes_decimal_payloads_as_numeric_json(tmp_path):

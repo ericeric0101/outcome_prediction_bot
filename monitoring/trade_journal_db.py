@@ -72,8 +72,16 @@ class TradeJournalDB:
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
         self._init_schema()
 
-    def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path, timeout=10)
+    def _connect(self, *, timeout_sec: float = 10.0) -> sqlite3.Connection:
+        """Open one short-lived SQLite connection.
+
+        The default remains deliberately patient for canonical execution
+        evidence.  Read-only telemetry on the live decision path must use the
+        separate best-effort method below: waiting ten seconds for a journal
+        writer is never an acceptable reason to delay account reconciliation
+        or a protective action.
+        """
+        conn = sqlite3.connect(self.db_path, timeout=max(0.0, float(timeout_sec)))
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
         return conn
@@ -991,6 +999,44 @@ class TradeJournalDB:
                 return int(cursor.lastrowid)
         except Exception as e:
             logger.debug(f"TradeJournalDB log_strategy_event failed: {e}")
+            return None
+
+    def log_best_effort_strategy_event(
+        self,
+        run_id: str,
+        event_type: str,
+        payload: Optional[Dict[str, Any]] = None,
+        *,
+        timeout_sec: float = 0.05,
+    ) -> Optional[int]:
+        """Attempt a non-authoritative telemetry write without stalling live IO.
+
+        This method is intentionally limited to observations and admission
+        diagnostics.  It must never be used for durable order intent, fills,
+        lifecycle ownership, or any fail-closed execution evidence.
+        """
+        sql = "INSERT INTO strategy_events (ts, run_id, event_type, payload_json) VALUES (?, ?, ?, ?)"
+        started_at = time.monotonic()
+        try:
+            with self._connect(timeout_sec=timeout_sec) as conn:
+                cursor = conn.execute(
+                    sql,
+                    (
+                        _utc_now_iso(),
+                        run_id,
+                        event_type,
+                        _json_dumps(payload or {}),
+                    ),
+                )
+                conn.commit()
+                self.last_write_timing_ms["best_effort_strategy_event"] = round((time.monotonic() - started_at) * 1000, 3)
+                return int(cursor.lastrowid)
+        except Exception as e:
+            # A contended telemetry database is observable but cannot be
+            # allowed to turn a 1.5-second execution lane into a 10-second
+            # one.  Canonical execution records use their durable methods.
+            self.last_write_timing_ms["best_effort_strategy_event"] = round((time.monotonic() - started_at) * 1000, 3)
+            logger.debug(f"TradeJournalDB best-effort strategy event skipped: {e}")
             return None
 
     def log_durable_order_intent(self, run_id: str, payload: Dict[str, Any]) -> Optional[int]:
