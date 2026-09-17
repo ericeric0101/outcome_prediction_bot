@@ -15,7 +15,7 @@ from monitoring.trade_journal_db import TradeJournalDB
 class OutcomeLossReentryDecision:
     allowed: bool
     reason: str
-    is_limited_reentry: bool = False
+    is_loss_reentry: bool = False
     prior_exit_price: float | None = None
     cooldown_remaining_sec: float | None = None
 
@@ -131,7 +131,7 @@ class OutcomeLossReentryGate:
         A reversal observation is a risk signal, not realized-loss evidence.
         In particular, a profit target may fill after the lifecycle was briefly
         tagged ``REVERSAL_CONFIRMED``.  Recording that closure as a loss would
-        incorrectly consume the market's limited re-entry token.
+        incorrectly activate post-loss re-entry safeguards.
         """
         try:
             with sqlite3.connect(self.journal.db_path) as conn:
@@ -211,7 +211,7 @@ class OutcomeLossReentryGate:
                 "loss_exit_price": float(sell_price), "entry_order_id": entry_order_id,
                 "entry_cost_usdc": str(buy_cost), "net_exit_proceeds_usdc": str(sell_price * sell_qty - sell_fee),
                 "net_realized_pnl_usdc": str(net_pnl),
-                "reentry_policy": "one_limited_reentry_after_verified_fee_inclusive_loss_v2",
+                "reentry_policy": "cooldown_and_same_side_reclaim_after_verified_fee_inclusive_loss_v3",
             })
             return True
         except (sqlite3.Error, ValueError, TypeError, json.JSONDecodeError, InvalidOperation):
@@ -225,26 +225,21 @@ class OutcomeLossReentryGate:
         candidate_bid: float,
         now: datetime | None = None,
     ) -> OutcomeLossReentryDecision:
-        """Allow one post-loss entry only after a fresh, recovered setup.
+        """Allow a post-loss entry only after a fresh, recovered setup.
 
         The caller has already established a current directional signal and a
         viable fee-after target.  Here we enforce the durable constraints:
-        one re-entry per market, a fixed cooldown, and reclaim of the actual
-        loss-exit price when returning to the same Outcome side.
+        a fixed cooldown and reclaim of the actual loss-exit price when
+        returning to the same Outcome side.  It deliberately does not cap
+        re-entry count: a later, independently confirmed setup must not be
+        permanently rejected merely because an earlier resting BUY was
+        cancelled or a market formed a new opportunity.
         """
         try:
             with sqlite3.connect(f"file:{Path(self.journal.db_path).resolve()}?mode=ro", uri=True) as conn:
                 row = self._latest_verified_loss_event(conn, outcome_id=outcome_id)
-                consumed = conn.execute(
-                    """SELECT 1 FROM strategy_events WHERE event_type=?
-                       AND CAST(json_extract(payload_json, '$.outcome_id') AS INTEGER)=?
-                       AND CAST(json_extract(payload_json, '$.loss_exit_event_id') AS INTEGER)=? LIMIT 1""",
-                    (self.REENTRY_EVENT, outcome_id, int(row[0])) if row is not None else (self.REENTRY_EVENT, outcome_id, -1),
-                ).fetchone()
             if row is None:
                 return OutcomeLossReentryDecision(True, "no_confirmed_loss_exit")
-            if consumed is not None:
-                return OutcomeLossReentryDecision(False, "loss_reentry_already_used_until_market_rollover")
             payload = json.loads(row[2] or "{}")
             loss_coin = str(payload.get("coin") or "")
             exit_price = payload.get("loss_exit_price")
@@ -274,7 +269,7 @@ class OutcomeLossReentryGate:
                 return OutcomeLossReentryDecision(
                     False,
                     "loss_reentry_cooldown_active",
-                    is_limited_reentry=True,
+                    is_loss_reentry=True,
                     prior_exit_price=exit_price_float,
                     cooldown_remaining_sec=self.COOLDOWN_SEC - elapsed_sec,
                 )
@@ -282,13 +277,13 @@ class OutcomeLossReentryGate:
                 return OutcomeLossReentryDecision(
                     False,
                     "loss_reentry_same_side_exit_price_not_reclaimed",
-                    is_limited_reentry=True,
+                    is_loss_reentry=True,
                     prior_exit_price=exit_price_float,
                 )
             return OutcomeLossReentryDecision(
                 True,
-                "loss_reentry_limited_recovery_authorized",
-                is_limited_reentry=True,
+                "loss_reentry_cooldown_and_reclaim_authorized",
+                is_loss_reentry=True,
                 prior_exit_price=exit_price_float,
             )
         except (sqlite3.Error, ValueError, TypeError, json.JSONDecodeError):
@@ -305,17 +300,16 @@ class OutcomeLossReentryGate:
         target_price: float,
         entry_reason: str,
     ) -> bool:
-        """Durably consume the sole re-entry token after exchange acceptance."""
+        """Durably audit every accepted post-loss re-entry submission.
+
+        This event is telemetry and reconciliation evidence, not an attempt
+        budget.  The cooldown and same-side reclaim checks stay authoritative
+        on every later entry decision.
+        """
         try:
             with sqlite3.connect(self.journal.db_path) as conn:
                 loss = self._latest_verified_loss_event(conn, outcome_id=outcome_id)
-                consumed = conn.execute(
-                    """SELECT 1 FROM strategy_events WHERE event_type=?
-                       AND CAST(json_extract(payload_json, '$.outcome_id') AS INTEGER)=?
-                       AND CAST(json_extract(payload_json, '$.loss_exit_event_id') AS INTEGER)=? LIMIT 1""",
-                    (self.REENTRY_EVENT, outcome_id, int(loss[0])) if loss is not None else (self.REENTRY_EVENT, outcome_id, -1),
-                ).fetchone()
-            if loss is None or consumed is not None:
+            if loss is None:
                 return False
             self.journal.log_strategy_event(self.run_id, self.REENTRY_EVENT, {
                 "venue": "hyperliquid_outcome", "outcome_id": outcome_id,
@@ -323,7 +317,7 @@ class OutcomeLossReentryGate:
                 "loss_exit_event_id": int(loss[0]),
                 "entry_bid": bid, "target_price_preview": target_price,
                 "entry_reason": entry_reason,
-                "reentry_policy": "one_limited_reentry_after_cooldown_and_reclaim_v1",
+                "reentry_policy": "cooldown_and_same_side_reclaim_v2",
             })
             return True
         except (sqlite3.Error, ValueError, TypeError):

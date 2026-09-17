@@ -65,7 +65,7 @@ def test_legacy_profitable_loss_event_and_its_reentry_token_are_ignored(tmp_path
     assert decision.reason == "no_confirmed_loss_exit"
 
 
-def test_reentry_gate_requires_official_sell_fill_then_allows_one_reclaimed_entry_after_cooldown(tmp_path):
+def test_reentry_gate_requires_official_sell_fill_then_allows_reclaimed_entries_after_cooldown(tmp_path):
     journal = TradeJournalDB(tmp_path / "journal.db")
     gate = OutcomeLossReentryGate(journal, "run")
     assert gate.evaluate(outcome_id=1, coin="#10", candidate_bid=0.8).allowed is True
@@ -82,15 +82,15 @@ def test_reentry_gate_requires_official_sell_fill_then_allows_one_reclaimed_entr
     assert not_reclaimed.reason == "loss_reentry_same_side_exit_price_not_reclaimed"
     allowed = gate.evaluate(outcome_id=1, coin="#10", candidate_bid=0.80, now=after_cooldown)
     assert allowed.allowed is True
-    assert allowed.is_limited_reentry is True
+    assert allowed.is_loss_reentry is True
     assert allowed.prior_exit_price == 0.80
     assert gate.record_reentry_submitted(
         outcome_id=1, period="1d", coin="#10", order_id="new-buy", bid=0.80,
         target_price=0.82, entry_reason="up_spot_mark_oi_confirmed",
     ) is True
-    used = gate.evaluate(outcome_id=1, coin="#10", candidate_bid=0.90, now=after_cooldown)
-    assert used.allowed is False
-    assert used.reason == "loss_reentry_already_used_until_market_rollover"
+    later = gate.evaluate(outcome_id=1, coin="#10", candidate_bid=0.90, now=after_cooldown)
+    assert later.allowed is True
+    assert later.reason == "loss_reentry_cooldown_and_reclaim_authorized"
     with sqlite3.connect(journal.db_path) as conn:
         assert conn.execute("SELECT COUNT(*) FROM strategy_events WHERE event_type='OUTCOME_LOSS_EXIT_CONFIRMED'").fetchone()[0] == 1
         assert conn.execute("SELECT COUNT(*) FROM strategy_events WHERE event_type='OUTCOME_LOSS_REENTRY_SUBMITTED'").fetchone()[0] == 1
@@ -103,7 +103,7 @@ def test_reentry_can_take_new_confirmed_opposite_side_after_cooldown(tmp_path):
     after_cooldown = datetime.now(timezone.utc) + timedelta(seconds=gate.COOLDOWN_SEC + 1)
     decision = gate.evaluate(outcome_id=1, coin="#11", candidate_bid=0.60, now=after_cooldown)
     assert decision.allowed is True
-    assert decision.reason == "loss_reentry_limited_recovery_authorized"
+    assert decision.reason == "loss_reentry_cooldown_and_reclaim_authorized"
 
 
 def test_legacy_loss_event_recovers_immutable_official_exit_price(tmp_path):

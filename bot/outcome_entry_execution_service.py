@@ -302,7 +302,7 @@ class OutcomeEntryExecutionService:
                 "blocked", "ambiguous SDK entry submission; reconciliation required before retry",
             )
         if result.state == "buy_placed":
-            if reentry is not None and reentry.is_limited_reentry and self.loss_reentry_gate is not None:
+            if reentry is not None and reentry.is_loss_reentry and self.loss_reentry_gate is not None:
                 self.loss_reentry_gate.record_reentry_submitted(
                     outcome_id=market.outcome_id, period=market.period, coin=coin,
                     order_id=str(result.order_id), bid=float(price),
@@ -331,7 +331,7 @@ class OutcomeEntryExecutionService:
                     "entry_evidence": entry_evidence, "entry_tier": entry_tier,
                     "sampling_policy": sampling_policy, "directional_signal_used": True,
                     "loss_reentry_policy": reentry.reason if reentry is not None else "unavailable",
-                    "loss_reentry_limited": bool(reentry.is_limited_reentry) if reentry is not None else False,
+                    "loss_reentry_active": bool(reentry.is_loss_reentry) if reentry is not None else False,
                     "loss_reentry_prior_exit_price": (
                         str(reentry.prior_exit_price)
                         if reentry is not None and reentry.prior_exit_price is not None else None

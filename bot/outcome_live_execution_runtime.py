@@ -1859,7 +1859,7 @@ class OutcomeLiveExecutionRuntime:
             admission["loss_reentry_gate"] = {
                 "allowed": reentry.allowed,
                 "reason": reentry.reason,
-                "limited_reentry": reentry.is_limited_reentry,
+                "loss_reentry_active": reentry.is_loss_reentry,
                 "prior_exit_price": reentry.prior_exit_price,
                 "cooldown_remaining_sec": reentry.cooldown_remaining_sec,
             }
@@ -2057,7 +2057,7 @@ class OutcomeLiveExecutionRuntime:
                 if isinstance(admission.get("market_regime_shadow"), dict) else None
             ),
             "loss_reentry_policy": reentry.reason if reentry is not None else "unavailable",
-            "loss_reentry_limited": bool(reentry.is_limited_reentry) if reentry is not None else False,
+            "loss_reentry_active": bool(reentry.is_loss_reentry) if reentry is not None else False,
             "loss_reentry_prior_exit_price": (
                 str(reentry.prior_exit_price) if reentry is not None and reentry.prior_exit_price is not None else None
             ),

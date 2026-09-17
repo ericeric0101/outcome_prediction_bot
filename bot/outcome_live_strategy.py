@@ -30,8 +30,8 @@ class OutcomeLiveStrategyConfig:
     min_entry_price: Decimal = Decimal("0.55")
     # Binary contracts have a capped upside.  This is a code-owned emergency
     # risk pause, not a tunable signal threshold: no fresh expensive-side BUY
-    # may be opened at or above 85 cents while tail-risk work is active.
-    max_entry_price: Decimal = Decimal("0.85")
+    # may be opened at or above 90 cents while tail-risk work is active.
+    max_entry_price: Decimal = Decimal("0.90")
     tier_b_enabled: bool = False
     # A deliberately temporary, explicit kill switch for the only new live
     # strategy branch.  It is false by default; its numeric policy is

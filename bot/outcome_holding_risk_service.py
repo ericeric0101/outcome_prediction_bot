@@ -313,7 +313,7 @@ class OutcomeHoldingRiskService:
             if result.state == "emergency_exit_flat" and self.confirmed_loss_recorder is not None:
                 # This method independently verifies the complete official
                 # BUY/SELL lot and fee-inclusive loss.  A failed or partial
-                # reconciliation therefore cannot spend a re-entry token.
+                # reconciliation therefore cannot activate post-loss re-entry safeguards.
                 self.confirmed_loss_recorder.record_confirmed_loss_exit(
                     outcome_id=market.outcome_id,
                     period=market.period,
