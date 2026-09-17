@@ -1472,6 +1472,7 @@ class TradeJournalDB:
         *,
         batch_size: int = 500,
         progress: Callable[[int], None] | None = None,
+        timeout_sec: float = 10.0,
     ) -> int:
         """Write recomputable X3 rows in short transactions.
 
@@ -1511,7 +1512,7 @@ class TradeJournalDB:
                 batch.append(values(row))
                 if len(batch) < batch_size:
                     continue
-                with self._connect() as conn:
+                with self._connect(timeout_sec=timeout_sec) as conn:
                     conn.executemany(sql, batch)
                     conn.commit()
                 written += len(batch)
@@ -1519,7 +1520,7 @@ class TradeJournalDB:
                     progress(written)
                 batch.clear()
             if batch:
-                with self._connect() as conn:
+                with self._connect(timeout_sec=timeout_sec) as conn:
                     conn.executemany(sql, batch)
                     conn.commit()
                 written += len(batch)
@@ -1536,6 +1537,7 @@ class TradeJournalDB:
         *,
         batch_size: int = 500,
         progress: Callable[[int], None] | None = None,
+        timeout_sec: float = 10.0,
     ) -> int:
         """Write D2 derived joins in short, restart-safe transactions only."""
         if batch_size <= 0:
@@ -1572,7 +1574,7 @@ class TradeJournalDB:
                 batch.append(values(row))
                 if len(batch) < batch_size:
                     continue
-                with self._connect() as conn:
+                with self._connect(timeout_sec=timeout_sec) as conn:
                     conn.executemany(sql, batch)
                     conn.commit()
                 written += len(batch)
@@ -1580,7 +1582,7 @@ class TradeJournalDB:
                     progress(written)
                 batch.clear()
             if batch:
-                with self._connect() as conn:
+                with self._connect(timeout_sec=timeout_sec) as conn:
                     conn.executemany(sql, batch)
                     conn.commit()
                 written += len(batch)
@@ -1595,7 +1597,7 @@ class TradeJournalDB:
                                            outcome_id: int, period: str, fill_timestamp_ms: int,
                                            oi_observation_id: int | None, oi_local_received_at_ms: int | None,
                                            oi_age_ms: int | None, features: Dict[str, Any],
-                                           actual_markouts: Dict[str, Any]) -> bool:
+                                           actual_markouts: Dict[str, Any], timeout_sec: float = 10.0) -> bool:
         """Persist fill-time OI conditioning plus only exchange-confirmed P3 markouts."""
         sql = """
         INSERT INTO outcome_oi_fill_feature_rows (
@@ -1608,7 +1610,7 @@ class TradeJournalDB:
           actual_markouts_json=excluded.actual_markouts_json,generated_at=excluded.generated_at
         """
         try:
-            with self._connect() as conn:
+            with self._connect(timeout_sec=timeout_sec) as conn:
                 conn.execute(sql, (feature_schema_version, fill_order_event_id, outcome_id, period, fill_timestamp_ms,
                     oi_observation_id, oi_local_received_at_ms, oi_age_ms, _json_dumps(features),
                     _json_dumps(actual_markouts), _utc_now_iso()))

@@ -44,6 +44,7 @@ from bot.outcome_execution_ledger import OutcomeExecutionLedger
 from bot.outcome_operations_monitor import OutcomeOperationsMonitor
 from bot.outcome_research_capture import OutcomeResearchCapture
 from bot.outcome_research_worker import OutcomeResearchWorker
+from bot.outcome_derived_feature_worker import OutcomeDerivedFeatureWorker
 from bot.deribit_market_data import DeribitMarketDataWorker
 from bot.outcome_rollover import OutcomeRolloverCoordinator
 from monitoring.trade_journal_db import TradeJournalDB
@@ -248,6 +249,7 @@ def run_integrated_hyperliquid_bot(
     research_capture = None
     research_worker = None
     deribit_worker = None
+    derived_feature_worker = None
     if not simulation:
         # Keep capture off the wallet/execution loop.  This client is used
         # exclusively by the worker, whose code has no order submission or
@@ -260,6 +262,13 @@ def run_integrated_hyperliquid_bot(
             client=research_client, capture=research_capture, journal=live_journal,
         )
         research_worker.start()
+        # Derived X3/D2 rows are research-only, but must be produced while
+        # their raw P2/OI/Deribit evidence is fresh.  The worker uses short
+        # write attempts and never shares the execution client or authority.
+        derived_feature_worker = OutcomeDerivedFeatureWorker(
+            journal=live_journal, run_id=f"outcome-derived-features-{uuid.uuid4().hex[:10]}",
+        )
+        derived_feature_worker.start()
         # Deribit is isolated public research only.  Its worker never shares
         # the account client or execution loop and its absence cannot block
         # Outcome entry/exit safety.  It is opt-in so a copied environment
@@ -297,6 +306,8 @@ def run_integrated_hyperliquid_bot(
         logger.error("Unable to persist runtime safety startup manifest; live startup aborted fail-closed.")
         if research_worker is not None:
             research_worker.stop()
+        if derived_feature_worker is not None:
+            derived_feature_worker.stop()
         if deribit_worker is not None:
             deribit_worker.stop()
         if settlement_worker is not None:
@@ -760,6 +771,8 @@ def run_integrated_hyperliquid_bot(
                 logger.error(f"[OUTCOME SHUTDOWN] entry-buy cancellation reconciliation failed: {exc}")
         if research_worker is not None:
             research_worker.stop()
+        if derived_feature_worker is not None:
+            derived_feature_worker.stop()
         if deribit_worker is not None:
             deribit_worker.stop()
         if settlement_worker is not None:

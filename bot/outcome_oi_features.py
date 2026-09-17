@@ -259,6 +259,7 @@ class OutcomeOiFeaturePipeline:
         batch_size: int = 500,
         rebuild: bool = False,
         progress: Callable[[int, int], None] | None = None,
+        write_timeout_sec: float = 10.0,
     ) -> X3BuildResult:
         """Incrementally build X3 without quadratic scans or long write locks.
 
@@ -338,6 +339,7 @@ class OutcomeOiFeaturePipeline:
         written = self.journal.bulk_upsert_outcome_oi_feature_rows(
             rows(), batch_size=batch_size,
             progress=(lambda completed: progress(completed, len(work))) if progress else None,
+            timeout_sec=write_timeout_sec,
         )
         fill_rows = 0
         for event_id, fill in maker_fills:
@@ -350,6 +352,7 @@ class OutcomeOiFeaturePipeline:
                     fill_order_event_id=event_id, outcome_id=int(fill["outcome_id"]), period="1d", fill_timestamp_ms=timestamp,
                     oi_observation_id=oi.id if oi else None, oi_local_received_at_ms=oi.local_received_at_ms if oi else None,
                     oi_age_ms=timestamp - oi.local_received_at_ms if oi else None, features=features,
-                    actual_markouts=markouts_by_fill.get(str(fill.get("trade_id")), {})):
+                    actual_markouts=markouts_by_fill.get(str(fill.get("trade_id")), {}),
+                    timeout_sec=write_timeout_sec):
                 fill_rows += 1
         return X3BuildResult(len(snapshots), written, joined, coverage, fill_rows)

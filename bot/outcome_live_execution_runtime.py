@@ -38,6 +38,7 @@ from bot.outcome_entry_requote import (
     OutcomeEntryRequoteController,
 )
 from bot.outcome_holding_path import OutcomeHoldingPathObservation, OutcomeHoldingPathRecorder
+from bot.outcome_exit_continuation import OutcomeExitContinuationObserver
 from bot.outcome_trend_continuation import OutcomeTrendContinuationRecorder
 from bot.outcome_reversal import OutcomeReversalClassifier, OutcomeReversalInput
 from bot.outcome_loss_reentry import OutcomeLossReentryGate
@@ -124,6 +125,7 @@ class OutcomeLiveExecutionRuntime:
             if self.entry_lifecycle_store else None
         )
         self.holding_path_recorder = OutcomeHoldingPathRecorder(ledger.journal, ledger.run_id) if ledger else None
+        self.exit_continuation_observer = OutcomeExitContinuationObserver(ledger.journal, ledger.run_id) if ledger else None
         self.trend_continuation_recorder = OutcomeTrendContinuationRecorder(ledger.journal, ledger.run_id) if ledger else None
         self.reversal_classifier = OutcomeReversalClassifier()
         self.loss_reentry_gate = OutcomeLossReentryGate(ledger.journal, ledger.run_id) if ledger else None
@@ -1500,6 +1502,37 @@ class OutcomeLiveExecutionRuntime:
         except (ValueError, TypeError, KeyError, IndexError, json.JSONDecodeError):
             return
 
+    def _capture_due_exit_continuations(self, *, market: OutcomeMarketSpec) -> None:
+        """Capture fixed post-IOC checkpoints without changing a decision."""
+        observer = self.exit_continuation_observer
+        if observer is None:
+            return
+        try:
+            for continuation, target in observer.due(outcome_id=market.outcome_id):
+                book = self._fresh_book_once(market=market, side_index=continuation.side_index)
+                top = self._top_of_book(book)
+                if top is None:
+                    continue
+                bid, ask = top
+                remaining, notional, depth = continuation.inventory, Decimal("0"), Decimal("0")
+                for level in book.get("bids", ()):
+                    px, size = Decimal(str(level.get("price", level.get("px")))), Decimal(str(level.get("size", level.get("sz"))))
+                    if px > 0 and size > 0:
+                        taken = min(remaining, size)
+                        notional += px * taken
+                        depth += taken
+                        remaining -= taken
+                        if remaining <= 0:
+                            break
+                vwap = notional / continuation.inventory if remaining <= 0 else None
+                observer.record(continuation=continuation, target_sec=target, best_bid=bid, best_ask=ask,
+                                marketable_vwap=vwap, depth_shares=depth)
+        except Exception:
+            # This is strictly post-exit research.  A transient journal or
+            # book failure must never alter entry/exit authority or delay a
+            # protective decision on the next tick.
+            return
+
     def _live_entry_age_sec(self, *, market: OutcomeMarketSpec, coin: str) -> float | None:
         return self.journal_view.live_entry_age_sec(market, coin)
 
@@ -1552,6 +1585,7 @@ class OutcomeLiveExecutionRuntime:
             return LiveExecutionResult("disabled", "automated execution requires OUTCOME_AUTOMATED_EXECUTION_ENABLED=1 and OUTCOME_SDK_EXECUTION_ENABLED=1")
         report = self.recovery.reconcile([market])
         self.exit_recovery_service.reconcile(market=market, report=report)
+        self._capture_due_exit_continuations(market=market)
         exit_ambiguity = self.exit_recovery_service.ambiguity_barrier(market=market)
         if exit_ambiguity is not None:
             return exit_ambiguity
@@ -1602,6 +1636,7 @@ class OutcomeLiveExecutionRuntime:
             return health_error
         report = self.recovery.reconcile([market])
         self.exit_recovery_service.reconcile(market=market, report=report)
+        self._capture_due_exit_continuations(market=market)
         exit_ambiguity = self.exit_recovery_service.ambiguity_barrier(market=market)
         if exit_ambiguity is not None:
             return exit_ambiguity
@@ -1749,6 +1784,7 @@ class OutcomeLiveExecutionRuntime:
             "reason": str(getattr(report, "reason", "unknown")),
         }
         self.exit_recovery_service.reconcile(market=market, report=report)
+        self._capture_due_exit_continuations(market=market)
         exit_ambiguity = self.exit_recovery_service.ambiguity_barrier(market=market)
         if exit_ambiguity is not None:
             admission["ambiguous_exit_fence"] = "pending"

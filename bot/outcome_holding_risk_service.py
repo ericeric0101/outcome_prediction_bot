@@ -320,6 +320,23 @@ class OutcomeHoldingRiskService:
                     coin=coin,
                     order_id=str(result.emergency_order_id or ""),
                 )
+            if result.state == "emergency_exit_flat":
+                # The holding-path recorder rightly stops when inventory is
+                # flat.  Register fixed research checkpoints so later
+                # analysis can compare the actual protected exit with a
+                # lifecycle-bound 5/15/30 minute executable path.  This is
+                # telemetry only and deliberately has no re-entry authority.
+                exit_order = str(result.emergency_order_id or "")
+                self.ledger.journal.log_best_effort_strategy_event(
+                    self.ledger.run_id, "OUTCOME_EXIT_CONTINUATION_REGISTERED", {
+                        "read_only": True, "live_authority": False, "execution_submitted": False,
+                        "exit_id": f"{market.outcome_id}:{coin}:{exit_order}",
+                        "outcome_id": market.outcome_id, "coin": coin, "side_index": side_index,
+                        "entry_vwap": str(item.fill_vwap), "inventory": str(item.inventory),
+                        "exit_timestamp": time.time(), "targets_sec": [300, 900, 1800],
+                        "execution_type": execution_type,
+                    },
+                )
         return LiveExecutionResult(result.state, result.detail, result.emergency_order_id or result.old_order_id)
 
     def _attempt_budget_exhausted(self, *, market: OutcomeMarketSpec, coin: str) -> bool:

@@ -199,6 +199,7 @@ class OutcomeDeribitFeaturePipeline:
     def build(
         self, *, batch_size: int = 500, rebuild: bool = False,
         progress: Callable[[int, int], None] | None = None,
+        write_timeout_sec: float = 10.0,
     ) -> D2BuildResult:
         """Build D2 rows, limiting source scope to the live Deribit era."""
         with sqlite3.connect(self.journal.db_path) as conn:
@@ -286,7 +287,7 @@ class OutcomeDeribitFeaturePipeline:
                 }
 
         written = self.journal.bulk_upsert_outcome_deribit_feature_rows(
-            rows(), batch_size=batch_size,
+            rows(), batch_size=batch_size, timeout_sec=write_timeout_sec,
             progress=(lambda completed: progress(completed, len(work))) if progress else None,
         )
         return D2BuildResult(
