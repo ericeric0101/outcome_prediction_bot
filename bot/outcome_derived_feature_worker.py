@@ -63,7 +63,9 @@ class OutcomeDerivedFeatureWorker:
         # worker into a tight retry loop against a contended journal.
         self._next_due = now + self.interval_sec
         try:
-            oi = OutcomeOiFeaturePipeline(self.journal).build(
+            oi_pipeline = OutcomeOiFeaturePipeline(self.journal)
+            oi_fill_rows = oi_pipeline.build_fill_rows(write_timeout_sec=self.write_timeout_sec)
+            oi = oi_pipeline.build(
                 batch_size=self.batch_size, write_timeout_sec=self.write_timeout_sec,
             )
             deribit = OutcomeDeribitFeaturePipeline(self.journal).build(
@@ -72,7 +74,7 @@ class OutcomeDerivedFeatureWorker:
         except Exception as exc:
             self._emit(state="build_skipped_or_failed_will_retry", error_type=type(exc).__name__)
             return False
-        self._emit(state="built", oi=asdict(oi), deribit=asdict(deribit))
+        self._emit(state="built", oi={**asdict(oi), "prebuilt_fill_rows": oi_fill_rows}, deribit=asdict(deribit))
         return True
 
     def start(self) -> None:

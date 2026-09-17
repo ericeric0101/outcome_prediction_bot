@@ -14,6 +14,7 @@ def test_derived_worker_is_due_once_and_uses_bounded_write_timeout(monkeypatch, 
 
     class Oi:
         def __init__(self, _journal): pass
+        def build_fill_rows(self, **kwargs): calls.append(("oi_fills", kwargs)); return 1
         def build(self, **kwargs): calls.append(("oi", kwargs)); return _Result()
 
     class Deribit:
@@ -28,5 +29,6 @@ def test_derived_worker_is_due_once_and_uses_bounded_write_timeout(monkeypatch, 
                                          monotonic=lambda: now[0])
     assert worker.run_once() is True
     assert worker.run_once() is False
-    assert [name for name, _ in calls] == ["oi", "deribit"]
-    assert all(kwargs["write_timeout_sec"] == 0.05 and kwargs["batch_size"] == 7 for _, kwargs in calls)
+    assert [name for name, _ in calls] == ["oi_fills", "oi", "deribit"]
+    assert calls[0][1]["write_timeout_sec"] == 0.05
+    assert all(kwargs["write_timeout_sec"] == 0.05 and kwargs["batch_size"] == 7 for _, kwargs in calls[1:])

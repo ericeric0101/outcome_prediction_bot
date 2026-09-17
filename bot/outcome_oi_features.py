@@ -253,6 +253,28 @@ class OutcomeOiFeaturePipeline:
             labels[key] = record
         return labels
 
+    def build_fill_rows(self, *, write_timeout_sec: float = 10.0) -> int:
+        """Incrementally join official maker fills without scanning P2 labels."""
+        with sqlite3.connect(self.journal.db_path) as conn:
+            observations = self._observations(conn)
+            maker_fills = self._actual_maker_fills(conn)
+            markouts_by_fill = self._markouts_by_fill(conn)
+        oi_index = _OiIndex.from_points(observations)
+        written = 0
+        for event_id, fill in maker_fills:
+            timestamp = int(fill["timestamp_ms"])
+            oi, features = self._oi_features(oi_index, timestamp)
+            features.update({"fill_id": fill.get("trade_id"), "fill_side": fill.get("side"), "fill_price": fill.get("price"),
+                             "fill_quantity": fill.get("quantity"), "actual_fill": True, "maker": True,
+                             "oi_join_rule": "as_of_local_received_at"})
+            if self.journal.upsert_outcome_oi_fill_feature_row(feature_schema_version=FEATURE_SCHEMA_VERSION,
+                    fill_order_event_id=event_id, outcome_id=int(fill["outcome_id"]), period="1d", fill_timestamp_ms=timestamp,
+                    oi_observation_id=oi.id if oi else None, oi_local_received_at_ms=oi.local_received_at_ms if oi else None,
+                    oi_age_ms=timestamp - oi.local_received_at_ms if oi else None, features=features,
+                    actual_markouts=markouts_by_fill.get(str(fill.get("trade_id")), {}), timeout_sec=write_timeout_sec):
+                written += 1
+        return written
+
     def build(
         self,
         *,
@@ -336,11 +358,10 @@ class OutcomeOiFeaturePipeline:
                     "features": features, "labels": labels, "market_context": context,
                 }
 
-        written = self.journal.bulk_upsert_outcome_oi_feature_rows(
-            rows(), batch_size=batch_size,
-            progress=(lambda completed: progress(completed, len(work))) if progress else None,
-            timeout_sec=write_timeout_sec,
-        )
+        # Fill conditioning is compact and immediately useful for actual
+        # execution-quality research.  Do it before the much larger snapshot
+        # backfill so an interrupted historical rebuild never leaves new
+        # official fills stranded behind a long label scan.
         fill_rows = 0
         for event_id, fill in maker_fills:
             timestamp = int(fill["timestamp_ms"])
@@ -355,4 +376,9 @@ class OutcomeOiFeaturePipeline:
                     actual_markouts=markouts_by_fill.get(str(fill.get("trade_id")), {}),
                     timeout_sec=write_timeout_sec):
                 fill_rows += 1
+        written = self.journal.bulk_upsert_outcome_oi_feature_rows(
+            rows(), batch_size=batch_size,
+            progress=(lambda completed: progress(completed, len(work))) if progress else None,
+            timeout_sec=write_timeout_sec,
+        )
         return X3BuildResult(len(snapshots), written, joined, coverage, fill_rows)
