@@ -44,18 +44,23 @@ class OutcomeMarketRiskMonitor:
     _HORIZONS = (5, 10, 30)
 
     def __init__(self) -> None:
-        self._samples: dict[str, deque[tuple[float, Decimal, Decimal]]] = {}
+        # Keep the complete compact BBO shape required to distinguish a
+        # one-way deterioration from a potentially recoverable chop.  This
+        # remains process-local, bounded to 90 seconds, and has no execution
+        # dependency.  Durable evidence is emitted by the runtime only after
+        # the existing full-depth holding-path observation.
+        self._samples: dict[str, deque[tuple[float, Decimal, Decimal, Decimal]]] = {}
         self._dislocation_started: dict[str, float] = {}
         self._warning_started: dict[str, float] = {}
         self._latest_lane: dict[str, dict[str, Any]] = {}
         self._latest_full_depth_lane: dict[str, dict[str, Any]] = {}
 
     @staticmethod
-    def _prior(samples: deque[tuple[float, Decimal, Decimal]], now: float, horizon: int) -> tuple[Decimal, Decimal] | None:
+    def _prior(samples: deque[tuple[float, Decimal, Decimal, Decimal]], now: float, horizon: int) -> tuple[Decimal, Decimal] | None:
         candidates = [row for row in samples if row[0] <= now - horizon]
         if not candidates:
             return None
-        _, bid, depth = candidates[-1]
+        _, bid, _ask, depth = candidates[-1]
         return bid, depth
 
     @staticmethod
@@ -64,9 +69,69 @@ class OutcomeMarketRiskMonitor:
             return None
         return (current / prior - Decimal("1")) * Decimal("10000")
 
+    @staticmethod
+    def _trend_efficiency(values: list[Decimal]) -> Decimal | None:
+        """Return absolute net movement / travelled path (one is one-way)."""
+        if len(values) < 3:
+            return None
+        path = sum((current - prior).copy_abs() for prior, current in zip(values, values[1:]))
+        return (values[-1] - values[0]).copy_abs() / path if path > 0 else Decimal("0")
+
+    @staticmethod
+    def _sign_flips(values: list[Decimal]) -> int:
+        signs = [1 if value > 0 else -1 for value in values if value != 0]
+        return sum(1 for prior, current in zip(signs, signs[1:]) if prior != current)
+
+    def _recovery_shape(self, *, lifecycle_id: str) -> dict[str, Any]:
+        """Describe, never authorize, a choppy/recovering 90-second BBO path.
+
+        The definition is intentionally the same conjunctive shape used by
+        the offline exit replay: a direction flip alone is normal noise and
+        never makes a HOLD proposal eligible.  This fact is emitted alongside
+        all future hard candidates so replay no longer has to infer it from a
+        different sampling stream.
+        """
+        samples = list(self._samples.get(lifecycle_id, ()))
+        if len(samples) < 3:
+            return {
+                "classification": "insufficient_hold_path",
+                "sample_count": len(samples), "bid_trend_efficiency": None,
+                "bid_direction_flips": 0, "depth_recovery_ratio": None,
+                "spread_contraction_ratio": None,
+                "hold_for_recovery_eligible": False,
+            }
+        bids = [item[1] for item in samples]
+        depths = [item[3] for item in samples]
+        spreads = [((ask / bid) - Decimal("1")) * Decimal("10000") for _ts, bid, ask, _depth in samples if bid > 0]
+        bid_changes = [current - prior for prior, current in zip(bids, bids[1:])]
+        minimum_depth, latest_depth = min(depths), depths[-1]
+        if spreads:
+            maximum_spread, latest_spread = max(spreads), spreads[-1]
+        else:
+            maximum_spread, latest_spread = Decimal("0"), Decimal("0")
+        depth_recovery = latest_depth / minimum_depth if minimum_depth > 0 else None
+        spread_contraction = latest_spread / maximum_spread if maximum_spread > 0 else None
+        efficiency = self._trend_efficiency(bids)
+        flips = self._sign_flips(bid_changes)
+        chop = bool(
+            efficiency is not None and flips >= 1
+            and efficiency <= Decimal("0.60")
+            and depth_recovery is not None and depth_recovery >= Decimal("1.25")
+            and spread_contraction is not None and spread_contraction <= Decimal("0.80")
+        )
+        return {
+            "classification": "chop_recovery_candidate" if chop else "persistent_or_unresolved_deterioration",
+            "sample_count": len(samples),
+            "bid_trend_efficiency": str(efficiency) if efficiency is not None else None,
+            "bid_direction_flips": flips,
+            "depth_recovery_ratio": str(depth_recovery) if depth_recovery is not None else None,
+            "spread_contraction_ratio": str(spread_contraction) if spread_contraction is not None else None,
+            "hold_for_recovery_eligible": chop,
+        }
+
     def observe(self, item: OutcomeMarketRiskObservation) -> dict[str, Any]:
         samples = self._samples.setdefault(item.lifecycle_id, deque())
-        samples.append((item.timestamp, item.best_bid, item.top3_depth))
+        samples.append((item.timestamp, item.best_bid, item.best_ask, item.top3_depth))
         while samples and samples[0][0] < item.timestamp - self._LOOKBACK_SEC:
             samples.popleft()
         velocity, ratios = {}, {}
@@ -174,6 +239,11 @@ class OutcomeMarketRiskMonitor:
         within_cap = bool(net_return is not None and net_return >= Decimal("-0.15"))
         hard = bool(lane.get("state") == "WARNING_CANDIDATE" and lane.get("hard_drawdown_reached")
                     and full_inventory and within_cap)
+        recovery_shape = self._recovery_shape(lifecycle_id=lifecycle_id)
+        warning_eligible = lane.get("state") == "WARNING_CANDIDATE"
+        # All three options are persisted as counterfactuals.  The live
+        # controller remains unchanged: a future HOLD veto cannot be promoted
+        # until warning protection has independent live authority.
         result = {
             "state": "HARD_CANDIDATE_WITHIN_CAP" if hard else (
                 "HARD_CANDIDATE_DEPTH_OR_CAP_BLOCKED" if lane.get("hard_drawdown_reached") else str(lane.get("state"))
@@ -185,6 +255,24 @@ class OutcomeMarketRiskMonitor:
             "observed_at": timestamp,
             "live_authority": False,
             "execution_submitted": False,
+            "recovery_shape": recovery_shape,
+            "counterfactual_actions": {
+                "hard_ioc": {
+                    "action": "HARD_IOC_COUNTERFACTUAL" if hard else "NO_HARD_IOC",
+                    "eligible": hard,
+                    "requires_full_depth_within_cap": True,
+                },
+                "warning_only": {
+                    "action": "WARNING_ONLY_COUNTERFACTUAL" if warning_eligible else "KEEP_PROTECTIVE_SELL",
+                    "eligible": warning_eligible,
+                    "does_not_cancel_or_replace_protection": True,
+                },
+                "hold_for_recovery": {
+                    "action": "HOLD_FOR_RECOVERY_COUNTERFACTUAL" if recovery_shape["hold_for_recovery_eligible"] else "NO_HOLD_VETO",
+                    "eligible": recovery_shape["hold_for_recovery_eligible"],
+                    "never_live_authorized": True,
+                },
+            },
             "limits": ["shadow only", "does_not_cancel_protection", "does_not_submit_ioc"],
         }
         self._latest_full_depth_lane[lifecycle_id] = result

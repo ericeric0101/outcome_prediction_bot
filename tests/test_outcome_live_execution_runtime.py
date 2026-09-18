@@ -215,6 +215,36 @@ def test_market_regime_shadow_is_journalled_without_execution_authority(tmp_path
     assert json.loads(payload)["execution_submitted"] is False
 
 
+def test_holding_risk_decision_shadow_persists_three_counterfactuals_without_mutation(tmp_path):
+    journal = TradeJournalDB(tmp_path / "holding-risk-shadow.db")
+    runtime = OutcomeLiveExecutionRuntime(
+        account=CalibrationAccount(), wallet="w", gateway=Gateway(),
+        ledger=OutcomeExecutionLedger(journal, "run"),
+    )
+    lane = {
+        "state": "HARD_CANDIDATE_WITHIN_CAP", "full_depth_net_return_pct": "-0.12",
+        "within_minus_15pct_cap": True,
+        "recovery_shape": {"classification": "chop_recovery_candidate", "hold_for_recovery_eligible": True},
+        "counterfactual_actions": {
+            "hard_ioc": {"action": "HARD_IOC_COUNTERFACTUAL", "eligible": True},
+            "warning_only": {"action": "WARNING_ONLY_COUNTERFACTUAL", "eligible": True},
+            "hold_for_recovery": {"action": "HOLD_FOR_RECOVERY_COUNTERFACTUAL", "eligible": True},
+        },
+    }
+    runtime._record_holding_risk_decision_shadow(
+        market=market(), coin="#11530", lifecycle_id="entry-1", holding_age_sec=60,
+        time_left_sec=3600, lane=lane,
+    )
+    with sqlite3.connect(journal.db_path) as conn:
+        payload = json.loads(conn.execute(
+            "SELECT payload_json FROM strategy_events WHERE event_type='OUTCOME_HOLDING_RISK_DECISION_SHADOW'"
+        ).fetchone()[0])
+    assert payload["execution_submitted"] is False
+    assert payload["live_authority"] is False
+    assert payload["counterfactual_actions"]["hard_ioc"]["action"] == "HARD_IOC_COUNTERFACTUAL"
+    assert payload["counterfactual_actions"]["hold_for_recovery"]["action"] == "HOLD_FOR_RECOVERY_COUNTERFACTUAL"
+
+
 def test_postfill_quality_shadow_stops_after_its_two_minute_window(monkeypatch, tmp_path):
     journal = TradeJournalDB(tmp_path / "postfill-window.db")
     runtime = OutcomeLiveExecutionRuntime(

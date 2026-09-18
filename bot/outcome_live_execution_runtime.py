@@ -214,6 +214,7 @@ class OutcomeLiveExecutionRuntime:
         self._last_crash_shadow_record: dict[str, tuple[str, float]] = {}
         self._last_market_risk_record: dict[str, tuple[str, float]] = {}
         self._last_fast_failure_lane_record: dict[str, tuple[str, float]] = {}
+        self._last_holding_risk_decision_record: dict[str, tuple[str, float]] = {}
         self._last_postfill_quality_record: dict[str, tuple[str, float]] = {}
         self._last_fill_sync_at = float("-inf")
         # An unresolved, cancelled BUY is unusual.  Its terminal proof needs
@@ -1354,6 +1355,57 @@ class OutcomeLiveExecutionRuntime:
                 self._last_market_risk_record[lifecycle_id] = (monitor_state, now)
         return True
 
+    def _record_holding_risk_decision_shadow(
+        self, *, market: OutcomeMarketSpec, coin: str, lifecycle_id: str,
+        holding_age_sec: float, time_left_sec: float, lane: dict[str, object],
+    ) -> None:
+        """Persist one compact three-lane counterfactual at hard-risk boundaries.
+
+        This consumes only the full-depth snapshot already fetched for the
+        existing holding-path recorder.  It has no controller reference and
+        cannot change the narrow canary, a protective SELL, or entry policy.
+        """
+        if self.ledger is None:
+            return
+        state = str(lane.get("state") or "UNKNOWN")
+        if state not in {"HARD_CANDIDATE_WITHIN_CAP", "HARD_CANDIDATE_DEPTH_OR_CAP_BLOCKED"}:
+            return
+        shape = lane.get("recovery_shape") if isinstance(lane.get("recovery_shape"), dict) else {}
+        actions = lane.get("counterfactual_actions") if isinstance(lane.get("counterfactual_actions"), dict) else {}
+        hard = actions.get("hard_ioc") if isinstance(actions.get("hard_ioc"), dict) else {}
+        warning = actions.get("warning_only") if isinstance(actions.get("warning_only"), dict) else {}
+        hold = actions.get("hold_for_recovery") if isinstance(actions.get("hold_for_recovery"), dict) else {}
+        fingerprint = "|".join((
+            state, str(shape.get("classification") or "unknown"),
+            str(hard.get("action") or "unknown"), str(warning.get("action") or "unknown"),
+            str(hold.get("action") or "unknown"),
+        ))
+        now = time.monotonic()
+        previous = self._last_holding_risk_decision_record.get(lifecycle_id)
+        if previous is not None and previous[0] == fingerprint and now - previous[1] < self._HOLDING_PATH_MIN_INTERVAL_SEC:
+            return
+        self._log_best_effort_strategy_event("OUTCOME_HOLDING_RISK_DECISION_SHADOW", {
+            "schema_version": 1, "read_only": True, "live_authority": False,
+            "execution_submitted": False, "outcome_id": market.outcome_id,
+            "period": market.period, "coin": coin, "entry_lifecycle_id": lifecycle_id,
+            "holding_age_sec": holding_age_sec, "time_left_sec": time_left_sec,
+            "hard_candidate_state": state,
+            "full_depth_net_return_pct": lane.get("full_depth_net_return_pct"),
+            "within_minus_15pct_cap": lane.get("within_minus_15pct_cap"),
+            "recovery_shape": shape,
+            "counterfactual_actions": actions,
+            "promotion_boundary": {
+                "hold_veto_live_authorized": False,
+                "warning_lane_live_authorized": False,
+                "existing_narrow_canary_unchanged": True,
+            },
+            "limits": [
+                "no live decision changes", "no cancel/reprice/IOC authority",
+                "hold option cannot veto existing safety lanes",
+            ],
+        })
+        self._last_holding_risk_decision_record[lifecycle_id] = (fingerprint, now)
+
     def _capture_holding_path(self, *, market: OutcomeMarketSpec, finding: object,
                               update_reversal: bool = True) -> None:
         """Persist as-of open-inventory facts; never changes an order decision."""
@@ -1443,6 +1495,10 @@ class OutcomeLiveExecutionRuntime:
                         },
                     )
                     self._last_fast_failure_lane_record[lifecycle_id] = (lane_state, now)
+                self._record_holding_risk_decision_shadow(
+                    market=market, coin=coin, lifecycle_id=lifecycle_id,
+                    holding_age_sec=age, time_left_sec=market.time_to_expiry_sec(), lane=lane,
+                )
             # B5 observes the same already-fetched full-depth book.  It never
             # creates an order and therefore adds no REST or SDK call.
             live_context = dict(evidence)
