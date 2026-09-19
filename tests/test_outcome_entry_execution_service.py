@@ -1,8 +1,9 @@
 from decimal import Decimal
+import sqlite3
 from types import SimpleNamespace
 
 from bot.outcome_entry_execution_service import OutcomeEntryExecutionService
-from bot.outcome_entry_lifecycle import OutcomeEntryLifecycleStore
+from bot.outcome_entry_lifecycle import OutcomeEntryLifecycle, OutcomeEntryLifecycleStore
 from bot.outcome_entry_requote import OutcomeEntryQuotePlanner, OutcomeEntryQuotePlannerConfig, OutcomeEntryRequoteController
 from bot.outcome_live_strategy import OutcomeLiveStrategyConfig
 from bot.outcome_runtime_types import OutcomeRuntimeTickSnapshot
@@ -188,3 +189,74 @@ def test_stale_zero_fill_ambiguous_cancel_fails_closed_without_replacement(monke
         snapshot=snapshot(side_index=0), admission={}, config=OutcomeLiveStrategyConfig(stale_entry_cancel_enabled=True),
     )
     assert blocked is not None and "stale_cancel_pending_terminal_reconciliation" in blocked.detail
+
+
+def test_stale_rearm_never_borrows_expiry_or_rearm_from_an_older_cancel_cycle(tmp_path):
+    """A later confirmed cancel without its expiry must remain a hard fence."""
+    journal = TradeJournalDB(tmp_path / "stale-cycle-link.db")
+    store = OutcomeEntryLifecycleStore(journal, "run")
+    first = OutcomeEntryLifecycle("w", 7, "#yes", "buy-1", Decimal("0.60"), 0, "BUY_RESTING")
+    first_decision = store.record_stale_cancel_decision(
+        lifecycle=first, decision_at_ms=100, order_age_sec=60,
+    )
+    assert first_decision is not None
+    first_expiry = store.record_stale_cancel_confirmed(
+        lifecycle=first, decision_at_ms=100, order_age_sec=60,
+        stale_cancel_decision_event_id=first_decision,
+    )
+    assert first_expiry is not None
+    _, first_reason, _ = store.stale_decision_rearm_barrier(
+        wallet="w", outcome_id=7, decision_at_ms=None, signal_ineligible=True,
+    )
+    assert first_reason == "stale_decision_rearmed_waiting_for_fresh_eligible_transition"
+
+    second = OutcomeEntryLifecycle("w", 7, "#yes", "buy-2", Decimal("0.61"), 0, "BUY_RESTING")
+    second_decision = store.record_stale_cancel_decision(
+        lifecycle=second, decision_at_ms=200, order_age_sec=60,
+    )
+    assert second_decision is not None
+    # Simulate the precise partial durable-write failure: confirmation made it
+    # to disk, but its linked expiry did not.  Cycle one remains complete.
+    confirmed = journal.log_durable_strategy_event(store.run_id, store.STALE_CANCEL_CONFIRMED_EVENT, {
+        "venue": "hyperliquid_outcome", "wallet": "w", "outcome_id": 7,
+        "coin": "#yes", "order_id": "buy-2",
+        "stale_cancel_decision_event_id": second_decision,
+        "state": "CANCEL_CONFIRMED",
+    })
+    assert confirmed is not None
+    allowed, reason, _ = store.stale_decision_rearm_barrier(
+        wallet="w", outcome_id=7, decision_at_ms=10**15, signal_ineligible=False,
+    )
+    assert not allowed
+    assert reason == "stale_cancel_confirmed_but_decision_expiry_missing"
+
+
+def test_stale_timer_uses_immutable_order_submit_time_after_restart_adoption(monkeypatch, tmp_path):
+    journal = TradeJournalDB(tmp_path / "stale-submit-age.db")
+    store = OutcomeEntryLifecycleStore(journal, "run")
+    journal.log_order_event("run", "ORDER_SUBMIT", venue_order_id="buy-1", side="BUY", status="RESTING", instrument_id="#yes", payload={
+        "venue": "hyperliquid_outcome", "outcome_id": 7, "coin": "#yes",
+        "audit": {"entry_policy_schema_version": 1, "entry_policy_kind": "s0_oi_spot_mark_confirmation",
+                  "entry_bid_at_decision": "0.60", "target_decision_at_ms": 100},
+    })
+    original_submit_ts = "2026-01-01T00:00:00+00:00"
+    with sqlite3.connect(journal.db_path) as conn:
+        conn.execute("UPDATE order_events SET ts=? WHERE venue_order_id='buy-1'", (original_submit_ts,))
+    account = StaleAccount(); gateway = StaleGateway(account)
+    lifecycle = store.recover_or_adopt_audited_submit(
+        wallet="w", outcome_id=7, coin="#yes", open_orders=account.orders,
+    )
+    assert lifecycle is not None and lifecycle.submitted_at_ts is not None
+    assert lifecycle.updated_at_ts is not None and lifecycle.updated_at_ts > lifecycle.submitted_at_ts
+    service = OutcomeEntryExecutionService(
+        recovery=SimpleNamespace(wallet="w", account=account), gateway=gateway, machine=SimpleNamespace(), store=store,
+        planner=OutcomeEntryQuotePlanner(OutcomeEntryQuotePlannerConfig()),
+        controller=OutcomeEntryRequoteController(account=account, gateway=gateway, store=store, wallet="w"),
+    )
+    monkeypatch.setattr("bot.outcome_entry_execution_service.time.time", lambda: lifecycle.submitted_at_ts + 60.1)
+    resting = SimpleNamespace(coin="#yes", inventory="0", state="buy_resting", buy_order_ids=("buy-1",))
+    result = service.manage_resting_buy(
+        snapshot=snapshot(active=(resting,)), config=OutcomeLiveStrategyConfig(stale_entry_cancel_enabled=True),
+    )
+    assert result is not None and result.state == "cancelled"
+    assert gateway.cancel_calls

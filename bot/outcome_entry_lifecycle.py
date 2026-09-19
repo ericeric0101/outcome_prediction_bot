@@ -27,6 +27,10 @@ class OutcomeEntryLifecycle:
     replacement_count: int
     state: str
     updated_at_ts: float | None = None
+    # The accepted BUY's immutable submit event time.  Quote-management state
+    # may be recovered/adopted after a restart, but that must not restart the
+    # stale-order clock.
+    submitted_at_ts: float | None = None
 
 
 class OutcomeEntryLifecycleStore:
@@ -79,12 +83,14 @@ class OutcomeEntryLifecycleStore:
 
     def record_stale_cancel_confirmed(
         self, *, lifecycle: OutcomeEntryLifecycle, decision_at_ms: int | None, order_age_sec: float,
+        stale_cancel_decision_event_id: int,
     ) -> int | None:
         """Durably expire exactly one old decision after cancel/account truth."""
         payload = {
             "venue": "hyperliquid_outcome", "wallet": lifecycle.wallet,
             "outcome_id": lifecycle.outcome_id, "coin": lifecycle.coin,
             "order_id": lifecycle.order_id, "decision_observed_at_ms": decision_at_ms,
+            "stale_cancel_decision_event_id": int(stale_cancel_decision_event_id),
             "order_age_sec": round(order_age_sec, 3), "fill_status": "zero_official_fill_and_zero_inventory",
             "reason": "stale_zero_fill_60s", "state": "CANCEL_CONFIRMED",
         }
@@ -120,30 +126,34 @@ class OutcomeEntryLifecycleStore:
                         """SELECT id FROM strategy_events WHERE event_type=? AND id>?
                            AND json_extract(payload_json, '$.wallet')=?
                            AND CAST(json_extract(payload_json, '$.outcome_id') AS INTEGER)=?
+                           AND CAST(json_extract(payload_json, '$.stale_cancel_decision_event_id') AS INTEGER)=?
                            ORDER BY id DESC LIMIT 1""",
-                        (self.STALE_CANCEL_CONFIRMED_EVENT, stale_decision_id, wallet, int(outcome_id)),
+                        (self.STALE_CANCEL_CONFIRMED_EVENT, stale_decision_id, wallet, int(outcome_id), stale_decision_id),
                     ).fetchone()
                     if confirmed is None:
                         return False, "stale_cancel_pending_terminal_reconciliation", None
-                expired = conn.execute(
-                    """SELECT id,ts,payload_json FROM strategy_events
-                       WHERE event_type=? AND json_extract(payload_json, '$.wallet')=?
-                         AND CAST(json_extract(payload_json, '$.outcome_id') AS INTEGER)=?
-                       ORDER BY id DESC LIMIT 1""",
-                    (self.DECISION_EXPIRED_EVENT, wallet, int(outcome_id)),
-                ).fetchone()
-                if expired is None:
-                    if stale_decision is not None:
+                    confirmed_id = int(confirmed[0])
+                    expired = conn.execute(
+                        """SELECT id,ts FROM strategy_events
+                           WHERE event_type=? AND json_extract(payload_json, '$.wallet')=?
+                             AND CAST(json_extract(payload_json, '$.outcome_id') AS INTEGER)=?
+                             AND CAST(json_extract(payload_json, '$.cancel_confirmed_event_id') AS INTEGER)=?
+                           ORDER BY id DESC LIMIT 1""",
+                        (self.DECISION_EXPIRED_EVENT, wallet, int(outcome_id), confirmed_id),
+                    ).fetchone()
+                    if expired is None:
                         return False, "stale_cancel_confirmed_but_decision_expiry_missing", None
+                    expired_id, expired_ts = int(expired[0]), str(expired[1])
+                    rearmed = conn.execute(
+                        """SELECT id,ts FROM strategy_events WHERE event_type=? AND id>?
+                           AND json_extract(payload_json, '$.wallet')=?
+                             AND CAST(json_extract(payload_json, '$.outcome_id') AS INTEGER)=?
+                             AND CAST(json_extract(payload_json, '$.expired_decision_event_id') AS INTEGER)=?
+                           ORDER BY id DESC LIMIT 1""",
+                        (self.REARMED_EVENT, expired_id, wallet, int(outcome_id), expired_id),
+                    ).fetchone()
+                else:
                     return True, "no_stale_decision_expired", None
-                expired_id, expired_ts, raw = int(expired[0]), str(expired[1]), expired[2]
-                rearmed = conn.execute(
-                    """SELECT id,ts FROM strategy_events WHERE event_type=? AND id>?
-                       AND json_extract(payload_json, '$.wallet')=?
-                       AND CAST(json_extract(payload_json, '$.outcome_id') AS INTEGER)=?
-                       ORDER BY id DESC LIMIT 1""",
-                    (self.REARMED_EVENT, expired_id, wallet, int(outcome_id)),
-                ).fetchone()
             if rearmed is None and signal_ineligible:
                 rearm_at_ms = int(time.time() * 1000)
                 event_id = self.journal.log_durable_strategy_event(self.run_id, self.REARMED_EVENT, {
@@ -187,6 +197,7 @@ class OutcomeEntryLifecycleStore:
                 order_id=str(payload["order_id"]), price=Decimal(str(payload["price"])),
                 replacement_count=int(payload.get("replacement_count", 0)), state=str(payload["state"]),
                 updated_at_ts=datetime.fromisoformat(str(row[0])).timestamp(),
+                submitted_at_ts=self.submit_timestamp(order_id=str(payload["order_id"]), coin=str(payload["coin"])),
             )
         except (KeyError, TypeError, ValueError, sqlite3.Error, json.JSONDecodeError):
             return None
@@ -332,6 +343,20 @@ class OutcomeEntryLifecycleStore:
         except (sqlite3.Error, json.JSONDecodeError, TypeError, ValueError):
             return None
 
+    def submit_timestamp(self, *, order_id: str, coin: str) -> float | None:
+        """Return immutable venue-submit audit time for an owned BUY."""
+        try:
+            with sqlite3.connect(f"file:{self.journal.db_path}?mode=ro", uri=True) as conn:
+                row = conn.execute(
+                    """SELECT ts FROM order_events
+                       WHERE event_type='ORDER_SUBMIT' AND side='BUY'
+                         AND venue_order_id=? AND instrument_id=?
+                       ORDER BY id ASC LIMIT 1""", (str(order_id), coin),
+                ).fetchone()
+            return datetime.fromisoformat(str(row[0])).timestamp() if row is not None else None
+        except (sqlite3.Error, TypeError, ValueError):
+            return None
+
     def fast_rebook_cooldown_remaining(self, *, wallet: str, outcome_id: int, coin: str,
                                        cooldown_sec: float, now: float | None = None) -> float:
         """Persist fast-cancel cooldown semantics across a process restart."""
@@ -430,7 +455,10 @@ class OutcomeEntryLifecycleStore:
                 return None
         except (KeyError, TypeError, ValueError, ArithmeticError, sqlite3.Error, json.JSONDecodeError):
             return None
-        lifecycle = OutcomeEntryLifecycle(wallet, outcome_id, coin, order_id, price, 0, "BUY_RESTING", time.time())
+        lifecycle = OutcomeEntryLifecycle(
+            wallet, outcome_id, coin, order_id, price, 0, "BUY_RESTING", time.time(),
+            self.submit_timestamp(order_id=order_id, coin=coin),
+        )
         self.record(lifecycle, reason="adopted_exact_audited_s0_submit_or_pre_submit_intent_after_restart")
         if intent_id:
             self.resolve_ambiguous_submit(

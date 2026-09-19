@@ -203,7 +203,11 @@ class OutcomeEntryExecutionService:
         )
         if lifecycle is None or lifecycle.order_id != str(buy_order_ids[0]):
             return LiveExecutionResult("blocked", "entry requote refuses unrecorded buy ownership", str(buy_order_ids[0]))
-        age = None if lifecycle.updated_at_ts is None else max(0.0, time.time() - lifecycle.updated_at_ts)
+        # Use the immutable accepted-submit audit rather than the most recent
+        # lifecycle/recovery event.  Restart adoption must not give an old
+        # resting BUY a fresh 60-second stale-order lease.
+        resting_since = lifecycle.submitted_at_ts if lifecycle.submitted_at_ts is not None else lifecycle.updated_at_ts
+        age = None if resting_since is None else max(0.0, time.time() - resting_since)
         self._observe_resting_buy_quality(
             snapshot=snapshot, lifecycle=lifecycle, side_index=side_index, order_age_sec=age,
         )
@@ -229,9 +233,10 @@ class OutcomeEntryExecutionService:
                 decision_at_ms = int(decision_at_ms) if decision_at_ms is not None else None
             except (TypeError, ValueError):
                 decision_at_ms = None
-            if self.store.record_stale_cancel_decision(
+            stale_cancel_decision_event_id = self.store.record_stale_cancel_decision(
                 lifecycle=lifecycle, decision_at_ms=decision_at_ms, order_age_sec=age,
-            ) is None:
+            )
+            if stale_cancel_decision_event_id is None:
                 return LiveExecutionResult("blocked", "stale zero-fill cancel durable decision unavailable", lifecycle.order_id)
             stale_plan = EntryQuotePlan(EntryQuoteAction.CANCEL, "stale_zero_fill_60s")
             try:
@@ -247,6 +252,7 @@ class OutcomeEntryExecutionService:
                 return LiveExecutionResult(result.state, result.detail, result.old_order_id)
             expired = self.store.record_stale_cancel_confirmed(
                 lifecycle=lifecycle, decision_at_ms=decision_at_ms, order_age_sec=age,
+                stale_cancel_decision_event_id=stale_cancel_decision_event_id,
             )
             if expired is None:
                 return LiveExecutionResult("blocked", "stale cancel confirmed but decision expiry persistence unavailable", lifecycle.order_id)
