@@ -1,7 +1,7 @@
 # Hyperliquid Outcome (HIP-4) BTC Daily Prediction Market Trading Bot — Current Authority
 
-> **權威架構版本 (Authority Version)**：2.4.0 (Outcome-only, typed execution-domain services; tail-risk validation roadmap)
-> **建立與審計日期**：2026-08-23；最近修訂：2026-09-14
+> **權威架構版本 (Authority Version)**：2.5.0 (Outcome-only, typed execution-domain services; tail-risk validation roadmap)
+> **建立與審計日期**：2026-08-23；最近修訂：2026-09-19
 > **目標系統**：Hyperliquid HyperCore L1 原生預測市場 — Outcome (HIP-4 協議標準)  
 > **單一權威聲明**：本文件取代原 `project_overview.md`，為系統唯一的設計、架構、量化模型與執行權威規範。
 
@@ -21,6 +21,28 @@
 6. **Crash window 以 durable pre-submit intent 收斂。** BUY 與所有 SELL mutation（首次 protective ALO、cancel-confirm replacement ALO、price-protected IOC）都必須在 SDK mutation 前以 SQLite `synchronous=FULL` 寫入 exact wallet/outcome/coin/side/price/shares/order-kind 的 `OUTCOME_ORDER_INTENT`；寫入失敗即不送單。SELL intent 必須由 durable acknowledged/rejected finalization 或 account-truth resolution 關閉；因此即使 process 在寫 ambiguity event 前已 crash，單獨留下的 unresolved intent 也會形成 fence。ACK 不明時另寫 durable ambiguity evidence，後續只可由 fresh account truth 採納唯一且同 coin/side/price/remaining-shares 的 resting order，或在 visibility fence 後由 order absence + inventory 證據解除。ambiguous IOC 保守計入 bounded attempt budget；未解除前不得再做 exit mutation。官方 SDK 尚未在本 repo 驗證 client order id/idempotency key，故這是 restart recovery safety fence，不得宣稱能消除多 host 同 wallet 的 submit race；同 wallet live writer 仍只能一個。
 7. **Outcome coin canonicalization。** inventory 來源 `+<asset>` 與 book/order 來源 `#<asset>` 先 canonicalize 為 `#<asset>` 後才做 risk/exposure/recovery 判斷；unknown malformed coin 仍 fail-closed。
 8. **唯一 live execution path 與可診斷 sidecar。** legacy `bot/execution/outcome_execution.py` 與其測試已刪除；唯一 mutation path 為 `OutcomeLiveExecutionRuntime → OutcomeExecutionGateway → official TypeScript SDK sidecar`。sidecar stderr 寫入 bounded rotating `logs/outcome_sdk_sidecar.stderr.log`（2 MiB + 一個 rollover），不再丟棄 crash diagnostics。Telegram polling/control code 已完全移除；沒有 `/pause` 或 `/flatten` 這類會誤稱為 kill switch 的控制面。
+
+### 2026-09-19 — 60 秒 stale zero-fill BUY admission 與 post-fill evidence 對齊
+
+**本次唯一新增的 live authority。** 啟用 `OUTCOME_STALE_ENTRY_CANCEL_ENABLED=1`（固定 `OUTCOME_STALE_ENTRY_CANCEL_SEC=60`）時，bot-owned entry BUY 若已 resting **至少 60 秒且 durable official BUY fill 為零**，會先寫入 `OUTCOME_STALE_ENTRY_CANCEL_DECISION`，再只使用既有 `OutcomeEntryRequoteController → cancel_and_confirm` 路徑。該 controller 在 mutation 前後都讀取 fresh account truth：任何 inventory/fill、OID ownership、open-order absence、cancel ACK 或 durable persistence 不明，都進入 reconciliation／blocked，**不**送 replacement BUY。確認 OID 已不存在且 inventory 為零後，才寫入 `OUTCOME_STALE_ENTRY_CANCEL_CONFIRMED` 與 `OUTCOME_ENTRY_DECISION_EXPIRED`；partial fill 沿用既有 remainder cancel/protective SELL 生命週期，完全不走本條 zero-fill lane。
+
+**fresh re-arm contract。** stale cancel 不可立即重用原 S0 decision。即使 signal 持續 eligible，entry 一律拒絕；必須先觀察到全域 admission signal ineligible，durably 記為 `OUTCOME_ENTRY_REARMED`，再出現 ineligible → eligible 的新 transition，且新 decision timestamp 必須晚於 re-arm，才可重新走完整 S0、fresh book、portfolio 與 ALO admission。此 state 從 journal 推導，重啟不會遺失；它不是以任意 cooldown 取代新訊號。此前已修的 exit-terminal barrier 同時維持：bot-owned protective SELL 尚未 terminal 或一個在其 SELL fill 前評估的 decision 尚未過期時，不得送新 BUY；manual/external SELL 不得被誤採納為 bot exit。
+
+**不變項。** 本版不修改 5 分鐘 mark/OI confirmation、OI hard veto、Tier A/B、125 bps spread ceiling、$20 cap、ALO entry、TP、loss-band、fast-failure、S3、narrow `-10%` trigger／`-15%` cap、IOC entry、ML 或 MarketRiskMonitor 的 live authority。
+
+**證據與限制。** 166 筆 event-time 對齊的 maker BUY 中，60 秒 counterfactual 保留 98/166（59%）較早成交，排除 68 筆較晚成交；已觀測到被排除組的 30 秒 executable markout 中位數約 **-1.25¢**，保留組約 **-0.904¢**。#2437、#1993 與 #3253 第二筆 delayed BUY 是本規則可避免的已知 stale-fill 類例；#2820、#3253 第一筆和 #4219 第一筆屬 fast toxic fill，故本規則**不**是完整 entry 解法，也不可拿它宣稱可防止所有 tail。
+
+**post-fill scratch／holding-risk 僅讀取對齊。** 現有 report 以 immutable 同一 `entry_lifecycle_id` 串接：
+
+```text
+official BUY fill
+→ OUTCOME_POST_FILL_QUALITY_SHADOW scratch candidate
+→ 同 lifecycle 的首 90 秒 MarketRiskMonitor BBO/depth/spread path
+→ persistent/chop/recovery research classification
+→ P3 5/10/30s、holding-path MAE/MFE、canonical FIFO realized PnL
+```
+
+它不新增資料庫、不複製 raw L2、不建立下單路徑。`HOLD_FOR_RECOVERY` 與 `SCRATCH_*_RESEARCH` 均為 `read_only/live_authority=false`：不得取消 protective SELL、否決 narrow canary／fast-failure／S3、延後 IOC、或新增 exposure。首次 read-only sanity check 有 16 個 scratch lifecycle，其中 final FIFO 為 5 個 realized-loss、11 個 realized-profit；90 秒 shape 為 14 persistent、2 chop，但 persistent bucket 仍含 10 個最終獲利 lifecycle，故對齊成功**不等於**分類器已能授權 live veto。使用既有 `python -m bot.outcome_entry_quality_report --db logs/outcome_shadow.db --period 1d` 審查，缺 P3、holding path 或 FIFO 一律保持 missing，不得補造。
 
 ### 2026-09-12 外部執行審查交叉驗證與修補
 

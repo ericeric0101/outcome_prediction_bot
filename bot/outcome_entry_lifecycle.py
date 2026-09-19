@@ -33,6 +33,10 @@ class OutcomeEntryLifecycleStore:
     EVENT = "OUTCOME_ENTRY_LIFECYCLE"
     AMBIGUOUS_SUBMIT_EVENT = "OUTCOME_ORDER_AMBIGUOUS_SUBMIT"
     AMBIGUITY_RESOLVED_EVENT = "OUTCOME_ORDER_AMBIGUITY_RESOLVED"
+    STALE_CANCEL_DECISION_EVENT = "OUTCOME_STALE_ENTRY_CANCEL_DECISION"
+    STALE_CANCEL_CONFIRMED_EVENT = "OUTCOME_STALE_ENTRY_CANCEL_CONFIRMED"
+    DECISION_EXPIRED_EVENT = "OUTCOME_ENTRY_DECISION_EXPIRED"
+    REARMED_EVENT = "OUTCOME_ENTRY_REARMED"
 
     def __init__(self, journal: TradeJournalDB, run_id: str) -> None:
         self.journal, self.run_id = journal, run_id
@@ -57,6 +61,105 @@ class OutcomeEntryLifecycleStore:
         if durable:
             return self.journal.log_durable_strategy_event(self.run_id, self.EVENT, payload)
         return self.journal.log_strategy_event(self.run_id, self.EVENT, payload)
+
+    def record_stale_cancel_decision(
+        self, *, lifecycle: OutcomeEntryLifecycle, decision_at_ms: int | None, order_age_sec: float,
+    ) -> int | None:
+        """Durably bind a reviewed zero-fill cancellation to its S0 decision."""
+        return self.journal.log_durable_strategy_event(self.run_id, self.STALE_CANCEL_DECISION_EVENT, {
+            "venue": "hyperliquid_outcome", "wallet": lifecycle.wallet,
+            "outcome_id": lifecycle.outcome_id, "coin": lifecycle.coin,
+            "order_id": lifecycle.order_id, "decision_observed_at_ms": decision_at_ms,
+            # The controller performs the authoritative inventory/open-order
+            # read immediately after this durable intent.  Do not claim that
+            # read has happened before it actually has.
+            "order_age_sec": round(order_age_sec, 3), "fill_status": "zero_official_fill_pending_fresh_account_truth",
+            "reason": "stale_zero_fill_60s", "state": "CANCEL_REQUESTED",
+        })
+
+    def record_stale_cancel_confirmed(
+        self, *, lifecycle: OutcomeEntryLifecycle, decision_at_ms: int | None, order_age_sec: float,
+    ) -> int | None:
+        """Durably expire exactly one old decision after cancel/account truth."""
+        payload = {
+            "venue": "hyperliquid_outcome", "wallet": lifecycle.wallet,
+            "outcome_id": lifecycle.outcome_id, "coin": lifecycle.coin,
+            "order_id": lifecycle.order_id, "decision_observed_at_ms": decision_at_ms,
+            "order_age_sec": round(order_age_sec, 3), "fill_status": "zero_official_fill_and_zero_inventory",
+            "reason": "stale_zero_fill_60s", "state": "CANCEL_CONFIRMED",
+        }
+        confirmed = self.journal.log_durable_strategy_event(self.run_id, self.STALE_CANCEL_CONFIRMED_EVENT, payload)
+        if confirmed is None:
+            return None
+        expired = self.journal.log_durable_strategy_event(self.run_id, self.DECISION_EXPIRED_EVENT, {
+            **payload, "state": "EXPIRED", "cancel_confirmed_event_id": confirmed,
+        })
+        return expired
+
+    def stale_decision_rearm_barrier(
+        self, *, wallet: str, outcome_id: int, decision_at_ms: int | None,
+        signal_ineligible: bool,
+    ) -> tuple[bool, str, int | None]:
+        """Require an ineligible observation before an expired decision can reform.
+
+        This state is journal-derived so restart cannot turn a just-cancelled
+        still-eligible signal into an immediate replacement order.
+        """
+        try:
+            with sqlite3.connect(f"file:{self.journal.db_path}?mode=ro", uri=True) as conn:
+                stale_decision = conn.execute(
+                    """SELECT id FROM strategy_events WHERE event_type=?
+                       AND json_extract(payload_json, '$.wallet')=?
+                       AND CAST(json_extract(payload_json, '$.outcome_id') AS INTEGER)=?
+                       ORDER BY id DESC LIMIT 1""",
+                    (self.STALE_CANCEL_DECISION_EVENT, wallet, int(outcome_id)),
+                ).fetchone()
+                if stale_decision is not None:
+                    stale_decision_id = int(stale_decision[0])
+                    confirmed = conn.execute(
+                        """SELECT id FROM strategy_events WHERE event_type=? AND id>?
+                           AND json_extract(payload_json, '$.wallet')=?
+                           AND CAST(json_extract(payload_json, '$.outcome_id') AS INTEGER)=?
+                           ORDER BY id DESC LIMIT 1""",
+                        (self.STALE_CANCEL_CONFIRMED_EVENT, stale_decision_id, wallet, int(outcome_id)),
+                    ).fetchone()
+                    if confirmed is None:
+                        return False, "stale_cancel_pending_terminal_reconciliation", None
+                expired = conn.execute(
+                    """SELECT id,ts,payload_json FROM strategy_events
+                       WHERE event_type=? AND json_extract(payload_json, '$.wallet')=?
+                         AND CAST(json_extract(payload_json, '$.outcome_id') AS INTEGER)=?
+                       ORDER BY id DESC LIMIT 1""",
+                    (self.DECISION_EXPIRED_EVENT, wallet, int(outcome_id)),
+                ).fetchone()
+                if expired is None:
+                    if stale_decision is not None:
+                        return False, "stale_cancel_confirmed_but_decision_expiry_missing", None
+                    return True, "no_stale_decision_expired", None
+                expired_id, expired_ts, raw = int(expired[0]), str(expired[1]), expired[2]
+                rearmed = conn.execute(
+                    """SELECT id,ts FROM strategy_events WHERE event_type=? AND id>?
+                       AND json_extract(payload_json, '$.wallet')=?
+                       AND CAST(json_extract(payload_json, '$.outcome_id') AS INTEGER)=?
+                       ORDER BY id DESC LIMIT 1""",
+                    (self.REARMED_EVENT, expired_id, wallet, int(outcome_id)),
+                ).fetchone()
+            if rearmed is None and signal_ineligible:
+                rearm_at_ms = int(time.time() * 1000)
+                event_id = self.journal.log_durable_strategy_event(self.run_id, self.REARMED_EVENT, {
+                    "venue": "hyperliquid_outcome", "wallet": wallet, "outcome_id": int(outcome_id),
+                    "expired_decision_event_id": expired_id, "expired_at": expired_ts,
+                    "rearm_state": "ready_after_ineligible_signal", "state": "REARMED",
+                })
+                return False, "stale_decision_rearmed_waiting_for_fresh_eligible_transition", rearm_at_ms if event_id is not None else None
+            if rearmed is None:
+                return False, "stale_decision_requires_ineligible_then_fresh_eligible_signal", None
+            rearm_at_ms = int(datetime.fromisoformat(str(rearmed[1])).timestamp() * 1000)
+            if decision_at_ms is None or decision_at_ms <= rearm_at_ms:
+                return False, "fresh_decision_timestamp_required_after_stale_rearm", rearm_at_ms
+            return True, "fresh_decision_after_stale_rearm", rearm_at_ms
+        except (sqlite3.Error, TypeError, ValueError, json.JSONDecodeError):
+            return False, "stale_rearm_journal_unreadable", None
 
     def recover(self, *, wallet: str, outcome_id: int, coin: str) -> OutcomeEntryLifecycle | None:
         try:

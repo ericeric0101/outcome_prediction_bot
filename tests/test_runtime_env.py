@@ -10,6 +10,8 @@ def test_loader_accepts_only_current_outcome_local_surface(tmp_path):
         "DERIBIT_RESEARCH_SNAPSHOT_INTERVAL_SEC=1\n"
         "OUTCOME_RISK_EPISODE_BUDGET_ENABLED=1\n"
         "OUTCOME_NARROW_HARD_FAILURE_CANARY_ENABLED=1\n"
+        "OUTCOME_STALE_ENTRY_CANCEL_ENABLED=1\n"
+        "OUTCOME_STALE_ENTRY_CANCEL_SEC=60\n"
         "POLYMARKET_PK=must_not_load\n"
         "STRATEGY_PROFILE=must_not_load\n",
         encoding="utf-8",
@@ -24,6 +26,8 @@ def test_loader_accepts_only_current_outcome_local_surface(tmp_path):
     assert environ["DERIBIT_RESEARCH_SNAPSHOT_INTERVAL_SEC"] == "1"
     assert environ["OUTCOME_RISK_EPISODE_BUDGET_ENABLED"] == "1"
     assert environ["OUTCOME_NARROW_HARD_FAILURE_CANARY_ENABLED"] == "1"
+    assert environ["OUTCOME_STALE_ENTRY_CANCEL_ENABLED"] == "1"
+    assert environ["OUTCOME_STALE_ENTRY_CANCEL_SEC"] == "60"
     assert "POLYMARKET_PK" not in environ
     assert "STRATEGY_PROFILE" not in environ
 

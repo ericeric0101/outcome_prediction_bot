@@ -62,6 +62,10 @@ def report(db_path: str | Path, *, period: str = "1d") -> dict[str, Any]:
             """SELECT ts,payload_json FROM strategy_events
                WHERE event_type='OUTCOME_HOLDING_PATH_OBSERVATION' ORDER BY id"""
         ).fetchall()
+        monitor_rows = conn.execute(
+            """SELECT ts,payload_json FROM strategy_events
+               WHERE event_type='OUTCOME_MARKET_RISK_MONITOR_SHADOW' ORDER BY id"""
+        ).fetchall()
         pnl_rows = conn.execute(
             """SELECT open_trade_id,realized_net_usdc,recorded_at
                FROM outcome_realized_pnl_lots"""
@@ -117,6 +121,44 @@ def report(db_path: str | Path, *, period: str = "1d") -> dict[str, Any]:
     for values in paths_by_trade.values():
         values.sort(key=lambda item: item[0])
 
+    monitor_by_lifecycle: dict[str, list[tuple[datetime, float, float, float]]] = defaultdict(list)
+    for ts, raw in monitor_rows:
+        payload = _payload(raw)
+        lifecycle_id = str(payload.get("entry_lifecycle_id") or "")
+        at = _timestamp(ts)
+        bid, ask, depth = (_number(payload.get("best_bid")), _number(payload.get("best_ask")),
+                           _number(payload.get("top3_depth")))
+        if lifecycle_id and at is not None and bid is not None and ask is not None and depth is not None and bid > 0 and ask > bid and depth > 0:
+            monitor_by_lifecycle[lifecycle_id].append((at, bid, ask, depth))
+    for values in monitor_by_lifecycle.values():
+        values.sort(key=lambda item: item[0])
+
+    def recovery_shape(samples: list[tuple[datetime, float, float, float]]) -> dict[str, Any]:
+        """Mirror the existing read-only MarketRiskMonitor shape contract."""
+        if len(samples) < 3:
+            return {
+                "classification": "SCRATCH_UNRESOLVED_RESEARCH", "missing_data_reason": "fewer_than_three_monitor_samples",
+                "sample_count": len(samples), "bid_path_efficiency": None, "bid_direction_flips": 0,
+                "depth_refill_ratio": None, "spread_convergence_ratio": None,
+            }
+        bids, depths = [item[1] for item in samples], [item[3] for item in samples]
+        spreads = [((ask / bid) - 1) * 10_000 for _at, bid, ask, _depth in samples]
+        changes = [current - prior for prior, current in zip(bids, bids[1:])]
+        signs = [1 if value > 0 else -1 for value in changes if value != 0]
+        flips = sum(1 for prior, current in zip(signs, signs[1:]) if prior != current)
+        travelled = sum(abs(current - prior) for prior, current in zip(bids, bids[1:]))
+        efficiency = abs(bids[-1] - bids[0]) / travelled if travelled > 0 else 0.0
+        refill = depths[-1] / min(depths) if min(depths) > 0 else None
+        convergence = spreads[-1] / max(spreads) if max(spreads) > 0 else None
+        chop = bool(flips >= 1 and efficiency <= 0.60 and refill is not None and refill >= 1.25
+                    and convergence is not None and convergence <= 0.80)
+        return {
+            "classification": "SCRATCH_CHOP_RECOVERY_RESEARCH" if chop else "SCRATCH_PERSISTENT_DETERIORATION_RESEARCH",
+            "missing_data_reason": None, "sample_count": len(samples),
+            "bid_path_efficiency": efficiency, "bid_direction_flips": flips,
+            "depth_refill_ratio": refill, "spread_convergence_ratio": convergence,
+        }
+
     realized_by_trade: dict[str, float] = defaultdict(float)
     close_at_by_trade: dict[str, str] = {}
     for trade_id, realized, recorded_at in pnl_rows:
@@ -130,6 +172,12 @@ def report(db_path: str | Path, *, period: str = "1d") -> dict[str, Any]:
     scratch_lifecycle_outcomes: list[dict[str, Any]] = []
     for trade_id, scratch in sorted(scratch_by_trade.items(), key=lambda item: str(item[1]["first_seen_at"])):
         scratch_at = _timestamp(scratch["first_seen_at"])
+        lifecycle_id = f"official_buy:{scratch['payload'].get('order_id')}:{trade_id}"
+        monitor_window = [
+            item for item in monitor_by_lifecycle.get(lifecycle_id, [])
+            if scratch_at is not None and item[0] >= scratch_at
+            and (item[0] - scratch_at).total_seconds() <= 90
+        ]
         path = paths_by_trade.get(trade_id, [])
         path_windows: dict[str, Any] = {}
         for horizon_sec in (30, 60, 120):
@@ -156,13 +204,18 @@ def report(db_path: str | Path, *, period: str = "1d") -> dict[str, Any]:
             "first_scratch_at": scratch["first_seen_at"],
             "outcome_id": scratch["payload"].get("outcome_id"),
             "order_id": scratch["payload"].get("order_id"),
+            "entry_lifecycle_id": lifecycle_id,
             "executable_return_pct_at_first_scratch": scratch["payload"].get("executable_return_pct"),
+            "market_risk_90s": recovery_shape(monitor_window),
             "post_scratch_executable_path": path_windows,
             "canonical_realized_net_usdc": realized,
             "canonical_close_at": close_at_by_trade.get(trade_id),
             "classification": outcome,
         })
     scratch_outcome_counts = Counter(item["classification"] for item in scratch_lifecycle_outcomes)
+    scratch_research_counts = Counter(
+        str(item["market_risk_90s"].get("classification")) for item in scratch_lifecycle_outcomes
+    )
     signal_states = Counter(str(payload.get("signal_state") or "unknown") for _ts, _kind, payload in prefill)
     actions = Counter(
         str((payload.get("stale_cancel_shadow") or {}).get("action") or "unknown")
@@ -188,6 +241,7 @@ def report(db_path: str | Path, *, period: str = "1d") -> dict[str, Any]:
         },
         "postfill_scratch_lifecycle_outcomes": scratch_lifecycle_outcomes,
         "postfill_scratch_lifecycle_outcome_counts": dict(scratch_outcome_counts),
+        "postfill_scratch_market_risk_90s_counts": dict(scratch_research_counts),
         "limits": [
             "Shadow candidates are not fills, cancellations, or IOC simulations.",
             "IOC counterfactual uses only as-of top-of-book and excludes full-depth/slippage/fee certainty.",

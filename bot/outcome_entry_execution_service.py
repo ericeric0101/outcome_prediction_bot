@@ -13,6 +13,7 @@ from bot.outcome_sdk_sidecar import OutcomeSdkAmbiguousExecutionError
 from bot.outcome_entry_requote import (
     EntryQuoteAction,
     EntryQuoteInput,
+    EntryQuotePlan,
     OutcomeEntryQuotePlanner,
     OutcomeEntryRequoteController,
 )
@@ -132,6 +133,17 @@ class OutcomeEntryExecutionService:
                 return LiveExecutionResult(
                     "blocked", "ambiguous prior entry submission; reconciliation required before any new entry",
                 )
+            rearm_allowed, rearm_reason, rearmed_at_ms = self.store.stale_decision_rearm_barrier(
+                wallet=self.recovery.wallet, outcome_id=snapshot.market.outcome_id,
+                decision_at_ms=snapshot.entry_decision_at_ms,
+                signal_ineligible=snapshot.entry_side_index not in (0, 1),
+            )
+            admission["stale_entry_rearm"] = {
+                "allowed": rearm_allowed, "reason": rearm_reason,
+                "rearmed_at_ms": rearmed_at_ms,
+            }
+            if not rearm_allowed:
+                return LiveExecutionResult("flat", f"live strategy no entry: {rearm_reason}")
         if snapshot.reduce_only:
             admission["reduce_only_gate"] = "new_entries_prohibited"
             return LiveExecutionResult("flat", "reduce-only: no live exposure after entry cancellation")
@@ -195,6 +207,50 @@ class OutcomeEntryExecutionService:
         self._observe_resting_buy_quality(
             snapshot=snapshot, lifecycle=lifecycle, side_index=side_index, order_age_sec=age,
         )
+        # The reviewed stale-passive policy is deliberately narrower than the
+        # ordinary requote lane: only an owned BUY with no durable official
+        # fill and fresh zero account inventory may be cancelled at 60s.
+        # It never makes a replacement decision in this tick.
+        if config.stale_entry_cancel_enabled and age is not None and age >= config.stale_entry_cancel_sec:
+            official_fill = self.store.official_buy_fill(
+                outcome_id=snapshot.market.outcome_id, coin=coin, order_id=lifecycle.order_id,
+            )
+            if official_fill is not None:
+                self.store.record(
+                    lifecycle, reason="stale_zero_fill_cancel_refused_official_fill_present",
+                    extra={"state": "RECONCILE_REQUIRED", "trade_id": official_fill.get("trade_id")},
+                )
+                return LiveExecutionResult(
+                    "reconcile_required", "stale zero-fill cancel refused: official buy fill present", lifecycle.order_id,
+                )
+            audit = self.store.submit_audit(order_id=lifecycle.order_id, coin=coin) or {}
+            decision_at_ms = audit.get("target_decision_at_ms")
+            try:
+                decision_at_ms = int(decision_at_ms) if decision_at_ms is not None else None
+            except (TypeError, ValueError):
+                decision_at_ms = None
+            if self.store.record_stale_cancel_decision(
+                lifecycle=lifecycle, decision_at_ms=decision_at_ms, order_age_sec=age,
+            ) is None:
+                return LiveExecutionResult("blocked", "stale zero-fill cancel durable decision unavailable", lifecycle.order_id)
+            stale_plan = EntryQuotePlan(EntryQuoteAction.CANCEL, "stale_zero_fill_60s")
+            try:
+                result = self.controller.execute_cancel(
+                    market=snapshot.market, side_index=side_index, lifecycle=lifecycle, plan=stale_plan,
+                )
+            except Exception:
+                self.store.record(lifecycle, reason="stale_zero_fill_cancel_exception", extra={"state": "RECONCILE_REQUIRED"})
+                return LiveExecutionResult("reconcile_required", "stale zero-fill cancel exception; reconciliation required", lifecycle.order_id)
+            self._record_cancel(snapshot=snapshot, coin=coin, lifecycle=lifecycle,
+                                result=result, reason=stale_plan.reason, fast_risk=None)
+            if result.state != "cancelled":
+                return LiveExecutionResult(result.state, result.detail, result.old_order_id)
+            expired = self.store.record_stale_cancel_confirmed(
+                lifecycle=lifecycle, decision_at_ms=decision_at_ms, order_age_sec=age,
+            )
+            if expired is None:
+                return LiveExecutionResult("blocked", "stale cancel confirmed but decision expiry persistence unavailable", lifecycle.order_id)
+            return LiveExecutionResult("cancelled", "stale zero-fill BUY cancelled; old decision expired pending re-arm", lifecycle.order_id)
         fast_confirmed, fast_reason, fast_evidence = (False, "fast_risk_unavailable", {})
         if self.fast_risk_decision is not None:
             fast_confirmed, fast_reason, fast_evidence = self.fast_risk_decision(

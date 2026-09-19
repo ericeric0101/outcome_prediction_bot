@@ -37,6 +37,11 @@ class OutcomeLiveStrategyConfig:
     # strategy branch.  It is false by default; its numeric policy is
     # code-owned so an operator cannot accidentally tune it per launch.
     trend_continuation_enabled: bool = False
+    # This is the sole admission-policy change in the stale-passive release.
+    # It is explicitly opt-in and production is pinned to 60 seconds; callers
+    # may not use this as a general requote tuning surface.
+    stale_entry_cancel_enabled: bool = False
+    stale_entry_cancel_sec: int = 60
 
     @classmethod
     def from_env(cls) -> "OutcomeLiveStrategyConfig":
@@ -54,6 +59,8 @@ class OutcomeLiveStrategyConfig:
             min_entry_price=Decimal(os.environ.get("OUTCOME_LIVE_STRATEGY_MIN_ENTRY_PRICE", "0.55")),
             tier_b_enabled=os.environ.get("OUTCOME_TIER_B_ENABLED", "0").strip().lower() in {"1", "true", "yes", "on"},
             trend_continuation_enabled=os.environ.get("OUTCOME_TREND_CONTINUATION_ENABLED", "0").strip().lower() in {"1", "true", "yes", "on"},
+            stale_entry_cancel_enabled=os.environ.get("OUTCOME_STALE_ENTRY_CANCEL_ENABLED", "0").strip().lower() in {"1", "true", "yes", "on"},
+            stale_entry_cancel_sec=int(os.environ.get("OUTCOME_STALE_ENTRY_CANCEL_SEC", "60")),
         )
         if not (Decimal("0") <= value.floor_return_pct <= value.narrow_return_pct <= value.target_return_pct < Decimal("1")):
             raise ValueError("live strategy return tiers must satisfy 0 <= floor <= narrow <= target < 1")
@@ -65,6 +72,8 @@ class OutcomeLiveStrategyConfig:
             raise ValueError("live strategy thresholds must be non-negative")
         if not Decimal("0") < value.min_entry_price < value.max_entry_price < Decimal("1"):
             raise ValueError("live strategy entry price band must satisfy 0 < min < max < 1")
+        if value.stale_entry_cancel_enabled and value.stale_entry_cancel_sec != 60:
+            raise ValueError("stale entry cancellation is pinned to the reviewed 60-second production threshold")
         return value
 
 
