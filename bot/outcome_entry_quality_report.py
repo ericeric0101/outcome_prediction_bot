@@ -5,7 +5,9 @@ import argparse
 import json
 import sqlite3
 from collections import Counter, defaultdict
+from datetime import datetime
 from pathlib import Path
+from statistics import mean, median
 from typing import Any
 
 
@@ -17,10 +19,37 @@ def _payload(raw: object) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
+def _markout_summary(values: list[float]) -> dict[str, Any]:
+    """Summarise observed P3 values without claiming counterfactual PnL."""
+    if not values:
+        return {"n": 0, "mean": None, "median": None, "negative_rate": None}
+    return {
+        "n": len(values),
+        "mean": mean(values),
+        "median": median(values),
+        "negative_rate": sum(value < 0 for value in values) / len(values),
+    }
+
+
+def _timestamp(value: object) -> datetime | None:
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+
+
+def _number(value: object) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def report(db_path: str | Path, *, period: str = "1d") -> dict[str, Any]:
     """Summarise shadow action candidates; never query the exchange."""
     uri = f"file:{Path(db_path).resolve()}?mode=ro"
     with sqlite3.connect(uri, uri=True) as conn:
+        tables = {str(row[0]) for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         rows = conn.execute(
             """SELECT ts,event_type,payload_json FROM strategy_events
                WHERE event_type IN ('OUTCOME_ENTRY_QUALITY_SHADOW','OUTCOME_POST_FILL_QUALITY_SHADOW')
@@ -29,6 +58,14 @@ def report(db_path: str | Path, *, period: str = "1d") -> dict[str, Any]:
         markout_rows = conn.execute(
             """SELECT payload_json FROM order_events WHERE event_type='FILL_MARKOUT' ORDER BY id"""
         ).fetchall()
+        holding_rows = conn.execute(
+            """SELECT ts,payload_json FROM strategy_events
+               WHERE event_type='OUTCOME_HOLDING_PATH_OBSERVATION' ORDER BY id"""
+        ).fetchall()
+        pnl_rows = conn.execute(
+            """SELECT open_trade_id,realized_net_usdc,recorded_at
+               FROM outcome_realized_pnl_lots"""
+        ).fetchall() if "outcome_realized_pnl_lots" in tables else []
     observations = [(str(ts), str(kind), _payload(raw)) for ts, kind, raw in rows]
     prefill = [item for item in observations if item[1] == "OUTCOME_ENTRY_QUALITY_SHADOW" and item[2].get("period") == period]
     postfill = [item for item in observations if item[1] == "OUTCOME_POST_FILL_QUALITY_SHADOW" and item[2].get("period") == period]
@@ -45,10 +82,87 @@ def report(db_path: str | Path, *, period: str = "1d") -> dict[str, Any]:
         if fill_id is not None and horizon is not None:
             p3[str(fill_id)][str(horizon)] = payload.get("signed_markout_ps")
     postfill_by_trade: dict[str, dict[str, Any]] = {}
+    scratch_by_trade: dict[str, dict[str, Any]] = {}
     for ts, _kind, payload in postfill:
         trade_id = str(payload.get("fill_trade_id") or "")
         if trade_id:
             postfill_by_trade.setdefault(trade_id, {"first_seen_at": ts, "payload": payload})
+            shadow = payload.get("post_fill_scratch_shadow")
+            if isinstance(shadow, dict) and shadow.get("action") == "SCRATCH_IOC_COUNTERFACTUAL":
+                scratch_by_trade.setdefault(trade_id, {"first_seen_at": ts, "payload": payload})
+    postfill_markout_groups: dict[str, dict[str, list[float]]] = {
+        "ever_scratch_candidate": defaultdict(list),
+        "never_scratch_candidate": defaultdict(list),
+    }
+    for trade_id, horizons in p3.items():
+        if trade_id not in postfill_by_trade:
+            continue
+        group = "ever_scratch_candidate" if trade_id in scratch_by_trade else "never_scratch_candidate"
+        for horizon, value in horizons.items():
+            try:
+                postfill_markout_groups[group][horizon].append(float(value))
+            except (TypeError, ValueError):
+                continue
+
+    paths_by_trade: dict[str, list[tuple[datetime, float]]] = defaultdict(list)
+    for ts, raw in holding_rows:
+        payload = _payload(raw)
+        trade_id = str(payload.get("entry_trade_id") or "")
+        at = _timestamp(ts)
+        net_return = _number(payload.get("marketable_net_exit_vs_entry_pct"))
+        if net_return is None:
+            net_return = _number(payload.get("net_exit_vs_entry_pct"))
+        if trade_id and at is not None and net_return is not None:
+            paths_by_trade[trade_id].append((at, net_return))
+    for values in paths_by_trade.values():
+        values.sort(key=lambda item: item[0])
+
+    realized_by_trade: dict[str, float] = defaultdict(float)
+    close_at_by_trade: dict[str, str] = {}
+    for trade_id, realized, recorded_at in pnl_rows:
+        value = _number(realized)
+        if value is None:
+            continue
+        key = str(trade_id)
+        realized_by_trade[key] += value
+        close_at_by_trade[key] = max(close_at_by_trade.get(key, ""), str(recorded_at or ""))
+
+    scratch_lifecycle_outcomes: list[dict[str, Any]] = []
+    for trade_id, scratch in sorted(scratch_by_trade.items(), key=lambda item: str(item[1]["first_seen_at"])):
+        scratch_at = _timestamp(scratch["first_seen_at"])
+        path = paths_by_trade.get(trade_id, [])
+        path_windows: dict[str, Any] = {}
+        for horizon_sec in (30, 60, 120):
+            values = [
+                (at, net_return) for at, net_return in path
+                if scratch_at is not None and at >= scratch_at
+                and (at - scratch_at).total_seconds() <= horizon_sec
+            ]
+            recovery = next((at.isoformat() for at, net_return in values if net_return >= 0), None)
+            path_windows[str(horizon_sec)] = {
+                "samples": len(values),
+                "minimum_executable_return_pct": min((value for _at, value in values), default=None),
+                "maximum_executable_return_pct": max((value for _at, value in values), default=None),
+                "recovered_to_nonnegative_at": recovery,
+            }
+        realized = realized_by_trade.get(trade_id)
+        outcome = (
+            "realized_profit_recovery" if realized is not None and realized > 0
+            else "realized_loss_persistent" if realized is not None and realized < 0
+            else "flat_or_unknown_final_outcome"
+        )
+        scratch_lifecycle_outcomes.append({
+            "fill_trade_id": trade_id,
+            "first_scratch_at": scratch["first_seen_at"],
+            "outcome_id": scratch["payload"].get("outcome_id"),
+            "order_id": scratch["payload"].get("order_id"),
+            "executable_return_pct_at_first_scratch": scratch["payload"].get("executable_return_pct"),
+            "post_scratch_executable_path": path_windows,
+            "canonical_realized_net_usdc": realized,
+            "canonical_close_at": close_at_by_trade.get(trade_id),
+            "classification": outcome,
+        })
+    scratch_outcome_counts = Counter(item["classification"] for item in scratch_lifecycle_outcomes)
     signal_states = Counter(str(payload.get("signal_state") or "unknown") for _ts, _kind, payload in prefill)
     actions = Counter(
         str((payload.get("stale_cancel_shadow") or {}).get("action") or "unknown")
@@ -65,10 +179,21 @@ def report(db_path: str | Path, *, period: str = "1d") -> dict[str, Any]:
             {"fill_trade_id": trade_id, **value, "p3_signed_markout_ps": p3.get(trade_id, {})}
             for trade_id, value in sorted(postfill_by_trade.items())
         ],
+        "postfill_scratch_p3_comparison": {
+            group: {
+                horizon: _markout_summary(values)
+                for horizon, values in sorted(horizons.items(), key=lambda item: int(item[0]))
+            }
+            for group, horizons in postfill_markout_groups.items()
+        },
+        "postfill_scratch_lifecycle_outcomes": scratch_lifecycle_outcomes,
+        "postfill_scratch_lifecycle_outcome_counts": dict(scratch_outcome_counts),
         "limits": [
             "Shadow candidates are not fills, cancellations, or IOC simulations.",
             "IOC counterfactual uses only as-of top-of-book and excludes full-depth/slippage/fee certainty.",
             "P3 markout is joined only by immutable official fill trade ID when available.",
+            "A scratch candidate means its observed path crossed the shadow watch; it does not prove an IOC would have filled at that price or improved lifecycle PnL.",
+            "A later positive canonical FIFO result establishes that a blanket scratch would have cut a winning lifecycle; it does not reconstruct the exact hypothetical IOC fill.",
         ],
         "promotion_blockers": [
             "Need independent daily markets and official fill/P3 outcomes before any live cancellation or active-entry canary.",

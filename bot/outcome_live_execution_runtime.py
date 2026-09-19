@@ -231,6 +231,7 @@ class OutcomeLiveExecutionRuntime:
         self.entry_execution_service = OutcomeEntryExecutionService(
             recovery=self.recovery, gateway=self.machine.gateway, machine=self.machine,
             store=self.entry_lifecycle_store, planner=self.entry_planner,
+            exit_store=self.exit_lifecycle_store,
             controller=self.entry_requote_controller, ledger=self.ledger,
             loss_reentry_gate=self.loss_reentry_gate, record_result=self._record,
             fast_risk_decision=self._entry_fast_risk_decision,
@@ -371,13 +372,24 @@ class OutcomeLiveExecutionRuntime:
         """Attach the launcher's cross-validated user-order observation."""
         self._account_reads.set_open_orders_stream(stream)
 
-    def _should_sync_fills(self, *, active: list[object], pending_owned_entry: bool, now: float) -> bool:
-        """Reserve high-weight fill reads for deadlines or unsafe account states."""
-        urgent = pending_owned_entry or any(
+    def _should_sync_fills(
+        self, *, active: list[object], pending_owned_entry: bool, now: float,
+        pending_owned_exit: bool = False,
+    ) -> bool:
+        """Reserve synchronous high-weight fill reads for unsafe states only.
+
+        The read-only research worker independently records the ordinary
+        30-second ``userFills`` evidence stream. Keeping that periodic read
+        out of a flat live tick prevents non-decision research latency from
+        delaying an entry decision. A fill that could leave inventory
+        unprotected, or an owned BUY that disappeared from account truth,
+        remains an immediate synchronous reconciliation boundary.
+        """
+        urgent = pending_owned_entry or pending_owned_exit or any(
             str(getattr(finding, "state", "")) in {"unprotected_inventory", "conflicting_orders", "orphan_sell"}
             for finding in active
         )
-        return urgent or now - self._last_fill_sync_at >= 30.0
+        return urgent
 
     @staticmethod
     def _audit_decimal(audit: dict[str, object], name: str) -> Decimal | None:
@@ -779,11 +791,28 @@ class OutcomeLiveExecutionRuntime:
                 if result.audit.get("entry_policy_schema_version") == 1 and result.audit.get("entry_policy_kind") in {
                     "s0_oi_spot_mark_confirmation", "s0_spot_mark_tier_b",
                 }:
-                    self.entry_lifecycle_store.record(OutcomeEntryLifecycle(
+                    persisted = self.entry_lifecycle_store.record(OutcomeEntryLifecycle(
                         wallet=self.recovery.wallet, outcome_id=market.outcome_id, coin=coin,
-                        order_id=str(result.order_id), price=Decimal(str(result.audit["entry_bid_at_decision"])),
+                        order_id=str(result.order_id),
+                        # The state machine can refresh the book between the
+                        # admission decision and venue submit.  Lifecycle
+                        # quote management must track the accepted limit,
+                        # never the earlier decision snapshot.
+                        price=Decimal(str(result.audit.get(
+                            "entry_submit_bid", result.audit["entry_bid_at_decision"],
+                        ))),
                         replacement_count=0, state="BUY_RESTING",
-                    ), reason="initial_audited_s0_alo_buy")
+                    ), reason="initial_audited_s0_alo_buy", durable=True)
+                    if persisted is None:
+                        # The exchange already accepted this BUY.  Do not
+                        # continue as if later cancel/requote ownership were
+                        # established: the durable pre-submit intent plus
+                        # account-truth recovery is the only safe route.
+                        return LiveExecutionResult(
+                            "blocked",
+                            "acknowledged entry ownership persistence failed; reconciliation required",
+                            str(result.order_id),
+                        )
                     intent_id = result.audit.get("entry_intent_id")
                     if intent_id and self.ledger is not None:
                         self.ledger.journal.log_strategy_event(self.ledger.run_id, "OUTCOME_ORDER_INTENT_ACK", {
@@ -1771,6 +1800,11 @@ class OutcomeLiveExecutionRuntime:
                            reduce_only: bool = False) -> LiveExecutionResult:
         """Run S0 and durably record its final admission or rejection reason."""
         self._begin_tick()
+        # Preserve the upstream S0 evaluation time across the potentially
+        # slower recovery/holding stages.  A decision that predates an owned
+        # TP fill must not be allowed to reopen the same exposure afterwards.
+        entry_evidence = dict(entry_evidence)
+        entry_evidence.setdefault("decision_observed_at_ms", int(time.time() * 1000))
         started_at = time.monotonic()
         admission: dict[str, object] = {}
         result = self._tick_live_strategy(
@@ -1792,6 +1826,13 @@ class OutcomeLiveExecutionRuntime:
                 "venue": "hyperliquid_outcome", "outcome_id": market.outcome_id,
                 "runtime_state": result.state, "total_ms": total_ms,
                 "account_recovery_ms": admission.get("timing_account_recovery_ms"),
+                "exit_recovery_ms": admission.get("timing_exit_recovery_ms"),
+                "exit_continuations_ms": admission.get("timing_exit_continuations_ms"),
+                "fill_sync_ms": admission.get("timing_fill_sync_ms"),
+                "holding_before_stream_ms": admission.get("timing_holding_before_stream_ms"),
+                "stream_gate_ms": admission.get("timing_stream_gate_ms"),
+                "holding_after_stream_ms": admission.get("timing_holding_after_stream_ms"),
+                "entry_preflight_ms": admission.get("timing_entry_preflight_ms"),
                 "research_shadow_ms": admission.get("timing_research_shadow_ms"),
                 "research_shadow_stages_ms": admission.get("timing_research_shadow_stages_ms"),
                 "book_request_ms": admission.get("timing_entry_book_request_ms"),
@@ -1839,12 +1880,6 @@ class OutcomeLiveExecutionRuntime:
             "safe_for_new_entry": bool(getattr(report, "safe_for_new_entry", False)),
             "reason": str(getattr(report, "reason", "unknown")),
         }
-        self.exit_recovery_service.reconcile(market=market, report=report)
-        self._capture_due_exit_continuations(market=market)
-        exit_ambiguity = self.exit_recovery_service.ambiguity_barrier(market=market)
-        if exit_ambiguity is not None:
-            admission["ambiguous_exit_fence"] = "pending"
-            return exit_ambiguity
         retired_active = [
             finding for finding in report.findings
             if finding.market_id != market.outcome_id and finding.state != "flat"
@@ -1862,6 +1897,12 @@ class OutcomeLiveExecutionRuntime:
             ) is not None
             for coin in (market.yes_coin, market.no_coin)
         )
+        pending_owned_exit = self.exit_lifecycle_store is not None and any(
+            self.exit_lifecycle_store.recover(
+                wallet=self.recovery.wallet, outcome_id=market.outcome_id, coin=coin,
+            ) is not None
+            for coin in (market.yes_coin, market.no_coin)
+        )
         # ``userFills`` has a high /info weight.  Account recovery already
         # reads balances and open orders every decision, so a healthy resting
         # BUY or covering SELL does not justify downloading the entire fill
@@ -1871,7 +1912,11 @@ class OutcomeLiveExecutionRuntime:
         # Stable states use a 30-second audit cadence; research owns its own
         # independent 30-second markout ingestion.
         now_monotonic = time.monotonic()
-        if self._should_sync_fills(active=active, pending_owned_entry=pending_owned_entry, now=now_monotonic):
+        if self._should_sync_fills(
+            active=active, pending_owned_entry=pending_owned_entry,
+            pending_owned_exit=pending_owned_exit, now=now_monotonic,
+        ):
+            fill_sync_started_at = time.monotonic()
             try:
                 self.ledger.sync_fills(
                     fills=self.recovery.account.get_user_fills_sync(self.recovery.wallet),
@@ -1882,6 +1927,22 @@ class OutcomeLiveExecutionRuntime:
                 # Account recovery remains the hard safety source; missing
                 # fill history means no inferred loss/re-entry transition.
                 pass
+            finally:
+                admission["timing_fill_sync_ms"] = round((time.monotonic() - fill_sync_started_at) * 1000, 3)
+        else:
+            admission["timing_fill_sync_ms"] = 0.0
+        # Do not terminalise a locally owned SELL from a possibly stale
+        # account snapshot before its official fill has been synchronized.
+        exit_recovery_started_at = time.monotonic()
+        self.exit_recovery_service.reconcile(market=market, report=report)
+        admission["timing_exit_recovery_ms"] = round((time.monotonic() - exit_recovery_started_at) * 1000, 3)
+        continuation_started_at = time.monotonic()
+        self._capture_due_exit_continuations(market=market)
+        admission["timing_exit_continuations_ms"] = round((time.monotonic() - continuation_started_at) * 1000, 3)
+        exit_ambiguity = self.exit_recovery_service.ambiguity_barrier(market=market)
+        if exit_ambiguity is not None:
+            admission["ambiguous_exit_fence"] = "pending"
+            return exit_ambiguity
         admission["active_current_market_count"] = len(active)
         snapshot = OutcomeRuntimeTickSnapshot(
             market=market, report=report, active=tuple(active),
@@ -1889,6 +1950,10 @@ class OutcomeLiveExecutionRuntime:
             entry_side_index=entry_side_index, entry_reason=entry_reason,
             reduce_only=reduce_only, observed_monotonic=time.monotonic(),
             market_context=dict(market_context or {}),
+            entry_decision_at_ms=(
+                int(entry_evidence["decision_observed_at_ms"])
+                if entry_evidence.get("decision_observed_at_ms") is not None else None
+            ),
         )
         self._current_tick_snapshot = snapshot
         self._record_entry_gate_decision(
@@ -1900,22 +1965,30 @@ class OutcomeLiveExecutionRuntime:
         )
         if fill_visibility_barrier is not None:
             return fill_visibility_barrier
+        holding_before_started_at = time.monotonic()
         holding_result = self.holding_supervisor.manage_before_stream_gate(
             self, snapshot=snapshot, config=config,
         )
+        admission["timing_holding_before_stream_ms"] = round((time.monotonic() - holding_before_started_at) * 1000, 3)
         if holding_result is not None:
             return holding_result
+        stream_gate_started_at = time.monotonic()
         health_error = self._stream_ready(market)
+        admission["timing_stream_gate_ms"] = round((time.monotonic() - stream_gate_started_at) * 1000, 3)
         if health_error and not (reduce_only and active):
             admission["market_data_gate"] = health_error.detail
             return health_error
         admission["market_data_gate"] = "ws_fresh" if health_error is None else "ws_stale_existing_exit_rest_fallback"
+        holding_after_started_at = time.monotonic()
         holding_result = self.holding_supervisor.manage_after_stream_gate(self, snapshot=snapshot)
+        admission["timing_holding_after_stream_ms"] = round((time.monotonic() - holding_after_started_at) * 1000, 3)
         if holding_result is not None:
             return holding_result
+        entry_preflight_started_at = time.monotonic()
         entry_preflight = self.entry_supervisor.preflight(
             self, snapshot=snapshot, admission=admission, config=config,
         )
+        admission["timing_entry_preflight_ms"] = round((time.monotonic() - entry_preflight_started_at) * 1000, 3)
         if entry_preflight is not None:
             return entry_preflight
         fees = self.recovery.account.get_user_fees_sync(self.recovery.wallet)

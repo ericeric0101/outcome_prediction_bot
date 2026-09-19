@@ -254,7 +254,10 @@ def run_integrated_hyperliquid_bot(
         # Keep capture off the wallet/execution loop.  This client is used
         # exclusively by the worker, whose code has no order submission or
         # cancellation path.
-        research_client = OutcomeClient(auth, timeout_sec=5.0)
+        # Research is useful but never an execution dependency. One bounded
+        # attempt prevents its read-only retries from competing with account
+        # truth on the shared venue /info lane.
+        research_client = OutcomeClient(auth, timeout_sec=3.0, info_max_retries=1)
         research_capture = OutcomeResearchCapture(
             client=research_client, wallet_address=auth.wallet_address, journal=live_journal,
         )
@@ -292,7 +295,10 @@ def run_integrated_hyperliquid_bot(
         from bot.outcome_settlement import OutcomeSettlementAdapter
         from bot.outcome_pnl_reconciliation import OutcomePnLReconciler
         settlement_worker = OutcomeSettlementWorker(
-            account=OutcomeClient(auth, timeout_sec=10.0, info_max_retries=3),
+            # Settlement is background housekeeping. It must yield rather
+            # than retry/back off on the shared venue while the live runtime
+            # is protecting an active position.
+            account=OutcomeClient(auth, timeout_sec=3.0, info_max_retries=1),
             settlement_adapter=OutcomeSettlementAdapter(),
             pnl_reconciler=OutcomePnLReconciler(live_journal, f"outcome-pnl-{uuid.uuid4().hex[:10]}"),
             journal=live_journal, interval_sec=60.0,

@@ -172,8 +172,13 @@ class OutcomeSettlementWorker:
                 "venue": "hyperliquid_outcome", "error_type": type(exc).__name__, "error": str(exc),
             })
             return
-        payout_history = self._capture_payout_fill_window()
-        for outcome_id in sorted(candidates - self._settled_ids):
+        pending_candidates = candidates - self._settled_ids
+        # Payout history is evidence only for a pending settlement. With no
+        # candidate it is needless high-weight /info traffic, and can compete
+        # with live account reconciliation despite owning no current-market
+        # safety decision.
+        payout_history = self._capture_payout_fill_window() if pending_candidates else []
+        for outcome_id in sorted(pending_candidates):
             if now - self._last_attempt_at.get(outcome_id, 0.0) < self.interval_sec:
                 continue
             self._last_attempt_at[outcome_id] = now

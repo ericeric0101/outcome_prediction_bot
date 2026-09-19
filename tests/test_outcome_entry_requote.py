@@ -88,6 +88,30 @@ def test_entry_store_adopts_only_exact_audited_s0_buy(tmp_path):
     ]) is None
 
 
+def test_entry_store_adopts_exact_actual_submit_price_when_book_moved_after_decision(tmp_path):
+    """Recovery must use the immutable submitted price, not stale decision BBO."""
+    journal = TradeJournalDB(tmp_path / "actual-submit-price.db")
+    store = OutcomeEntryLifecycleStore(journal, "run")
+    journal.log_order_event("run", "ORDER_SUBMIT", venue_order_id="buy-moved", side="BUY",
+                            status="RESTING", instrument_id="#13561", payload={
+        "venue": "hyperliquid_outcome", "outcome_id": 1356, "coin": "#13561",
+        "audit": {
+            "entry_policy_schema_version": 1,
+            "entry_policy_kind": "s0_oi_spot_mark_confirmation",
+            "entry_bid_at_decision": "0.57000",
+            "entry_submit_bid": "0.56250",
+        },
+    })
+    lifecycle = store.recover_or_adopt_audited_submit(
+        wallet="w", outcome_id=1356, coin="#13561", open_orders=[
+            {"coin": "#13561", "side": "B", "oid": "buy-moved", "limitPx": "0.56250"},
+        ],
+    )
+    assert lifecycle is not None
+    assert lifecycle.order_id == "buy-moved"
+    assert lifecycle.price == Decimal("0.56250")
+
+
 def test_entry_store_recovers_exact_durable_pre_submit_intent_after_crash(tmp_path):
     """Venue-accepted BUYs are recoverable even if ORDER_SUBMIT was never written."""
     journal = TradeJournalDB(tmp_path / "entry_intent.db")

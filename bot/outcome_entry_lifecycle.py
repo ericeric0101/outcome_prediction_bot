@@ -38,14 +38,25 @@ class OutcomeEntryLifecycleStore:
         self.journal, self.run_id = journal, run_id
 
     def record(self, lifecycle: OutcomeEntryLifecycle, *, reason: str,
-               extra: dict[str, Any] | None = None) -> None:
-        self.journal.log_strategy_event(self.run_id, self.EVENT, {
+               extra: dict[str, Any] | None = None, durable: bool = False) -> int | None:
+        """Persist ownership state and return its journal event id.
+
+        Initial ownership after a venue-acknowledged BUY is safety-critical:
+        without it the bot can see a real open BUY but cannot prove it owns
+        that order on the next tick.  Callers use ``durable=True`` for that
+        acknowledgement boundary; routine observational state transitions may
+        remain normal journal writes.
+        """
+        payload = {
             "venue": "hyperliquid_outcome", "wallet": lifecycle.wallet,
             "outcome_id": lifecycle.outcome_id, "coin": lifecycle.coin,
             "order_id": lifecycle.order_id, "price": str(lifecycle.price),
             "replacement_count": lifecycle.replacement_count, "state": lifecycle.state,
             "reason": reason, **(extra or {}),
-        })
+        }
+        if durable:
+            return self.journal.log_durable_strategy_event(self.run_id, self.EVENT, payload)
+        return self.journal.log_strategy_event(self.run_id, self.EVENT, payload)
 
     def recover(self, *, wallet: str, outcome_id: int, coin: str) -> OutcomeEntryLifecycle | None:
         try:
@@ -303,7 +314,14 @@ class OutcomeEntryLifecycleStore:
                 return None
             if int(payload.get("outcome_id")) != outcome_id or str(payload.get("coin")) != coin:
                 return None
-            price = Decimal(str(audit["entry_bid_at_decision"]))
+            # A post-only submit is allowed to use a fresh book after the
+            # strategy decision.  ``entry_bid_at_decision`` is therefore not
+            # necessarily the price which actually reached the venue.  The
+            # immutable ORDER_SUBMIT audit records that actual submitted
+            # limit; use it when present, or retain the pre-submit equality
+            # requirement for the crash-window intent-only fallback.
+            submitted_price = audit.get("entry_submit_bid", audit["entry_bid_at_decision"])
+            price = Decimal(str(submitted_price))
             order_price = Decimal(str(order.get("limitPx", order.get("px", "0"))))
             if not Decimal("0") < price < Decimal("1") or order_price != price:
                 return None

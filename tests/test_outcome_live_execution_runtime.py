@@ -84,7 +84,7 @@ def test_runtime_blocks_cross_side_existing_exposure(monkeypatch):
     assert runtime.tick(market=market(), side_index=0, entry_permitted=True).state == "blocked"
 
 
-def test_high_weight_fill_sync_is_cadenced_but_unsafe_inventory_is_immediate():
+def test_high_weight_fill_sync_is_backgrounded_when_safe_but_unsafe_inventory_is_immediate():
     runtime = OutcomeLiveExecutionRuntime(account=Account(), wallet="w", gateway=Gateway())
     runtime._last_fill_sync_at = 100.0
     assert runtime._should_sync_fills(
@@ -95,7 +95,7 @@ def test_high_weight_fill_sync_is_cadenced_but_unsafe_inventory_is_immediate():
     ) is False
     assert runtime._should_sync_fills(
         active=[SimpleNamespace(state="protected_inventory")], pending_owned_entry=False, now=130.0,
-    ) is True
+    ) is False
     assert runtime._should_sync_fills(
         active=[SimpleNamespace(state="unprotected_inventory")], pending_owned_entry=False, now=101.5,
     ) is True
@@ -1001,6 +1001,14 @@ def test_runtime_closes_stale_lifecycle_after_exchange_fill_reconciliation(monke
     ledger = OutcomeExecutionLedger(journal, "run")
     store = OutcomeExitLifecycleStore(journal, "run")
     store.record(OutcomeExitLifecycle("w", 1153, "#11530", "filled-sell", Decimal("13"), Decimal("0.85"), 0, "SELL_RESTING"), reason="fixture")
+    # A flat account snapshot alone is not terminal proof.  The user-fill
+    # bridge supplies the independent evidence that this exact owned SELL
+    # actually executed.
+    journal.log_order_event(
+        "run", "ORDER_FILLED", venue_order_id="filled-sell", side="SELL",
+        instrument_id="#11530", price=0.85, qty=13,
+        payload={"venue": "hyperliquid_outcome", "actual_fill": True},
+    )
     runtime = OutcomeLiveExecutionRuntime(account=Account(), wallet="w", gateway=Gateway(), ledger=ledger, exit_lifecycle_store=store)
     runtime.tick_market(market=market(), entry_side_index=None)
     assert store.recover(wallet="w", outcome_id=1153, coin="#11530") is None

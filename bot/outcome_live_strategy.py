@@ -282,6 +282,11 @@ class OutcomeOiEntryGate:
             mark_5m_bps=mark_return_bps,
         )
         evidence = {
+            # This is the time the complete S0 predicate was evaluated, not
+            # an inferred market-data timestamp.  Admission uses it only to
+            # prevent a decision already in flight from reopening a position
+            # whose owned exit completes during the same loop.
+            "decision_observed_at_ms": now_ms,
             "oi_current_id": int(current[0]), "oi_prior_id": int(prior[0]), "oi_age_ms": age_ms,
             "spot_strike_bps": str(spot_strike_bps), "oi_return_bps": str(oi_return_bps),
             "mark_return_bps": str(mark_return_bps), "oi_lookback_sec": self.config.oi_lookback_sec,

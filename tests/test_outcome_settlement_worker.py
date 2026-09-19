@@ -87,3 +87,18 @@ def test_settlement_worker_persists_payout_cursor_and_logs_pending_only_on_trans
         assert conn.execute(
             "SELECT status FROM outcome_settlement_status WHERE outcome_id=1153"
         ).fetchone()[0] == "pending_winning_payout_evidence"
+
+
+def test_settlement_worker_skips_payout_history_without_pending_candidates(tmp_path):
+    journal = TradeJournalDB(tmp_path / "worker.db")
+    account, adapter, reconciler = CursorAccount(), Adapter(), Reconciler()
+    worker = OutcomeSettlementWorker(
+        account=account, settlement_adapter=adapter, pnl_reconciler=reconciler,
+        journal=journal, interval_sec=30,
+    )
+
+    worker.run_once(now_monotonic=31)
+
+    assert account.by_time_calls == []
+    assert account.calls == []
+    assert adapter.calls == []

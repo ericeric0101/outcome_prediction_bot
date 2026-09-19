@@ -306,6 +306,45 @@ class OutcomeExitLifecycleStore:
         except (KeyError, TypeError, ValueError, sqlite3.Error, json.JSONDecodeError):
             return None
 
+    def latest_owned_sell_fill_at_ms(
+        self, *, wallet: str, outcome_id: int, coin: str,
+    ) -> tuple[int, str] | None:
+        """Return a completed SELL only when its bot ownership is provable.
+
+        A user-fill row alone is not sufficient: it could be a manual order.
+        The matching local ``ORDER_SUBMIT`` is immutable evidence that this
+        runtime owned the exact order.  This is an admission fence, never a
+        source for inventory or fill-size inference.
+        """
+        try:
+            with sqlite3.connect(f"file:{self.journal.db_path}?mode=ro", uri=True) as conn:
+                row = conn.execute(
+                    """
+                    SELECT filled.ts, filled.venue_order_id
+                    FROM order_events AS filled
+                    WHERE filled.event_type='ORDER_FILLED' AND filled.side='SELL'
+                      AND filled.instrument_id=?
+                      AND json_extract(filled.payload_json, '$.venue')='hyperliquid_outcome'
+                      AND json_extract(filled.payload_json, '$.actual_fill')=1
+                      AND EXISTS (
+                          SELECT 1 FROM order_events AS submitted
+                          WHERE submitted.event_type='ORDER_SUBMIT' AND submitted.side='SELL'
+                            AND submitted.venue_order_id=filled.venue_order_id
+                            AND submitted.instrument_id=filled.instrument_id
+                            AND json_extract(submitted.payload_json, '$.venue')='hyperliquid_outcome'
+                            AND json_extract(submitted.payload_json, '$.outcome_id')=?
+                      )
+                    ORDER BY filled.id DESC LIMIT 1
+                    """,
+                    (coin, int(outcome_id)),
+                ).fetchone()
+            if row is None:
+                return None
+            return (int(datetime.fromisoformat(str(row[0])).timestamp() * 1000), str(row[1]))
+        except (sqlite3.Error, TypeError, ValueError):
+            # A failed local audit read must not manufacture an authorization.
+            return None
+
     def loss_band_first_seen_ts(self, *, wallet: str, outcome_id: int, coin: str) -> float | None:
         """Return durable first passive-loss evidence, never a guessed timer."""
         try:
@@ -362,6 +401,23 @@ class OutcomeExitLifecycleStore:
         """True only after the bounded retry budget is exhausted."""
         return self.emergency_attempt_count(wallet=wallet, outcome_id=outcome_id, coin=coin) >= self.MAX_EMERGENCY_ATTEMPTS
 
+    def has_official_sell_fill(self, *, coin: str, order_id: str) -> bool:
+        """Whether the immutable user-fill bridge confirms this exact SELL."""
+        try:
+            with sqlite3.connect(f"file:{self.journal.db_path}?mode=ro", uri=True) as conn:
+                row = conn.execute(
+                    """SELECT 1 FROM order_events
+                       WHERE event_type='ORDER_FILLED' AND side='SELL'
+                         AND instrument_id=? AND venue_order_id=?
+                         AND json_extract(payload_json, '$.venue')='hyperliquid_outcome'
+                         AND json_extract(payload_json, '$.actual_fill')=1
+                       LIMIT 1""",
+                    (coin, str(order_id)),
+                ).fetchone()
+            return row is not None
+        except sqlite3.Error:
+            return False
+
     def reconcile_owned_sell(self, *, wallet: str, outcome_id: int, coin: str, inventory: Decimal,
                               open_orders: list[dict[str, Any]]) -> OutcomeExitLifecycle | None:
         status, adopted = self.reconcile_ambiguous_submit(
@@ -380,10 +436,18 @@ class OutcomeExitLifecycleStore:
             if row.get("coin") == coin and row.get("side") == "A"
         ]
         matching = [row for row in candidate_sells if str(row.get("oid")) == lifecycle.order_id]
-        # A closed lifecycle needs two independent account facts: no remaining
-        # inventory and absence of the owned order.  Either fact alone can be
-        # a partial-fill/cancel race and must remain reconciliation-only.
+        # A closed lifecycle needs an official fill in addition to two account
+        # facts: no remaining inventory and absence of the owned order.  A
+        # balance/open-order snapshot can briefly look flat while a maker SELL
+        # is in flight; terminalising from that transient view would permit a
+        # second BUY before the exit actually completes.
         if inventory <= 0 and not matching:
+            if not self.has_official_sell_fill(coin=coin, order_id=lifecycle.order_id):
+                self.record(
+                    lifecycle, reason="owned_sell_absent_waiting_for_official_fill",
+                    extra={"state": "RECONCILE_REQUIRED"}, durable=True,
+                )
+                return None
             closed = OutcomeExitLifecycle(
                 lifecycle.wallet, lifecycle.outcome_id, lifecycle.coin, lifecycle.order_id,
                 lifecycle.inventory, lifecycle.target_price, lifecycle.replacement_count, "CLOSED",

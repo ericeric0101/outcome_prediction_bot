@@ -19,6 +19,24 @@ def test_bootstrap_gate_rejects_thin_or_wide_tier_b_book(tmp_path):
     assert thin.allowed and thin.safe_max_shares == Decimal("4")
 
 
+def test_wide_spread_rejection_does_not_read_public_trade_flow(tmp_path, monkeypatch):
+    """A flow cap cannot rescue a spread-cap rejection, so skip its DB read."""
+    gate = OutcomeTierBExecutionGate(str(tmp_path / "journal.db"))
+
+    def _unexpected_flow_read(_coin):
+        raise AssertionError("wide-spread rejection must not read WS trade history")
+
+    monkeypatch.setattr(gate, "_recent_trade_shares", _unexpected_flow_read)
+    decision = gate.evaluate(
+        bid=Decimal("0.70"), ask=Decimal("0.72"),
+        bid_levels=[{"size": "100"}], requested_shares=Decimal("13"), coin="#yes",
+    )
+
+    assert not decision.allowed
+    assert decision.reason == "entry_spread_exceeds_calibrated_ceiling"
+    assert decision.recent_trade_shares is None
+
+
 def test_bootstrap_gate_sets_a_bounded_submit_price_drift_ceiling(tmp_path):
     journal = TradeJournalDB(tmp_path / "journal.db")
     decision = OutcomeTierBExecutionGate(journal.db_path).evaluate(

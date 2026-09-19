@@ -6,6 +6,7 @@ from decimal import Decimal
 from typing import Any, Callable, Protocol
 
 from bot.outcome_entry_lifecycle import OutcomeEntryLifecycleStore
+from bot.outcome_exit_lifecycle import OutcomeExitLifecycleStore
 from bot.outcome_exit_target_policy import OutcomeExitTargetDecision
 from bot.outcome_loss_reentry import OutcomeLossReentryDecision, OutcomeLossReentryGate
 from bot.outcome_sdk_sidecar import OutcomeSdkAmbiguousExecutionError
@@ -37,6 +38,7 @@ class OutcomeEntryExecutionService:
     def __init__(
         self, *, recovery: EntryRecoveryPort, gateway: EntryGatewayPort, machine: Any,
         store: OutcomeEntryLifecycleStore | None, planner: OutcomeEntryQuotePlanner,
+        exit_store: OutcomeExitLifecycleStore | None = None,
         controller: OutcomeEntryRequoteController | None = None,
         ledger: OutcomeExecutionLedger | None = None,
         loss_reentry_gate: OutcomeLossReentryGate | None = None,
@@ -49,6 +51,7 @@ class OutcomeEntryExecutionService:
         self.gateway = gateway
         self.machine = machine
         self.store = store
+        self.exit_store = exit_store
         self.planner = planner
         self.controller = controller
         self.ledger = ledger
@@ -71,6 +74,27 @@ class OutcomeEntryExecutionService:
         if snapshot.active:
             admission["account_gate"] = "existing_outcome_inventory_or_order"
             return LiveExecutionResult("blocked", "live strategy has existing Outcome inventory or order")
+
+        # The account snapshot can briefly look flat while a locally owned
+        # protective SELL is still resting or is in the process of filling.
+        # Its durable lifecycle is an additional safety fact: never submit a
+        # second BUY until that exact owned exit has reached terminal account
+        # truth.  This closes the TP-fill / new-BUY race without adopting any
+        # external or manual SELL.
+        if self.exit_store is not None:
+            for coin in (snapshot.market.yes_coin, snapshot.market.no_coin):
+                exit_lifecycle = self.exit_store.recover(
+                    wallet=self.recovery.wallet, outcome_id=snapshot.market.outcome_id, coin=coin,
+                )
+                if exit_lifecycle is not None:
+                    admission["owned_exit_lifecycle_fence"] = {
+                        "allowed": False, "coin": coin, "order_id": exit_lifecycle.order_id,
+                        "state": exit_lifecycle.state,
+                    }
+                    return LiveExecutionResult(
+                        "blocked", "owned protective exit pending terminal account reconciliation",
+                        exit_lifecycle.order_id,
+                    )
 
         if self.safety_preflight is not None:
             ready, reason = self.safety_preflight(outcome_id=snapshot.market.outcome_id)
@@ -117,6 +141,20 @@ class OutcomeEntryExecutionService:
 
         admission["selected_side_index"] = snapshot.entry_side_index
         admission["selected_coin"] = self.gateway.outcome_coin(snapshot.market, snapshot.entry_side_index)
+        if self.exit_store is not None and snapshot.entry_decision_at_ms is not None:
+            last_exit = self.exit_store.latest_owned_sell_fill_at_ms(
+                wallet=self.recovery.wallet, outcome_id=snapshot.market.outcome_id,
+                coin=str(admission["selected_coin"]),
+            )
+            if last_exit is not None and snapshot.entry_decision_at_ms <= last_exit[0]:
+                admission["post_exit_decision_fence"] = {
+                    "allowed": False, "decision_observed_at_ms": snapshot.entry_decision_at_ms,
+                    "owned_exit_filled_at_ms": last_exit[0], "owned_exit_order_id": last_exit[1],
+                }
+                return LiveExecutionResult(
+                    "flat", "live strategy no entry: decision predates completed owned exit",
+                    last_exit[1],
+                )
         if self.store is not None:
             cooldown = self.store.fast_rebook_cooldown_remaining(
                 wallet=self.recovery.wallet, outcome_id=snapshot.market.outcome_id,

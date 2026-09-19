@@ -54,3 +54,42 @@ def test_preflight_separates_reduce_only_no_signal_and_selected_coin():
         snapshot=snapshot(side_index=1), admission=admission, config=OutcomeLiveStrategyConfig(),
     )
     assert result is None and admission["selected_coin"] == "#no"
+
+
+def test_preflight_blocks_when_durable_protective_exit_exists_but_snapshot_is_stale():
+    """A locally owned SELL is sufficient to stop a second BUY race."""
+    exit_store = SimpleNamespace(
+        recover=lambda **_: SimpleNamespace(order_id="protective-sell", state="SELL_RESTING"),
+    )
+    recovery = SimpleNamespace(wallet="w", account=SimpleNamespace(get_open_orders_sync=lambda _wallet: []))
+    service = OutcomeEntryExecutionService(
+        recovery=recovery, gateway=Gateway(), machine=SimpleNamespace(), store=None,
+        exit_store=exit_store, planner=OutcomeEntryQuotePlanner(OutcomeEntryQuotePlannerConfig()),
+    )
+    admission = {}
+    result = service.preflight(
+        snapshot=snapshot(active=()), admission=admission, config=OutcomeLiveStrategyConfig(),
+    )
+    assert result is not None and result.state == "blocked"
+    assert result.order_id == "protective-sell"
+    assert admission["owned_exit_lifecycle_fence"]["state"] == "SELL_RESTING"
+
+
+def test_preflight_refuses_decision_that_started_before_owned_exit_fill():
+    exit_store = SimpleNamespace(
+        recover=lambda **_: None,
+        latest_owned_sell_fill_at_ms=lambda **_: (200, "completed-sell"),
+    )
+    recovery = SimpleNamespace(wallet="w", account=SimpleNamespace(get_open_orders_sync=lambda _wallet: []))
+    service = OutcomeEntryExecutionService(
+        recovery=recovery, gateway=Gateway(), machine=SimpleNamespace(), store=None,
+        exit_store=exit_store, planner=OutcomeEntryQuotePlanner(OutcomeEntryQuotePlannerConfig()),
+    )
+    old_decision = OutcomeRuntimeTickSnapshot(
+        **{**snapshot().__dict__, "entry_decision_at_ms": 199},
+    )
+    admission = {}
+    result = service.preflight(snapshot=old_decision, admission=admission, config=OutcomeLiveStrategyConfig())
+    assert result is not None and result.state == "flat"
+    assert result.order_id == "completed-sell"
+    assert admission["post_exit_decision_fence"]["owned_exit_filled_at_ms"] == 200

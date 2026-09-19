@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_FLOOR
 from typing import Any, Iterable
 
@@ -84,17 +85,27 @@ class OutcomeTierBExecutionGate:
         """
         if not coin:
             return None
+        # ``idx_strategy_events_type_id`` can return the latest bounded event
+        # window cheaply.  Do not put ``julianday(ts)`` in the SQL predicate:
+        # it forces SQLite to inspect every historical WS-trade event before
+        # applying LIMIT, which can stall the live decision loop as the raw
+        # journal grows.  The old query was intentionally bounded to 300 rows;
+        # retain that exact observation bound and apply the five-minute cutoff
+        # after the indexed read.
+        cutoff = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
         try:
             with sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True) as conn:
                 rows = conn.execute(
-                    """SELECT payload_json FROM strategy_events
-                       WHERE event_type='OUTCOME_WS_TRADES' AND julianday(ts)>=julianday('now','-5 minutes')
+                    """SELECT ts, payload_json FROM strategy_events
+                       WHERE event_type='OUTCOME_WS_TRADES'
                        ORDER BY id DESC LIMIT 300"""
                 ).fetchall()
         except sqlite3.Error:
             return None
         seen: set[str] = set(); total = Decimal("0"); found = False
-        for (raw,) in rows:
+        for timestamp, raw in rows:
+            if str(timestamp) < cutoff:
+                continue
             try:
                 payload = json.loads(raw or "{}")
                 data = payload.get("raw", {}).get("data", [])
@@ -174,6 +185,12 @@ class OutcomeTierBExecutionGate:
         # A visible L2 level is not all executable capacity.  Retain the
         # existing 1.25x safety multiple and round down to whole shares.
         safe_max_shares = (depth / self.BOOTSTRAP_DEPTH_MULTIPLE).to_integral_value(rounding=ROUND_FLOOR)
+        max_submit_bid = bid * (Decimal("1") + policy.max_submit_drift_bps / Decimal("10000"))
+        if spread_bps > policy.max_spread_bps:
+            # Trade flow can only tighten capacity; it cannot make a wide
+            # spread eligible.  Refuse immediately so a known-rejected entry
+            # never pays for a DB scan on the latency-critical live path.
+            return TierBExecutionDecision(False, "entry_spread_exceeds_calibrated_ceiling", policy, spread_bps, depth, bid, max_submit_bid, safe_max_shares, None)
         recent_trade_shares = self._recent_trade_shares(coin)
         if recent_trade_shares is not None:
             # At most one quarter of recently observed, de-duplicated public
@@ -181,9 +198,6 @@ class OutcomeTierBExecutionGate:
             # increase the book-derived ceiling, only tighten it.
             flow_cap = (recent_trade_shares / Decimal("4")).to_integral_value(rounding=ROUND_FLOOR)
             safe_max_shares = min(safe_max_shares, flow_cap)
-        max_submit_bid = bid * (Decimal("1") + policy.max_submit_drift_bps / Decimal("10000"))
-        if spread_bps > policy.max_spread_bps:
-            return TierBExecutionDecision(False, "entry_spread_exceeds_calibrated_ceiling", policy, spread_bps, depth, bid, max_submit_bid, safe_max_shares, recent_trade_shares)
         if safe_max_shares <= 0:
             return TierBExecutionDecision(False, "tier_b_safe_capacity_zero", policy, spread_bps, depth, bid, max_submit_bid, safe_max_shares, recent_trade_shares)
         return TierBExecutionDecision(True, "tier_b_execution_quality_confirmed", policy, spread_bps, depth, bid, max_submit_bid, safe_max_shares, recent_trade_shares)

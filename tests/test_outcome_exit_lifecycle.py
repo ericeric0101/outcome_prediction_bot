@@ -51,12 +51,52 @@ def test_owned_sell_refuses_second_same_coin_manual_sell(tmp_path):
 
 
 def test_flat_inventory_and_absent_owned_order_close_lifecycle(tmp_path):
-    store = OutcomeExitLifecycleStore(TradeJournalDB(tmp_path / "journal.db"), "run-a")
+    journal = TradeJournalDB(tmp_path / "journal.db")
+    store = OutcomeExitLifecycleStore(journal, "run-a")
     store.record(_lifecycle(), reason="initial_protection")
+    journal.log_order_event(
+        "run-a", "ORDER_FILLED", venue_order_id="sell-7", side="SELL",
+        instrument_id="#11530", price=0.84, qty=13,
+        payload={"venue": "hyperliquid_outcome", "actual_fill": True},
+    )
     assert store.reconcile_owned_sell(wallet="0xwallet", outcome_id=1153, coin="#11530", inventory=Decimal("0"), open_orders=[]) is None
     # CLOSED is terminal: a future restart cannot mistake it for a resting
     # sell or gain cancellation ownership from it.
     assert store.recover(wallet="0xwallet", outcome_id=1153, coin="#11530") is None
+
+
+def test_flat_snapshot_cannot_terminalize_owned_sell_before_official_fill(tmp_path):
+    store = OutcomeExitLifecycleStore(TradeJournalDB(tmp_path / "journal.db"), "run-a")
+    store.record(_lifecycle(), reason="initial_protection")
+    assert store.reconcile_owned_sell(
+        wallet="0xwallet", outcome_id=1153, coin="#11530", inventory=Decimal("0"), open_orders=[],
+    ) is None
+    pending = store.recover(wallet="0xwallet", outcome_id=1153, coin="#11530")
+    assert pending is not None and pending.state == "RECONCILE_REQUIRED"
+
+
+def test_latest_owned_sell_fill_excludes_manual_fill_and_keeps_owned_identity(tmp_path):
+    journal = TradeJournalDB(tmp_path / "journal.db")
+    store = OutcomeExitLifecycleStore(journal, "run-a")
+    # A manual/external fill has no matching local ORDER_SUBMIT and cannot
+    # become an admission fence for this runtime.
+    journal.log_order_event(
+        "run-a", "ORDER_FILLED", venue_order_id="manual-sell", side="SELL",
+        instrument_id="#11530", price=0.70, qty=13,
+        payload={"venue": "hyperliquid_outcome", "actual_fill": True},
+    )
+    assert store.latest_owned_sell_fill_at_ms(wallet="0xwallet", outcome_id=1153, coin="#11530") is None
+    journal.log_order_event(
+        "run-a", "ORDER_SUBMIT", venue_order_id="owned-sell", side="SELL",
+        instrument_id="#11530", payload={"venue": "hyperliquid_outcome", "outcome_id": 1153},
+    )
+    journal.log_order_event(
+        "run-a", "ORDER_FILLED", venue_order_id="owned-sell", side="SELL",
+        instrument_id="#11530", price=0.71, qty=13,
+        payload={"venue": "hyperliquid_outcome", "actual_fill": True},
+    )
+    latest = store.latest_owned_sell_fill_at_ms(wallet="0xwallet", outcome_id=1153, coin="#11530")
+    assert latest is not None and latest[1] == "owned-sell"
 
 
 def test_ambiguous_exit_adopts_only_exact_matching_resting_sell(tmp_path):
