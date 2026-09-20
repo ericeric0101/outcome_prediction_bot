@@ -359,6 +359,22 @@ class TradeJournalDB:
         CREATE INDEX IF NOT EXISTS idx_outcome_deribit_features_source_time
             ON outcome_deribit_feature_rows(deribit_local_received_at_ms, deribit_valid);
 
+        -- Research-only mirror of valid Deribit points. Its independent
+        -- watermark proves which sparse source ids were scanned, so D2 can
+        -- use an indexed clock rather than reparsing JSON history.
+        CREATE TABLE IF NOT EXISTS outcome_deribit_point_index_v2 (
+            source_event_id INTEGER PRIMARY KEY,
+            source_timestamp_ms INTEGER,
+            local_received_at_ms INTEGER NOT NULL,
+            payload_json TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_outcome_deribit_point_v2_local_time
+            ON outcome_deribit_point_index_v2(local_received_at_ms, source_event_id);
+        CREATE TABLE IF NOT EXISTS outcome_deribit_point_index_state_v2 (
+            singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+            last_source_event_id INTEGER NOT NULL
+        );
+
         -- O3: Hyperliquid-native BTC perpetual context.  This is public,
         -- read-only shadow evidence used only to compare native OI/mark data
         -- with the existing Binance source; no strategy path reads it.

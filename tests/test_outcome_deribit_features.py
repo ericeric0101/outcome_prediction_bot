@@ -146,3 +146,32 @@ def test_d2_late_snapshot_falls_back_to_full_rebuild(tmp_path):
             "SELECT labels_json FROM outcome_deribit_feature_rows WHERE outcome_snapshot_event_id=10"
         ).fetchone()[0])
     assert labels["future_60s"]["available"] is True
+
+
+def test_d2_point_cache_without_watermark_is_safely_backfilled(tmp_path):
+    journal = TradeJournalDB(tmp_path / "journal.db")
+    base = 2_500_000_000_000
+    first = journal.log_strategy_event("deribit", "DERIBIT_FEATURE_SNAPSHOT", _deribit(base - 61_000))
+    second = journal.log_strategy_event("deribit", "DERIBIT_FEATURE_SNAPSHOT", _deribit(base - 1))
+    journal.log_strategy_event("outcome", "OUTCOME_P2_PARITY_SNAPSHOT", _outcome(base))
+    # Simulate an interrupted/legacy cache containing only its final point.
+    with sqlite3.connect(journal.db_path) as conn:
+        raw = conn.execute("SELECT payload_json FROM strategy_events WHERE id=?", (second,)).fetchone()[0]
+        conn.execute(
+            """INSERT INTO outcome_deribit_point_index_v2
+               (source_event_id,source_timestamp_ms,local_received_at_ms,payload_json)
+               VALUES (?,?,?,?)""",
+            (second, base - 101, base - 1, raw),
+        )
+        conn.commit()
+
+    OutcomeDeribitFeaturePipeline(journal).build(batch_size=10)
+    with sqlite3.connect(journal.db_path) as conn:
+        source_ids = [row[0] for row in conn.execute(
+            "SELECT source_event_id FROM outcome_deribit_point_index_v2 ORDER BY source_event_id"
+        )]
+        watermark = conn.execute(
+            "SELECT last_source_event_id FROM outcome_deribit_point_index_state_v2 WHERE singleton=1"
+        ).fetchone()[0]
+    assert source_ids == [first, second]
+    assert watermark == second
