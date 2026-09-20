@@ -1,6 +1,6 @@
 # Hyperliquid Outcome (HIP-4) BTC Daily Prediction Market Trading Bot — Current Authority
 
-> **權威架構版本 (Authority Version)**：2.5.1 (Outcome-only, typed execution-domain services; bounded-observation latency hardening)
+> **權威架構版本 (Authority Version)**：2.5.2 (Outcome-only, latest-confirmed-loss re-entry reference; early post-exit continuation checkpoints)
 > **建立與審計日期**：2026-08-23；最近修訂：2026-09-20
 > **目標系統**：Hyperliquid HyperCore L1 原生預測市場 — Outcome (HIP-4 協議標準)  
 > **單一權威聲明**：本文件取代原 `project_overview.md`，為系統唯一的設計、架構、量化模型與執行權威規範。
@@ -43,6 +43,12 @@ official BUY fill
 ```
 
 它不新增資料庫、不複製 raw L2、不建立下單路徑。`HOLD_FOR_RECOVERY` 與 `SCRATCH_*_RESEARCH` 均為 `read_only/live_authority=false`：不得取消 protective SELL、否決 narrow canary／fast-failure／S3、延後 IOC、或新增 exposure。首次 read-only sanity check 有 16 個 scratch lifecycle，其中 final FIFO 為 5 個 realized-loss、11 個 realized-profit；90 秒 shape 為 14 persistent、2 chop，但 persistent bucket 仍含 10 個最終獲利 lifecycle，故對齊成功**不等於**分類器已能授權 live veto。使用既有 `python -m bot.outcome_entry_quality_report --db logs/outcome_shadow.db --period 1d` 審查，缺 P3、holding path 或 FIFO 一律保持 missing，不得補造。
+
+### 2026-09-20 — latest-confirmed-loss re-entry reference 與 early post-exit checkpoints
+
+**latest confirmed loss is the only current re-entry reference.** `OutcomeLossReentryGate` 仍維持固定 15 分鐘冷卻與同側 reclaim，且 `OUTCOME_LOSS_REENTRY_SUBMITTED` 仍只是 audit、絕非每市場或每日期數額度。修正前，同一 `outcome_id × coin` 的第一筆 `OUTCOME_LOSS_EXIT_CONFIRMED` 會阻止後續不同 official SELL 建立新 event，使第二次實現虧損後的 cooldown/reclaim 錯誤錨定在較早 exit。現在 dedupe key 是 exact `outcome_id × coin × official SELL order_id`：同一 SELL 的 reconciliation retry idempotent；不同、完整配對且 fee-inclusive 為負的後續 SELL 則寫入新 event，`_latest_verified_loss_event()` 必須以最新 event 作為下一次評估的冷卻與 reclaim price。這是 lifecycle correctness repair，**不是**放寬 cooldown、reclaim、S0/Tier、spread/depth、size 或新增 re-entry 次數。
+
+**post-exit continuation 保持 read-only，僅增加早期 checkpoint。** 每個已由 official account truth 確認 flat 的 emergency exit，既有 `OUTCOME_EXIT_CONTINUATION_REGISTERED` targets 現為 **60/120/180/300/900/1800 秒**。每一點仍只由下一個既有 runtime tick 的 fresh book 盡力記錄 BBO、full-inventory depth walk 與 timestamp；book/journal 失敗即缺值，絕不重試以拖慢 protection，也不推估插值。60/120/180 秒只讓既有 exit-decision/entry replay 可測「止損後短期止穩」的反事實；它不會下單、取消、改 TP、改 stop、解鎖 recovery entry、或賦予 `HOLD_FOR_RECOVERY` 權限。
 
 ### 2026-09-20 — stale-cancel price-through replay 與 serial-loop latency 拆解
 

@@ -16,6 +16,7 @@ from bot.outcome_emergency_exit import (
     parse_bid_levels,
 )
 from bot.outcome_execution_ledger import OutcomeExecutionLedger
+from bot.outcome_exit_continuation import OutcomeExitContinuationObserver
 from bot.outcome_exit_lifecycle import OutcomeExitLifecycleStore
 from bot.outcome_maker_state_machine import OutcomeMakerStateMachine
 from bot.outcome_runtime_types import LiveExecutionResult
@@ -333,7 +334,8 @@ class OutcomeHoldingRiskService:
                         "exit_id": f"{market.outcome_id}:{coin}:{exit_order}",
                         "outcome_id": market.outcome_id, "coin": coin, "side_index": side_index,
                         "entry_vwap": str(item.fill_vwap), "inventory": str(item.inventory),
-                        "exit_timestamp": time.time(), "targets_sec": [300, 900, 1800],
+                        "exit_timestamp": time.time(),
+                        "targets_sec": list(OutcomeExitContinuationObserver.TARGETS_SEC),
                         "execution_type": execution_type,
                     },
                 )

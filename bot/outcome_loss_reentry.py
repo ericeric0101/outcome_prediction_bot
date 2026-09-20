@@ -144,12 +144,18 @@ class OutcomeLossReentryGate:
                     ORDER BY id DESC LIMIT 1
                     """, (coin, order_id),
                 ).fetchone()
+                # A reconciliation retry for the *same* official SELL must
+                # remain idempotent.  Do not, however, dedupe every later
+                # loss in this market/coin: doing that leaves the cooldown
+                # and reclaim reference anchored to an older exit after a
+                # genuine loss → re-entry → later loss sequence.
                 already = conn.execute(
                     """
                     SELECT 1 FROM strategy_events WHERE event_type=?
                       AND CAST(json_extract(payload_json, '$.outcome_id') AS INTEGER)=?
-                      AND json_extract(payload_json, '$.coin')=? LIMIT 1
-                    """, (self.EVENT, outcome_id, coin),
+                      AND json_extract(payload_json, '$.coin')=?
+                      AND json_extract(payload_json, '$.order_id')=? LIMIT 1
+                    """, (self.EVENT, outcome_id, coin, order_id),
                 ).fetchone()
             if row is None or already is not None:
                 return False

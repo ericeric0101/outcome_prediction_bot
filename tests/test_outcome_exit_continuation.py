@@ -9,10 +9,10 @@ def test_exit_continuation_records_only_missing_due_checkpoints(tmp_path):
     observer = OutcomeExitContinuationObserver(journal, "test")
     observer.register(outcome_id=1, coin="#10", side_index=0, entry_vwap=Decimal("0.6"),
                       inventory=Decimal("10"), exit_order_id="exit", execution_type="ioc", exit_timestamp=100.0)
-    due = observer.due(outcome_id=1, now=401.0)
-    assert [(target, item.entry_vwap, item.inventory) for item, target in due] == [(300, Decimal("0.6"), Decimal("10"))]
+    due = observer.due(outcome_id=1, now=161.0)
+    assert [(target, item.entry_vwap, item.inventory) for item, target in due] == [(60, Decimal("0.6"), Decimal("10"))]
     item, target = due[0]
     assert observer.record(continuation=item, target_sec=target, best_bid=Decimal("0.65"), best_ask=Decimal("0.66"),
                            marketable_vwap=Decimal("0.649"), depth_shares=Decimal("10"))
-    assert observer.due(outcome_id=1, now=401.0) == []
-    assert [target for _, target in observer.due(outcome_id=1, now=1001.0)] == [900]
+    assert observer.due(outcome_id=1, now=161.0) == []
+    assert [target for _, target in observer.due(outcome_id=1, now=221.0)] == [120]

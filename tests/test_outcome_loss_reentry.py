@@ -106,6 +106,39 @@ def test_reentry_can_take_new_confirmed_opposite_side_after_cooldown(tmp_path):
     assert decision.reason == "loss_reentry_cooldown_and_reclaim_authorized"
 
 
+def test_later_confirmed_loss_replaces_reentry_reference_without_spending_attempt_budget(tmp_path):
+    journal = TradeJournalDB(tmp_path / "journal.db")
+    gate = OutcomeLossReentryGate(journal, "run")
+    _record_loss(journal, gate)
+
+    # A distinct, later completed round trip in the same market/coin must
+    # create a new loss reference.  Calling the recorder twice for this SELL
+    # remains idempotent.
+    journal.log_strategy_event("run", "OUTCOME_LIVE_STRATEGY_ENTRY_PLACED", {
+        "outcome_id": 1, "coin": "#10", "order_id": "buy-2",
+    })
+    journal.log_order_event("run", "ORDER_FILLED", venue_order_id="buy-2", side="BUY", price=0.80, qty=10,
+                            commission_usdc=0.01, status="FILLED", instrument_id="#10", payload={
+        "venue": "hyperliquid_outcome", "actual_fill": True,
+    })
+    journal.log_order_event("run", "ORDER_FILLED", venue_order_id="sell-2", side="SELL", price=0.70, qty=10,
+                            commission_usdc=0.01, status="FILLED", instrument_id="#10", payload={
+        "venue": "hyperliquid_outcome", "actual_fill": True,
+    })
+    assert gate.record_confirmed_loss_exit(outcome_id=1, period="1d", coin="#10", order_id="sell-2") is True
+    assert gate.record_confirmed_loss_exit(outcome_id=1, period="1d", coin="#10", order_id="sell-2") is False
+
+    after_cooldown = datetime.now(timezone.utc) + timedelta(seconds=gate.COOLDOWN_SEC + 1)
+    blocked = gate.evaluate(outcome_id=1, coin="#10", candidate_bid=0.65, now=after_cooldown)
+    assert blocked.reason == "loss_reentry_same_side_exit_price_not_reclaimed"
+    assert blocked.prior_exit_price == 0.70
+    allowed = gate.evaluate(outcome_id=1, coin="#10", candidate_bid=0.70, now=after_cooldown)
+    assert allowed.reason == "loss_reentry_cooldown_and_reclaim_authorized"
+    assert allowed.prior_exit_price == 0.70
+    with sqlite3.connect(journal.db_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM strategy_events WHERE event_type='OUTCOME_LOSS_EXIT_CONFIRMED'").fetchone()[0] == 2
+
+
 def test_legacy_loss_event_recovers_immutable_official_exit_price(tmp_path):
     journal = TradeJournalDB(tmp_path / "journal.db")
     gate = OutcomeLossReentryGate(journal, "run")

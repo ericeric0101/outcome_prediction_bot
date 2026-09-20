@@ -27,7 +27,10 @@ class OutcomeExitContinuationObserver:
 
     REGISTER_EVENT = "OUTCOME_EXIT_CONTINUATION_REGISTERED"
     SAMPLE_EVENT = "OUTCOME_EXIT_CONTINUATION_OBSERVATION"
-    TARGETS_SEC = (300, 900, 1800)
+    # 60/120/180 seconds make the early post-exit stabilization hypothesis
+    # replayable.  These remain best-effort, read-only checkpoints; they do
+    # not alter the already-completed exit or authorize a re-entry.
+    TARGETS_SEC = (60, 120, 180, 300, 900, 1800)
 
     def __init__(self, journal: TradeJournalDB, run_id: str) -> None:
         self.journal, self.run_id = journal, run_id
