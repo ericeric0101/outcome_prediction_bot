@@ -1,7 +1,7 @@
 # Hyperliquid Outcome (HIP-4) BTC Daily Prediction Market Trading Bot — Current Authority
 
-> **權威架構版本 (Authority Version)**：2.5.10 (Outcome-only; all-loss-exit observation mode; conservative telemetry retention V1.2 compaction)
-> **建立與審計日期**：2026-08-23；最近修訂：2026-09-20
+> **權威架構版本 (Authority Version)**：2.5.11 (Outcome-only; all-loss-exit observation mode; conservative telemetry retention V1.2 compaction; bounded P2/D2 feature construction)
+> **建立與審計日期**：2026-08-23；最近修訂：2026-09-21
 > **目標系統**：Hyperliquid HyperCore L1 原生預測市場 — Outcome (HIP-4 協議標準)  
 > **單一權威聲明**：本文件取代原 `project_overview.md`，為系統唯一的設計、架構、量化模型與執行權威規範。
 
@@ -121,6 +121,18 @@ and must be checked in the durable startup manifest.
 **容量基線與保守 projection。** V1.1 實測舊 Admission 約 3,749B/row、44,293 rows/day、199MB/day；Gate 約 1,038B/row、43,992 rows/day、46.8MB/day。代表性 serializer regression（刻意含 4KB nested research evidence）為 full Admission 5,472B、full Gate 4,823B，穩定 compact Admission 823B、Gate 410B。以各 5-minute heartbeat（288/day）、目前 row rate、及**未預先假設額外 state transitions**估算：Admission 約 37.5MB/day（相對 199，省約 161.5MB/day／4.85GB per 30d）；Gate 約18.3MB/day（相對46.8，省約28.5MB/day／0.85GB per 30d）；合計約 **5.7GB/30d logical payload** 的 base-case savings。transition/full frequency 是 forward evidence，可能降低實際節省，故不得把 unit-test projection 宣稱為已實現 disk saving。
 
 **驗證與後續。** regression 覆蓋 v2 first/transition/unchanged/heartbeat/rollover/buy full、payload-size bounds、legacy + compact gate-ablation reader、capital-efficiency compact fallback、storage-report mode attribution，以及既有 execution/lifecycle tests。部署後 3–7 天只用 `--storage-report` 檢查各 mode 的 rows、avg bytes、MB/day、full-transition/heartbeat frequency；若 readers 缺欄，先補 compatibility 再考慮任何更進一步寫頻率降低。P2/Deribit/L2 與 runtime timing 需各自 dependency/replay evidence，不能藉本次 compaction 一併調整。
+
+### 2026-09-21 — SQLite 記憶體峰值修正與資料庫版本清冊（已驗證；不做資料刪除）
+
+**事故證據與結論。** 約 1.5 小時 live runtime 曾觀察到約 1.8 GiB Activity Monitor memory、`vmmap` physical-footprint peak 約 6.5 GiB，且 sample 顯示主執行緒長時間位於 `pysqlite_cursor_fetchall → sqlite3_step`、JSON parse 與 `pread`。實測診斷確認主因不是 socket retention，而是 feature builder 將大量 SQLite JSON payload 一次 materialize：舊 P2 查詢曾讀取 **228,084** 筆、約 **941,039,840 bytes** 的 `OUTCOME_P2_PARITY_SNAPSHOT`，RSS 約由 231 MiB 升至 3,214 MiB；舊 Deribit raw-point 路徑曾讀取 **425,748** 筆、約 **320,261,490 bytes**，RSS 約升至 1,243 MiB。這是大型暫態 materialization，加上 Python/macOS allocator 未立即把已釋放 heap 還給 OS 而保留 RSS/swap 的行為；不是已證實的永久 Python object leak。
+
+**已部署的有界讀取契約。** `OutcomeOiFeaturePipeline` 的 X3 P2 feature 以 durable checkpoint 加上 **62 分鐘** label window 建置；`OutcomeDeribitFeaturePipeline` 的 D2 P2 feature 以 checkpoint 加上 **307.5 秒** label window 建置。Deribit point source 則先以小批次建立 `outcome_deribit_point_index_v2`，再以 `local_received_at_ms, source_event_id` 的索引讀取 D2 as-of 所需 **63 秒** window 與一筆 pre-window point；這不改 feature、帳務、成交、風險或 recovery 語意，late snapshot/rebuild 仍保留正確性優先的完整重建 fallback。最終 live 驗證：X3 P2 為 95 rows / 418,974 bytes、D2 P2 為 33 rows / 145,657 bytes、D2 indexed points 為 225 rows / 169,788 bytes，RSS 均約 219 MiB，未再出現 GB 級 materialization。`OUTCOME_DB_MEM_DIAG=1` 可啟用 best-effort、fail-open 的 `[DB_MEM_DIAG]` 記錄（rows、payload bytes、query/processing duration、query 前後/processing 後 RSS、GC probe 與 thread）；它不屬交易 control flow。
+
+**現役 DB 與刪除邊界。** `logs/outcome_shadow.db` 是目前 `launcher --live` 的現役權威 journal：launcher 開啟 `OUTCOME_LIVE_STRATEGY_ENABLED=1`，故 default journal 即此檔。它包含 canonical order/fill/PnL/settlement evidence 以及長期研究來源，**不得以檔案刪除、取代或任意 VACUUM 當作記憶體修正**。`logs/outcome_execution.db` 只在 `OUTCOME_P3_CALIBRATION_ENABLED` 與 `OUTCOME_LIVE_STRATEGY_ENABLED` 都不是 `1` 時才是 fallback journal；因此它是條件式現役 DB，不能僅憑名稱判為舊版。`logs/trade_journal.db` 是 `TradeJournalDB` 與若干舊分析 script 的預設路徑，現行部署是否仍依賴它必須先逐一核對 launcher environment、排程、報表與資料內容；本版本不將它列為可直接刪除。
+
+**已確認的舊版快取（未刪除）。** 實際 `logs/outcome_shadow.db` 仍有 v1 `outcome_deribit_point_index`（6,000 rows，watermark 2,413,936）與 `outcome_deribit_point_index_state`。自 v2 上線後，repo 現行 source、schema 和 tests 只引用 `outcome_deribit_point_index_v2`／`outcome_deribit_point_index_state_v2`（現有 363,345 rows，watermark 3,903,249）；v1 由早期 partial build 遺留，已無現行程式 consumer，故標記為 **LEGACY_CANDIDATE_DELETE**。v2 是可重建的 derived cache、不是 execution authority，但目前 D2 feature build 依賴它，仍必須保留。
+
+**未來移除 v1 的強制程序。** 這不是 live tick 操作，也不是 `outcome_journal_maintenance.py` V1 telemetry allowlist 的一部分。先停止所有 bot/collector、製作可驗證 DB copy/backup、執行 `PRAGMA integrity_check`、再次查核 `sqlite_master` 及 repo/外部排程對 v1 table 的引用，並確認當次 process 已使用 v2 state watermark；其後才可在 maintenance window 對**精確兩張** v1 table 做可回復、已審核的 schema migration。不得刪除 `outcome_shadow.db`、不得碰 canonical tables、不得手動刪除 `-wal`/`-shm`。移除後若要縮小 OS file size，仍須依既有停機、備份與磁碟空間政策另行執行 SQLite `VACUUM`。
 
 ### 2026-09-19 — 60 秒 stale zero-fill BUY admission 與 post-fill evidence 對齊
 
