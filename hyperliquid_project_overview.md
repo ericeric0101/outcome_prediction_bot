@@ -1,6 +1,6 @@
 # Hyperliquid Outcome (HIP-4) BTC Daily Prediction Market Trading Bot — Current Authority
 
-> **權威架構版本 (Authority Version)**：2.5.4 (Outcome-only, durable settlement retry; operator-controlled all-loss-exit observation mode)
+> **權威架構版本 (Authority Version)**：2.5.5 (Outcome-only; all-loss-exit observation mode; structural-collapse forward shadow)
 > **建立與審計日期**：2026-08-23；最近修訂：2026-09-20
 > **目標系統**：Hyperliquid HyperCore L1 原生預測市場 — Outcome (HIP-4 協議標準)  
 > **單一權威聲明**：本文件取代原 `project_overview.md`，為系統唯一的設計、架構、量化模型與執行權威規範。
@@ -63,6 +63,18 @@ No automatic re-enable, threshold change, re-entry relaxation, size increase,
 or new entry authority is authorized.  A launcher restart is required; a
 shell-exported `OUTCOME_LOSS_EXIT_ENABLED` still takes precedence over `.env`
 and must be checked in the durable startup manifest.
+
+### 2026-09-20 — Structural Collapse / Tail-Risk Forward Validation（V16；shadow-only）
+
+**為何需要此線。** 正常 Outcome 成功交易通常只帶來小額利潤，但少數 tail 可抹去多筆贏家；因此此研究優先處理 tail，而不是提高交易頻率。歷史 #2437 顯示 Outcome 可執行 bid／流動性崩壞不必等同 BTC spot/mark/OI thesis 已被 `REVERSAL_CONFIRMED`，不能把底層方向反轉誤當成唯一風險代理。
+
+**歷史研究與其限制。** price-only `FailedRecovery` 與簡單 adverse-flow 在 recoverer 中也常出現，故只能啟動 WATCH。v10/v11 的 matched L2 研究發現 FailedRecovery 後、以本地 `T-5→T0` 對 `T0→T+15` 衡量的 held-side top-3 `DepthRetention` 是候選 Branch A；P07 則揭示 nominal depth 保留但雙側交易參與消失、spread 持續寬化的另一 phenotype。v14 確認 participation failure 是互補而非通用 detector；v15 的 A OR B in-sample replay 捕捉 **6/6 有足夠 A/B L2 的 tails**、未觸發 **7** 個 matched recoverers。#1993 因歷史 held-side L2 不完整仍未解，故絕不可宣稱「6/7 全部捕捉」或已證明 live PnL。歷史 15-share value-preservation counterfactual 不是可交易收益、未扣完整實際執行/重進成本。
+
+**凍結中的研究候選（非 live 規則）。** `OutcomeStructuralCollapseShadow` 使用 process-local、有界 public WS state：完成的五分鐘 held-side midpoint bars 先辨識 `FailedRecovery`（>=10pp adverse impulse、至少回補 40%、再 >=8pp deteriorate），只啟動 WATCH。Branch A 在 T+15 以 `DepthRetention < 0.70` 記錄 `A_DEPTH_FAILURE`；Branch B 在 T0→5 或 T5→15 要求 YES/NO **各自** unique-trade participation retention <0.25、且雙側 median spread 的較小者 >=200bps，記錄 early/late participation candidate。歷史 robustness grid 在 depth 約 0.60–0.75、participation 約 0.25–0.30、spread 約 150–200bps 有 plateau，但全為小樣本、in-sample 探索；BTC Branch C 未增加 v15 capture，暫留 context telemetry。
+
+**前向實作與權限邊界。** launcher 建立一個共享 observer，交給 `OutcomeWebSocketRecorder`（best-effort public `l2Book`/`trades`）及 `OutcomeLiveExecutionRuntime`；runtime 僅在 exact owned holding lifecycle 存在時，最多每 30 秒或 state transition 寫入 compact `OUTCOME_STRUCTURAL_COLLAPSE_SHADOW`。trade 以 trade ID 去重且不以 A/B side 區分，缺任一側 baseline 或 spread evidence 一律不形成 Branch B。五分鐘 close 僅在下一 bucket 抵達後封存，避免未完成 bar 的 lookahead；restart 不重建猜測中的 WATCH。所有 payload 固定 `read_only=true`、`live_authority=false`、`execution_submitted=false`，以及 `may_submit_order=false`、`may_cancel_order=false`、`may_replace_order=false`、`may_veto_existing_safety_lane=false`。observer 不持有 account、gateway、SDK、controller 或任何 mutation primitive；WS parse failure 也不得影響 health 或 execution wakeup。
+
+**目前與未來。** V16 不改 entry、TP、TP reprice、settlement、reduce-only、reconciliation、任何 IOC/stop，亦不改寫或繞過 `OUTCOME_LOSS_EXIT_ENABLED=0` 的 operator experiment。目標是累積約 20–30 個新的、獨立 FailedRecovery WATCH，審核 candidate lead time、15-share executable depth、後續 recover/collapse、false positives 與門檻是否在未重新擬合下穩定；這不是自動 promotion 門檻。任何 live promotion 必須先有獨立 evidence review 與獨立 code/authorization change。
 
 ### 2026-09-19 — 60 秒 stale zero-fill BUY admission 與 post-fill evidence 對齊
 

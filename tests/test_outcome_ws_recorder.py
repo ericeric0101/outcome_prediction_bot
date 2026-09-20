@@ -97,6 +97,23 @@ def test_l2_callback_keeps_terminal_pricing_cache_fresh(tmp_path):
     assert pricing.get_best_bid_ask("#11450") == (Decimal("0.60"), Decimal("0.61"))
 
 
+def test_structural_shadow_parse_failure_does_not_block_ws_health_or_wakeup(tmp_path):
+    class BrokenShadow:
+        def observe_l2(self, **_kwargs):
+            raise RuntimeError("research parser failure")
+
+        def observe_trades(self, **_kwargs):
+            raise RuntimeError("research parser failure")
+
+    recorder = OutcomeWebSocketRecorder(
+        CallbackClient(), TradeJournalDB(tmp_path / "stream.db"), "stream-run",
+        structural_collapse_shadow=BrokenShadow(),
+    )
+    recorder._on_l2({"channel": "l2Book", "data": {"coin": "#11450", "time": 456, "levels": [[{"px": "0.60", "sz": "10"}], [{"px": "0.61", "sz": "11"}]]}})
+    recorder._on_trades({"channel": "trades", "data": [{"coin": "#11450", "timestamp": 789}]})
+    assert recorder._l2_update.is_set()
+
+
 def test_l2_callback_coalesces_an_execution_loop_wakeup(tmp_path):
     recorder = OutcomeWebSocketRecorder(
         CallbackClient(), TradeJournalDB(tmp_path / "stream.db"), "stream-run",

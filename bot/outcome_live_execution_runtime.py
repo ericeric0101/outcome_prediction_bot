@@ -60,6 +60,7 @@ from bot.outcome_active_shadow import OutcomeActiveChallengerShadow
 from bot.outcome_entry_quality_shadow import OutcomeEntryQualityShadow, OutcomePostFillQualityInput
 from bot.outcome_crash_circuit_shadow import OutcomeCrashCircuitObservation, OutcomeCrashCircuitShadow
 from bot.outcome_market_risk_monitor import OutcomeMarketRiskMonitor, OutcomeMarketRiskObservation
+from bot.outcome_structural_collapse_shadow import OutcomeStructuralCollapseShadow
 from bot.outcome_stress_exitability import OutcomeStressExitabilitySizer
 from bot.outcome_runtime_supervisors import (
     OutcomeEntrySupervisor,
@@ -85,7 +86,7 @@ class OutcomeLiveExecutionRuntime:
     _REVERSAL_RISK_MIN_INTERVAL_SEC = 5.0
     _CRASH_SHADOW_MIN_INTERVAL_SEC = 10.0
 
-    def __init__(self, *, account: OutcomeClient, wallet: str, gateway: OutcomeExecutionGateway | None = None, risk_gate: OutcomePreTradeRiskGate | None = None, stream_health: OutcomeStreamHealth | None = None, ledger: OutcomeExecutionLedger | None = None, research_gate: OutcomeResearchGate | None = None, exit_planner: OutcomeExitQuotePlanner | None = None, exit_lifecycle_store: OutcomeExitLifecycleStore | None = None, exit_requote_controller: OutcomeExitRequoteController | None = None, entry_planner: OutcomeEntryQuotePlanner | None = None, entry_lifecycle_store: OutcomeEntryLifecycleStore | None = None, entry_requote_controller: OutcomeEntryRequoteController | None = None) -> None:
+    def __init__(self, *, account: OutcomeClient, wallet: str, gateway: OutcomeExecutionGateway | None = None, risk_gate: OutcomePreTradeRiskGate | None = None, stream_health: OutcomeStreamHealth | None = None, ledger: OutcomeExecutionLedger | None = None, research_gate: OutcomeResearchGate | None = None, exit_planner: OutcomeExitQuotePlanner | None = None, exit_lifecycle_store: OutcomeExitLifecycleStore | None = None, exit_requote_controller: OutcomeExitRequoteController | None = None, entry_planner: OutcomeEntryQuotePlanner | None = None, entry_lifecycle_store: OutcomeEntryLifecycleStore | None = None, entry_requote_controller: OutcomeEntryRequoteController | None = None, structural_collapse_shadow: OutcomeStructuralCollapseShadow | None = None) -> None:
         self._account_reads = OutcomeAccountReadCache(account)
         self.recovery = OutcomeAccountRecovery(account=self._account_reads, wallet=wallet)
         self.machine = OutcomeMakerStateMachine(
@@ -171,6 +172,7 @@ class OutcomeLiveExecutionRuntime:
         # deliberately separate from S3 / fast-failure authority.
         self.crash_circuit_shadow = OutcomeCrashCircuitShadow()
         self.market_risk_monitor = OutcomeMarketRiskMonitor()
+        self.structural_collapse_shadow = structural_collapse_shadow
         self.emergency_exit_policy = OutcomeEmergencyExitPolicy()
         self.emergency_exit_controller = (
             OutcomeEmergencyExitController(
@@ -217,6 +219,7 @@ class OutcomeLiveExecutionRuntime:
         self._last_efficiency_shadow_record: dict[tuple[str, int, int], tuple[str, float]] = {}
         self._last_crash_shadow_record: dict[str, tuple[str, float]] = {}
         self._last_market_risk_record: dict[str, tuple[str, float]] = {}
+        self._last_structural_collapse_shadow_record: dict[str, tuple[str, float]] = {}
         self._last_fast_failure_lane_record: dict[str, tuple[str, float]] = {}
         self._last_holding_risk_decision_record: dict[str, tuple[str, float]] = {}
         self._last_postfill_quality_record: dict[str, tuple[str, float]] = {}
@@ -1388,6 +1391,22 @@ class OutcomeLiveExecutionRuntime:
                     self.ledger.run_id, "OUTCOME_MARKET_RISK_MONITOR_SHADOW", monitor,
                 )
                 self._last_market_risk_record[lifecycle_id] = (monitor_state, now)
+            # Structural-collapse evidence is a separate, public-data-only
+            # forward-validation stream.  Its output is journaled solely as
+            # research and is never passed to any execution owner.
+            if self.structural_collapse_shadow is not None:
+                structural = self.structural_collapse_shadow.evaluate(
+                    lifecycle_id=lifecycle_id, outcome_id=market.outcome_id, period=market.period,
+                    held_coin=coin, yes_coin=market.yes_coin, no_coin=market.no_coin,
+                    now=now, position_size=inventory, entry_price=vwap,
+                )
+                state = str(structural.get("state")) + ":" + ",".join(
+                    str(item) for item in structural.get("candidate_branches", ())
+                )
+                previous = self._last_structural_collapse_shadow_record.get(lifecycle_id)
+                if previous is None or previous[0] != state or now - previous[1] >= 30.0:
+                    self._log_best_effort_strategy_event("OUTCOME_STRUCTURAL_COLLAPSE_SHADOW", structural)
+                    self._last_structural_collapse_shadow_record[lifecycle_id] = (state, now)
         return True
 
     def _record_holding_risk_decision_shadow(

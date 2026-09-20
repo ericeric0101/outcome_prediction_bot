@@ -15,13 +15,17 @@ from bot.outcome_open_orders_stream import OutcomeOpenOrdersStreamCache
 class OutcomeWebSocketRecorder:
     """Persist raw market stream messages; no trading client method is called."""
 
-    def __init__(self, client: Any, journal: TradeJournalDB, run_id: str, *, pricing_state: Any | None = None) -> None:
+    def __init__(self, client: Any, journal: TradeJournalDB, run_id: str, *, pricing_state: Any | None = None,
+                 structural_collapse_shadow: Any | None = None) -> None:
         self.client, self.journal, self.run_id = client, journal, run_id
         # The recorder is the single subscription owner for the live launcher.
         # Feeding its *received* L2 snapshots into the display cache prevents a
         # slow research write from making terminal BBOs look empty.  Execution
         # still independently fetches a fresh REST book before any order.
         self.pricing_state = pricing_state
+        # Public-data-only observer; failures are isolated from WS health and
+        # execution wakeups below.
+        self.structural_collapse_shadow = structural_collapse_shadow
         self._market_id: Optional[int] = None
         self._coins: tuple[str, str] = ("", "")
         self._thread: Optional[threading.Thread] = None
@@ -82,6 +86,16 @@ class OutcomeWebSocketRecorder:
                     # a malformed display update is rejected.
                     pass
             self.health.on_l2_book(data["coin"], payload=dict(data))
+            if self.structural_collapse_shadow is not None:
+                try:
+                    raw_ts = data.get("time", data.get("timestamp"))
+                    observed_at = float(raw_ts)
+                    observed_at = observed_at / 1000 if observed_at > 10_000_000_000 else observed_at
+                    self.structural_collapse_shadow.observe_l2(
+                        coin=str(data["coin"]), timestamp=observed_at, payload=dict(data),
+                    )
+                except Exception:
+                    pass
             self._l2_update.set()
         self._record("OUTCOME_WS_L2_BOOK", payload)
 
@@ -119,6 +133,20 @@ class OutcomeWebSocketRecorder:
         self._record("OUTCOME_WS_ALL_MIDS", compact_payload)
 
     def _on_trades(self, payload: Mapping[str, Any]) -> None:
+        if self.structural_collapse_shadow is not None:
+            try:
+                groups: dict[str, list[dict[str, Any]]] = {}
+                data = payload.get("data")
+                if isinstance(data, list):
+                    for row in data:
+                        if isinstance(row, Mapping) and row.get("coin") is not None:
+                            groups.setdefault(str(row["coin"]), []).append(dict(row))
+                for coin, rows in groups.items():
+                    self.structural_collapse_shadow.observe_trades(
+                        coin=coin, items=rows, received_at=time.time(),
+                    )
+            except Exception:
+                pass
         self._record("OUTCOME_WS_TRADES", payload)
 
     def _on_perp_asset_ctx(self, payload: Mapping[str, Any]) -> None:
