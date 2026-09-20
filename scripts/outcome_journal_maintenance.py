@@ -1,100 +1,47 @@
 #!/usr/bin/env python3
-"""Safe maintenance for the Outcome journal's historical raw-WS footprint.
+"""Operator-invoked, conservative Outcome telemetry retention maintenance.
 
-Run ``--report`` while live.  Any rewrite requires an exclusive SQLite lock,
-so the command refuses rather than competing with a running trading bot.
-``--vacuum`` additionally requires free disk headroom and is never implicit.
+Default invocation is read-only.  The command never runs from the live tick
+and never VACUUMs automatically.
 """
 from __future__ import annotations
 
 import argparse
-import shutil
-import sqlite3
+import os
+import sys
 from pathlib import Path
 
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
-def _size(path: Path) -> int:
-    return path.stat().st_size if path.exists() else 0
-
-
-def _report(path: Path) -> None:
-    wal = Path(f"{path}-wal")
-    shm = Path(f"{path}-shm")
-    with sqlite3.connect(f"file:{path.resolve()}?mode=ro", uri=True) as conn:
-        # Do not COUNT a multi-million-row raw WS history during a live
-        # health check.  The exact deleted count is emitted by the explicit
-        # maintenance operation; report only whether legacy rows remain.
-        all_mids = conn.execute(
-            """SELECT 1 FROM strategy_events
-               WHERE event_type='OUTCOME_WS_ALL_MIDS'
-                 AND json_extract(payload_json, '$.raw.recording_scope') IS NULL
-               LIMIT 1"""
-        ).fetchone() is not None
-        pages = int(conn.execute("PRAGMA page_count").fetchone()[0])
-        free_pages = int(conn.execute("PRAGMA freelist_count").fetchone()[0])
-        page_size = int(conn.execute("PRAGMA page_size").fetchone()[0])
-    print({
-        "journal": str(path), "db_bytes": _size(path), "wal_bytes": _size(wal), "shm_bytes": _size(shm),
-        "legacy_all_mids_present": all_mids, "page_size": page_size,
-        "free_pages": free_pages, "reclaimable_bytes_before_vacuum": free_pages * page_size,
-    })
-
-
-def _exclusive_connection(path: Path) -> sqlite3.Connection:
-    conn = sqlite3.connect(path, timeout=0, isolation_level=None)
-    try:
-        conn.execute("PRAGMA busy_timeout=0")
-        conn.execute("BEGIN EXCLUSIVE")
-    except sqlite3.Error:
-        conn.close()
-        raise RuntimeError("journal is active or locked; stop every bot/collector before maintenance")
-    return conn
+from bot.outcome_telemetry_retention import audit_database, json_report, prune_database, retention_enabled
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--journal-path", default="logs/outcome_shadow.db")
-    parser.add_argument("--report", action="store_true")
-    parser.add_argument("--checkpoint", action="store_true", help="truncate WAL only; requires exclusive lock")
-    parser.add_argument("--prune-legacy-all-mids", action="store_true")
-    parser.add_argument("--vacuum", action="store_true")
+    parser.add_argument("--audit", action="store_true", help="read-only table/event inventory (default)")
+    parser.add_argument("--report", action="store_true", help="backward-compatible alias for --audit")
+    parser.add_argument("--dry-run", action="store_true", help="measure the allowlist; deletes nothing")
+    parser.add_argument("--apply", action="store_true", help="delete only explicit allowlisted telemetry")
+    parser.add_argument("--batch-size", type=int, default=1000)
+    parser.add_argument("--vacuum", action="store_true", help="unsupported: VACUUM is always operator-separate")
     args = parser.parse_args()
+    if args.vacuum:
+        raise SystemExit("refusing automatic VACUUM; run a separately planned offline SQLite VACUUM after backup")
     path = Path(args.journal_path)
     if not path.exists():
         raise SystemExit(f"journal does not exist: {path}")
-    if args.report or not (args.checkpoint or args.prune_legacy_all_mids or args.vacuum):
-        _report(path)
-        return 0
-
-    # A delete is deliberately scoped to the payload class that was an
-    # accidental all-market mirror.  Fills, P2 snapshots, P3 markouts, order
-    # lifecycle and compact new allMids records remain untouched.
-    with _exclusive_connection(path) as conn:
-        if args.prune_legacy_all_mids:
-            deleted = conn.execute(
-                """DELETE FROM strategy_events
-                   WHERE event_type='OUTCOME_WS_ALL_MIDS'
-                     AND json_extract(payload_json, '$.raw.recording_scope') IS NULL"""
-            ).rowcount
-            print({"pruned_legacy_all_mids_rows": deleted})
-        conn.execute("COMMIT")
-        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-
-    if args.vacuum:
-        # SQLite VACUUM needs a second near-full copy while it works.  Refuse
-        # early rather than turning an already-full disk into a failed DB.
-        free = shutil.disk_usage(path.parent).free
-        required = int(_size(path) * 1.25)
-        if free < required:
-            raise SystemExit(
-                f"refusing VACUUM: need about {required} free bytes, have {free}; "
-                "the delete/checkpoint above is complete, free space then retry --vacuum"
-            )
-        with _exclusive_connection(path) as conn:
-            conn.execute("COMMIT")
-            conn.execute("VACUUM")
-            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-    _report(path)
+    # --audit and no arguments are identical read-only operations.  --apply
+    # still requires the explicit disabled-by-default environment gate.
+    if args.apply and args.dry_run:
+        raise SystemExit("choose either --dry-run or --apply")
+    result = prune_database(
+        path, apply=True, enabled=retention_enabled(os.environ), batch_size=args.batch_size,
+    ) if args.apply else (prune_database(path, apply=False, enabled=False, batch_size=args.batch_size)
+                          if args.dry_run else audit_database(path))
+    print(json_report(result))
     return 0
 
 
