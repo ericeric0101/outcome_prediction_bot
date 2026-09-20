@@ -77,6 +77,38 @@ def test_narrow_hard_failure_canary_requires_eleven_dollar_limits_and_shared_epi
     assert blocked.narrow_hard_failure_controller is None
 
 
+def test_operator_loss_exit_switch_disables_all_loss_ioc_lanes_but_keeps_runtime_ready(monkeypatch, tmp_path):
+    monkeypatch.setenv("OUTCOME_LOSS_EXIT_ENABLED", "0")
+    journal = TradeJournalDB(tmp_path / "loss_exit_off.db")
+    ledger = OutcomeExecutionLedger(journal, "run")
+    store = OutcomeExitLifecycleStore(journal, "run")
+    runtime = OutcomeLiveExecutionRuntime(
+        account=CalibrationAccount(), wallet="w", gateway=Gateway(), ledger=ledger,
+        exit_lifecycle_store=store,
+    )
+    finding = type("Finding", (), {"coin": "#11530", "inventory": Decimal("13"), "sell_order_ids": ("old-sell",)})()
+
+    assert runtime.holding_risk_service.maybe_narrow_hard_failure(market=market(), finding=finding) is None
+    assert runtime.holding_risk_service.maybe_fast_failure(market=market(), finding=finding) is None
+    assert runtime.holding_risk_service.maybe_emergency(market=market(), finding=finding) is None
+
+    components = {item.name: item for item in runtime.safety_components()}
+    for name in ("fast_failure", "narrow_hard_failure_canary", "s3_emergency"):
+        assert components[name].enabled is False
+        assert components[name].health == "operator_disabled"
+        assert components[name].ready is True
+    with sqlite3.connect(journal.db_path) as conn:
+        rows = conn.execute(
+            "SELECT payload_json FROM strategy_events WHERE event_type='OUTCOME_EXIT_SAFETY_GATE_DECISION'"
+        ).fetchall()
+    assert {json.loads(raw)["component"] for (raw,) in rows} == {
+        "OUTCOME_NARROW_HARD_FAILURE_CANARY",
+        "OUTCOME_FAST_FAILURE_EXIT_DECISION",
+        "OUTCOME_EMERGENCY_EXIT_DECISION",
+    }
+    assert all(json.loads(raw)["reason"] == "operator_loss_exit_disabled" for (raw,) in rows)
+
+
 def test_runtime_blocks_cross_side_existing_exposure(monkeypatch):
     monkeypatch.setenv("OUTCOME_AUTOMATED_EXECUTION_ENABLED", "1")
     monkeypatch.setenv("OUTCOME_SDK_EXECUTION_ENABLED", "1")

@@ -142,7 +142,11 @@ class OutcomeSettlementWorker:
 
     def _candidate_snapshot(self) -> set[int]:
         with self._candidate_lock:
-            return set(self._candidate_ids)
+            in_memory = set(self._candidate_ids)
+        # Candidate ownership must survive a restart.  In particular, an
+        # already-sold lifecycle has no open FIFO lot to rediscover, but an
+        # earlier 429 or missing payout proof is still an audit obligation.
+        return in_memory | self.journal.load_pending_outcome_settlement_ids()
 
     def run_once(self, *, now_monotonic: float | None = None) -> None:
         now = time.monotonic() if now_monotonic is None else now_monotonic

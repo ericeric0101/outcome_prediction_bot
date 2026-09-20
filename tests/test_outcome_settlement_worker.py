@@ -102,3 +102,24 @@ def test_settlement_worker_skips_payout_history_without_pending_candidates(tmp_p
     assert account.by_time_calls == []
     assert account.calls == []
     assert adapter.calls == []
+
+
+def test_settlement_worker_recovers_pending_candidate_after_restart(tmp_path):
+    journal = TradeJournalDB(tmp_path / "worker.db")
+    journal.update_outcome_settlement_status(outcome_id=3719, status="pending_official_sdk")
+    account, adapter, reconciler = Account(), Adapter(), Reconciler()
+    # Deliberately do not call add_candidates(): this models a fresh process
+    # after a previous worker was rate limited before it could reconcile.
+    worker = OutcomeSettlementWorker(
+        account=account, settlement_adapter=adapter, pnl_reconciler=reconciler,
+        journal=journal, interval_sec=30,
+    )
+
+    worker.run_once(now_monotonic=31)
+
+    assert adapter.calls == [3719]
+    assert reconciler.settlement_calls == [3719]
+    with sqlite3.connect(journal.db_path) as conn:
+        assert conn.execute(
+            "SELECT status FROM outcome_settlement_status WHERE outcome_id=3719"
+        ).fetchone()[0] == "recorded"

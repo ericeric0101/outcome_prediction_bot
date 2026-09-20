@@ -142,6 +142,10 @@ class OutcomeLiveExecutionRuntime:
             if ledger is not None and os.environ.get("OUTCOME_RISK_EPISODE_BUDGET_ENABLED", "0").strip() == "1"
             else None
         )
+        # Explicitly defaults to the historical behavior.  A disabled value
+        # is an operator-authorized observation mode: it suppresses only
+        # loss-triggered IOC exits, never normal TP or lifecycle safety.
+        self.loss_exit_enabled = os.environ.get("OUTCOME_LOSS_EXIT_ENABLED", "1").strip().lower() in {"1", "true", "yes", "on"}
         # This is intentionally an opt-in $11 canary.  $11 accommodates the
         # venue's $10 minimum after mandatory whole-share rounding; a stale
         # copied .env cannot silently authorize a larger exposure, and the
@@ -269,6 +273,7 @@ class OutcomeLiveExecutionRuntime:
             narrow_controller=self.narrow_hard_failure_controller,
             narrow_candidate=(self._narrow_hard_failure_candidate if self.narrow_hard_failure_canary_enabled else None),
             confirmed_loss_recorder=self.loss_reentry_gate,
+            loss_exit_enabled=self.loss_exit_enabled,
         )
         self.exit_requote_service = OutcomeExitRequoteService(
             recovery=self.recovery, machine=self.machine,
@@ -299,9 +304,9 @@ class OutcomeLiveExecutionRuntime:
             SafetyComponent("exit_lifecycle", self.exit_lifecycle_store is not None, "safety_critical", "v1", "ready" if self.exit_lifecycle_store else "missing", self.exit_lifecycle_store is not None, True),
             SafetyComponent("exit_requote", self.exit_requote_enabled(), "live_exit_authorization", "e4", "ready" if exit_ready else "missing", exit_ready, True),
             SafetyComponent("loss_band", self.exit_requote_enabled(), "live_exit_authorization", "e4", "ready" if exit_ready else "missing", exit_ready, True),
-            SafetyComponent("fast_failure", self.fast_failure_exit_controller is not None, "live_exit_authorization", "v1", "ready" if self.fast_failure_exit_controller else "missing", self.fast_failure_exit_controller is not None, True),
-            SafetyComponent("narrow_hard_failure_canary", self.narrow_hard_failure_canary_enabled, "live_exit_authorization", "v1", "ready" if self.narrow_hard_failure_controller else "disabled_or_missing_shared_budget", self.narrow_hard_failure_controller is not None, self.narrow_hard_failure_canary_enabled),
-            SafetyComponent("s3_emergency", self.emergency_exit_controller is not None, "live_exit_authorization", "s3", "ready" if self.emergency_exit_controller else "missing", self.emergency_exit_controller is not None, True),
+            SafetyComponent("fast_failure", self.loss_exit_enabled and self.fast_failure_exit_controller is not None, "live_exit_authorization", "v1", "ready" if self.loss_exit_enabled and self.fast_failure_exit_controller else ("operator_disabled" if not self.loss_exit_enabled else "missing"), True if not self.loss_exit_enabled else self.fast_failure_exit_controller is not None, True),
+            SafetyComponent("narrow_hard_failure_canary", self.loss_exit_enabled and self.narrow_hard_failure_canary_enabled, "live_exit_authorization", "v1", "ready" if self.loss_exit_enabled and self.narrow_hard_failure_controller else ("operator_disabled" if not self.loss_exit_enabled else "disabled_or_missing_shared_budget"), True if not self.loss_exit_enabled else self.narrow_hard_failure_controller is not None, self.narrow_hard_failure_canary_enabled),
+            SafetyComponent("s3_emergency", self.loss_exit_enabled and self.emergency_exit_controller is not None, "live_exit_authorization", "s3", "ready" if self.loss_exit_enabled and self.emergency_exit_controller else ("operator_disabled" if not self.loss_exit_enabled else "missing"), True if not self.loss_exit_enabled else self.emergency_exit_controller is not None, True),
             SafetyComponent("reversal_monitor", self.reversal_classifier is not None, "strategy_input", "v1", "ready" if self.reversal_classifier else "missing", self.reversal_classifier is not None),
             SafetyComponent("crash_shadow", self.crash_circuit_shadow is not None, "read_only", "v1", "ready" if self.crash_circuit_shadow else "missing", self.crash_circuit_shadow is not None),
             SafetyComponent("holding_path", self.holding_path_recorder is not None, "read_only", "v3", "ready" if self.holding_path_recorder else "missing", self.holding_path_recorder is not None),

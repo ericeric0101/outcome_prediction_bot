@@ -1,6 +1,6 @@
 # Hyperliquid Outcome (HIP-4) BTC Daily Prediction Market Trading Bot — Current Authority
 
-> **權威架構版本 (Authority Version)**：2.5.2 (Outcome-only, latest-confirmed-loss re-entry reference; early post-exit continuation checkpoints)
+> **權威架構版本 (Authority Version)**：2.5.3 (Outcome-only, durable settlement retry; operator-controlled loss-IOC observation mode)
 > **建立與審計日期**：2026-08-23；最近修訂：2026-09-20
 > **目標系統**：Hyperliquid HyperCore L1 原生預測市場 — Outcome (HIP-4 協議標準)  
 > **單一權威聲明**：本文件取代原 `project_overview.md`，為系統唯一的設計、架構、量化模型與執行權威規範。
@@ -21,6 +21,42 @@
 6. **Crash window 以 durable pre-submit intent 收斂。** BUY 與所有 SELL mutation（首次 protective ALO、cancel-confirm replacement ALO、price-protected IOC）都必須在 SDK mutation 前以 SQLite `synchronous=FULL` 寫入 exact wallet/outcome/coin/side/price/shares/order-kind 的 `OUTCOME_ORDER_INTENT`；寫入失敗即不送單。SELL intent 必須由 durable acknowledged/rejected finalization 或 account-truth resolution 關閉；因此即使 process 在寫 ambiguity event 前已 crash，單獨留下的 unresolved intent 也會形成 fence。ACK 不明時另寫 durable ambiguity evidence，後續只可由 fresh account truth 採納唯一且同 coin/side/price/remaining-shares 的 resting order，或在 visibility fence 後由 order absence + inventory 證據解除。ambiguous IOC 保守計入 bounded attempt budget；未解除前不得再做 exit mutation。官方 SDK 尚未在本 repo 驗證 client order id/idempotency key，故這是 restart recovery safety fence，不得宣稱能消除多 host 同 wallet 的 submit race；同 wallet live writer 仍只能一個。
 7. **Outcome coin canonicalization。** inventory 來源 `+<asset>` 與 book/order 來源 `#<asset>` 先 canonicalize 為 `#<asset>` 後才做 risk/exposure/recovery 判斷；unknown malformed coin 仍 fail-closed。
 8. **唯一 live execution path 與可診斷 sidecar。** legacy `bot/execution/outcome_execution.py` 與其測試已刪除；唯一 mutation path 為 `OutcomeLiveExecutionRuntime → OutcomeExecutionGateway → official TypeScript SDK sidecar`。sidecar stderr 寫入 bounded rotating `logs/outcome_sdk_sidecar.stderr.log`（2 MiB + 一個 rollover），不再丟棄 crash diagnostics。Telegram polling/control code 已完全移除；沒有 `/pause` 或 `/flatten` 這類會誤稱為 kill switch 的控制面。
+
+### 2026-09-20 — durable settlement retry 與 loss-IOC operator switch
+
+**Settlement retry correctness repair.** `OutcomeSettlementWorker` no longer
+relies solely on its process-local candidate set.  Every non-terminal durable
+`outcome_settlement_status` is reloaded after restart and retried alongside
+new rollover/FIFO candidates.  This closes the case where an official SDK 429
+occurred after a position was already fully sold: it is no longer an open FIFO
+lot, but it remains an official-settlement reconciliation obligation.  The
+worker remains read-only with respect to the venue.  A one-off official SDK
+retry on 2026-09-20 recorded #3719 as `settle_fraction=1.0` / side 0 winner;
+it did not infer the outcome from BTC or UI prices.
+
+**From this release onward, loss exits are explicitly switchable.**
+`OUTCOME_LOSS_EXIT_ENABLED` is an allowlisted operator setting and defaults to
+`1`, preserving historical behavior.  Setting it to `0` disables only the
+three loss-triggered IOC mutation lanes: `fast_failure`, `s3_emergency`, and
+`narrow_hard_failure_canary`.  It does **not** disable normal protective
+take-profit SELL management, reduce-only cleanup, settlement, account truth,
+durable intent, ambiguity fencing, lifecycle recovery, or read-only
+holding-risk/post-fill/continuation evidence.  When disabled, each affected
+lane durably records the transition reason
+`operator_loss_exit_disabled`; it must not cancel a protective SELL or send
+an IOC.  The startup manifest marks the three lanes `operator_disabled` and
+ready (an intentional policy choice, not a missing safety dependency).
+
+**Current authorized observation profile.** The private local deployment
+sets `OUTCOME_LOSS_EXIT_ENABLED=0` to observe several independent markets
+without loss-IOC intervention.  This is an explicit tail-risk increase, not
+evidence that hold-to-settlement is universally superior: the seven already
+officially settled recent stop lots came from only three daily markets, while
+#1993 remains an official hold-to-settlement near-total-loss counterexample.
+No automatic re-enable, threshold change, re-entry relaxation, size increase,
+or new entry authority is authorized.  A launcher restart is required; a
+shell-exported `OUTCOME_LOSS_EXIT_ENABLED` still takes precedence over `.env`
+and must be checked in the durable startup manifest.
 
 ### 2026-09-19 — 60 秒 stale zero-fill BUY admission 與 post-fill evidence 對齊
 

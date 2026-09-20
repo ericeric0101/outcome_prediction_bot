@@ -43,6 +43,7 @@ class OutcomeHoldingRiskService:
         narrow_controller: OutcomeEmergencyExitController | None = None,
         narrow_candidate: Callable[..., dict[str, object] | None] | None = None,
         confirmed_loss_recorder: Any | None = None,
+        loss_exit_enabled: bool = True,
     ) -> None:
         self.recovery = recovery
         self.machine = machine
@@ -59,6 +60,10 @@ class OutcomeHoldingRiskService:
         # policy.  Emergency IOC exits must feed it only after account truth
         # is flat and the official fill reconciliation has completed.
         self.confirmed_loss_recorder = confirmed_loss_recorder
+        # One explicit operator boundary covers every loss-triggered IOC
+        # family.  Normal protective take-profit management remains outside
+        # this service and therefore remains live while this is disabled.
+        self.loss_exit_enabled = bool(loss_exit_enabled)
         self.reversal_windows = reversal_windows
         self.fresh_book = fresh_book
         self.official_holding_age = official_holding_age
@@ -73,11 +78,15 @@ class OutcomeHoldingRiskService:
         re-reads fees/L2 and shares the same durable risk-episode budget as
         existing fast-failure and S3 controllers.
         """
+        coin = str(getattr(finding, "coin", ""))
+        inventory = Decimal(str(getattr(finding, "inventory", "0")))
+        if not self.loss_exit_enabled:
+            self._audit_early(component="OUTCOME_NARROW_HARD_FAILURE_CANARY", market=market, coin=coin,
+                              reason="operator_loss_exit_disabled", inventory=inventory)
+            return None
         if (self.ledger is None or self.store is None or self.narrow_controller is None
                 or self.narrow_policy is None or self.narrow_candidate is None or self.risk_episodes is None):
             return None
-        coin = str(getattr(finding, "coin", ""))
-        inventory = Decimal(str(getattr(finding, "inventory", "0")))
         if not tuple(getattr(finding, "sell_order_ids", ())):
             self._audit_early(component="OUTCOME_NARROW_HARD_FAILURE_CANARY", market=market, coin=coin, reason="no_owned_protective_sell", inventory=inventory)
             return None
@@ -123,10 +132,14 @@ class OutcomeHoldingRiskService:
         )
 
     def maybe_fast_failure(self, *, market: OutcomeMarketSpec, finding: object) -> LiveExecutionResult | None:
-        if self.ledger is None or self.store is None or self.fast_controller is None:
-            return None
         coin = str(getattr(finding, "coin", ""))
         inventory = Decimal(str(getattr(finding, "inventory", "0")))
+        if not self.loss_exit_enabled:
+            self._audit_early(component="OUTCOME_FAST_FAILURE_EXIT_DECISION", market=market, coin=coin,
+                              reason="operator_loss_exit_disabled", inventory=inventory)
+            return None
+        if self.ledger is None or self.store is None or self.fast_controller is None:
+            return None
         if not tuple(getattr(finding, "sell_order_ids", ())):
             self._audit_early(component="OUTCOME_FAST_FAILURE_EXIT_DECISION", market=market, coin=coin, reason="no_owned_protective_sell", inventory=inventory)
             return None
@@ -180,10 +193,14 @@ class OutcomeHoldingRiskService:
         )
 
     def maybe_emergency(self, *, market: OutcomeMarketSpec, finding: object) -> LiveExecutionResult | None:
-        if self.ledger is None or self.store is None or self.emergency_controller is None:
-            return None
         coin = str(getattr(finding, "coin", ""))
         inventory = Decimal(str(getattr(finding, "inventory", "0")))
+        if not self.loss_exit_enabled:
+            self._audit_early(component="OUTCOME_EMERGENCY_EXIT_DECISION", market=market, coin=coin,
+                              reason="operator_loss_exit_disabled", inventory=inventory)
+            return None
+        if self.ledger is None or self.store is None or self.emergency_controller is None:
+            return None
         if not tuple(getattr(finding, "sell_order_ids", ())):
             self._audit_early(component="OUTCOME_EMERGENCY_EXIT_DECISION", market=market, coin=coin, reason="no_owned_protective_sell", inventory=inventory)
             return None

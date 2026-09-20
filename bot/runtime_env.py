@@ -26,6 +26,15 @@ LIVE_EXIT_CANARY_LOCAL_ENV_KEYS = frozenset({
     "OUTCOME_NARROW_HARD_FAILURE_CANARY_ENABLED",
 })
 
+# This is an explicit operator kill switch for all loss-triggered IOC lanes.
+# It does not cover normal take-profit, settlement, reduce-only cleanup, or
+# account/lifecycle reconciliation.  Keep it named and allowlisted so a
+# private .env can intentionally disable the policy without silently falling
+# back to the code default.
+LOSS_EXIT_OPERATOR_LOCAL_ENV_KEYS = frozenset({
+    "OUTCOME_LOSS_EXIT_ENABLED",
+})
+
 # Deliberately small, current Outcome-only local configuration surface. Legacy
 # keys may remain in an old private .env during migration but are never loaded.
 LOCAL_ENV_KEYS = frozenset({
@@ -45,7 +54,7 @@ LOCAL_ENV_KEYS = frozenset({
     "OUTCOME_TIER_B_ENABLED", "OUTCOME_LIVE_STRATEGY_MIN_ENTRY_PRICE",
     "OUTCOME_STALE_ENTRY_CANCEL_ENABLED", "OUTCOME_STALE_ENTRY_CANCEL_SEC",
     "OUTCOME_MAX_ENTRY_NOTIONAL_USDC", "OUTCOME_MAX_OUTCOME_EXPOSURE_USDC", "OUTCOME_MAX_OPEN_ORDERS",
-}) | LIVE_EXIT_CANARY_LOCAL_ENV_KEYS
+}) | LIVE_EXIT_CANARY_LOCAL_ENV_KEYS | LOSS_EXIT_OPERATOR_LOCAL_ENV_KEYS
 
 
 def load_runtime_env(

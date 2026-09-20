@@ -1434,6 +1434,25 @@ class TradeJournalDB:
         except (sqlite3.Error, TypeError, ValueError):
             return False
 
+    def load_pending_outcome_settlement_ids(self) -> set[int]:
+        """Return durable settlement candidates which have not reached a terminal state.
+
+        A settlement worker can be restarted after the official SDK was rate
+        limited.  In that case its in-memory candidate set is empty, and a
+        fully sold lifecycle no longer appears in FIFO's unresolved inventory.
+        Preserve the retry obligation in the journal instead of silently
+        abandoning official settlement reconciliation.
+        """
+        try:
+            with self._connect() as conn:
+                rows = conn.execute(
+                    """SELECT outcome_id FROM outcome_settlement_status
+                       WHERE status NOT IN ('recorded', 'already_recorded')"""
+                ).fetchall()
+            return {int(outcome_id) for (outcome_id,) in rows if int(outcome_id) > 0}
+        except (sqlite3.Error, TypeError, ValueError):
+            return set()
+
     def upsert_outcome_oi_feature_row(self, *, feature_schema_version: int, outcome_snapshot_event_id: int,
                                       outcome_id: int, period: str, snapshot_timestamp_ms: int,
                                       oi_observation_id: int | None, oi_exchange_timestamp_ms: int | None,
