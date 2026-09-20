@@ -49,7 +49,15 @@ def as_dict(db_path: str | Path, *, period: str = "1d", recent_event_limit: int 
             payload = json.loads(raw or "{}")
             if payload.get("period") != period:
                 continue
+            # V1.2 compact ticks retain the gate-ablation scalars under
+            # ``signal_summary``; legacy and transition-full snapshots retain
+            # the original immutable raw evidence.
             evidence = payload.get("raw_signal_evidence")
+            if not isinstance(evidence, dict):
+                evidence = payload.get("signal_summary")
+            if not isinstance(evidence, dict):
+                compact = payload.get("compact_summary")
+                evidence = compact.get("signal_summary") if isinstance(compact, dict) else None
             alternatives = evidence.get("gate_variants") if isinstance(evidence, dict) else None
             if not isinstance(alternatives, dict):
                 missing_variant_payload += 1

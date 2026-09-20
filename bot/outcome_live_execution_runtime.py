@@ -86,6 +86,10 @@ class OutcomeLiveExecutionRuntime:
     _HOLDING_PATH_MIN_INTERVAL_SEC = 30.0
     _REVERSAL_RISK_MIN_INTERVAL_SEC = 5.0
     _CRASH_SHADOW_MIN_INTERVAL_SEC = 10.0
+    # V1.2 storage compaction: tick density remains durable, but repeated
+    # nested research/account payloads only need a full forensic snapshot on
+    # a meaningful state transition or bounded heartbeat.
+    _DECISION_TELEMETRY_FULL_HEARTBEAT_SEC = 300.0
 
     def __init__(self, *, account: OutcomeClient, wallet: str, gateway: OutcomeExecutionGateway | None = None, risk_gate: OutcomePreTradeRiskGate | None = None, stream_health: OutcomeStreamHealth | None = None, ledger: OutcomeExecutionLedger | None = None, research_gate: OutcomeResearchGate | None = None, exit_planner: OutcomeExitQuotePlanner | None = None, exit_lifecycle_store: OutcomeExitLifecycleStore | None = None, exit_requote_controller: OutcomeExitRequoteController | None = None, entry_planner: OutcomeEntryQuotePlanner | None = None, entry_lifecycle_store: OutcomeEntryLifecycleStore | None = None, entry_requote_controller: OutcomeEntryRequoteController | None = None, structural_collapse_shadow: OutcomeStructuralCollapseShadow | None = None, entry_readiness_shadow: OutcomeEntryReadinessShadow | None = None) -> None:
         self._account_reads = OutcomeAccountReadCache(account)
@@ -299,6 +303,12 @@ class OutcomeLiveExecutionRuntime:
             gate_audit=self._audit_exit_requote_gate,
         )
         self._current_tick_snapshot: OutcomeRuntimeTickSnapshot | None = None
+        # This is observation-only and intentionally process-local.  A fresh
+        # process/new market emits full evidence rather than guessing prior
+        # state.  Only the currently active market is retained, preventing an
+        # unbounded dictionary over daily rollovers.
+        self._decision_telemetry_market_id: int | None = None
+        self._decision_telemetry_state: dict[str, tuple[str, float]] = {}
 
     def safety_components(self, *, settlement_ready: bool | None = None) -> tuple[SafetyComponent, ...]:
         """Report loaded components from runtime truth, never config intent."""
@@ -1037,6 +1047,86 @@ class OutcomeLiveExecutionRuntime:
         except (KeyError, TypeError, ValueError, ArithmeticError):
             return None
 
+    @staticmethod
+    def _decision_signal_summary(entry_evidence: dict[str, object]) -> dict[str, object]:
+        """Keep scalar S0/gate-ablation evidence on every compact tick."""
+        keys = (
+            "decision_observed_at_ms", "oi_current_id", "oi_prior_id", "oi_age_ms",
+            "spot_strike_bps", "oi_return_bps", "mark_return_bps", "oi_lookback_sec",
+            "tier_b_enabled", "entry_tier",
+        )
+        summary = {key: entry_evidence.get(key) for key in keys if key in entry_evidence}
+        variants = entry_evidence.get("gate_variants")
+        if isinstance(variants, dict):
+            # Gate ablation needs only eligibility/side, not the unrelated
+            # nested score/research context carried by a legacy full event.
+            summary["gate_variants"] = {
+                str(name): {
+                    "eligible": bool(value.get("eligible")),
+                    "side_index": value.get("side_index"),
+                }
+                for name, value in variants.items() if isinstance(value, dict)
+            }
+        return summary
+
+    @staticmethod
+    def _decision_shadow_state(value: object) -> str | None:
+        if not isinstance(value, dict):
+            return None
+        for key in ("state", "reason", "candidate_confidence", "decision_kind"):
+            if value.get(key) is not None:
+                return str(value[key])
+        return None
+
+    @staticmethod
+    def _decision_blocker_code(*, state: str, reason: str) -> str:
+        normalized = reason.lower()
+        if state == "buy_placed":
+            return "buy_placed"
+        if "directional_confirmation_not_met" in normalized:
+            return "no_signal"
+        if "account recovery" in normalized:
+            return "account_recovery_block"
+        if "retiring" in normalized or "rollover" in normalized:
+            return "retiring_market_active"
+        if "existing outcome" in normalized or "protective" in normalized:
+            return "active_inventory"
+        if "owned entry" in normalized:
+            return "pending_owned_entry"
+        if "visibility" in normalized:
+            return "fill_visibility_barrier"
+        if "market-data gate" in normalized or "ws_" in normalized:
+            return "stream_not_ready"
+        if "stale" in normalized:
+            return "stale_decision"
+        if "risk gate" in normalized:
+            return "risk_gate"
+        if "portfolio" in normalized:
+            return "portfolio_guard"
+        if "submit" in normalized or state == "error":
+            return "entry_submit_failed"
+        if state == "flat":
+            return "flat"
+        return "other"
+
+    def _decision_payload_mode(self, *, event_type: str, market: OutcomeMarketSpec,
+                               state_signature: dict[str, object], important: bool = False) -> str:
+        """Return compact/full mode without ever influencing execution flow."""
+        now = time.monotonic()
+        if self._decision_telemetry_market_id != market.outcome_id:
+            self._decision_telemetry_market_id = market.outcome_id
+            self._decision_telemetry_state.clear()
+        key = event_type
+        signature = json.dumps(state_signature, sort_keys=True, default=str, separators=(",", ":"))
+        prior = self._decision_telemetry_state.get(key)
+        if prior is None or prior[0] != signature or important:
+            self._decision_telemetry_state[key] = (signature, now)
+            return "full_transition"
+        if now - prior[1] >= self._DECISION_TELEMETRY_FULL_HEARTBEAT_SEC:
+            self._decision_telemetry_state[key] = (signature, now)
+            return "full_heartbeat"
+        return "compact"
+
     def _record_entry_gate_decision(self, *, market: OutcomeMarketSpec, entry_side_index: int | None,
                                     entry_reason: str, entry_evidence: dict[str, object],
                                     active: list[object]) -> None:
@@ -1048,7 +1138,33 @@ class OutcomeLiveExecutionRuntime:
         """
         if self.ledger is None:
             return
+        active_summary = [
+            {"coin": str(getattr(item, "coin", "")), "state": str(getattr(item, "state", "")),
+             "inventory": str(getattr(item, "inventory", "0"))}
+            for item in active
+        ]
+        compact = {
+            "schema_version": 2, "payload_mode": "compact",
+            "venue": "hyperliquid_outcome", "read_only": True,
+            "outcome_id": market.outcome_id, "period": market.period,
+            "entry_side_index": entry_side_index, "entry_reason": entry_reason,
+            "signal_present": entry_side_index is not None,
+            "signal_summary": self._decision_signal_summary(entry_evidence),
+            "active_exposure_count": len(active), "active_states": active_summary,
+            "execution_submitted": False,
+        }
+        mode = self._decision_payload_mode(
+            event_type="OUTCOME_ENTRY_GATE_DECISION", market=market,
+            state_signature={
+                "side": entry_side_index, "reason": entry_reason,
+                "active": active_summary, "variants": compact["signal_summary"].get("gate_variants"),
+            },
+        )
+        if mode == "compact":
+            self._log_best_effort_strategy_event("OUTCOME_ENTRY_GATE_DECISION", compact)
+            return
         self._log_best_effort_strategy_event("OUTCOME_ENTRY_GATE_DECISION", {
+            "schema_version": 2, "payload_mode": mode,
             "venue": "hyperliquid_outcome", "read_only": True,
             "outcome_id": market.outcome_id, "period": market.period,
             "entry_side_index": entry_side_index, "entry_reason": entry_reason,
@@ -1060,7 +1176,7 @@ class OutcomeLiveExecutionRuntime:
                  "sell_order_ids": list(getattr(item, "sell_order_ids", ()))}
                 for item in active
             ],
-            "execution_submitted": False,
+            "execution_submitted": False, "compact_summary": compact,
         })
 
     def _record_entry_admission_decision(self, *, market: OutcomeMarketSpec,
@@ -1083,7 +1199,47 @@ class OutcomeLiveExecutionRuntime:
         else:
             status = self.stream_health.check(market)
             stream = {"ready": status.ready, "reason": status.reason}
+        account = admission.get("account_recovery")
+        account_safe = account.get("safe_for_new_entry") if isinstance(account, dict) else None
+        account_reason = account.get("reason") if isinstance(account, dict) else None
+        readiness = admission.get("entry_readiness_shadow")
+        regime = admission.get("market_regime_shadow")
+        final_reason = str(result.detail)
+        blocker = self._decision_blocker_code(state=result.state, reason=final_reason)
+        compact = {
+            "schema_version": 2, "payload_mode": "compact",
+            "venue": "hyperliquid_outcome", "read_only": True,
+            "outcome_id": market.outcome_id, "period": market.period,
+            "raw_signal_side_index": entry_side_index, "raw_signal_reason": entry_reason,
+            "signal_summary": self._decision_signal_summary(entry_evidence),
+            "final_state": result.state, "final_reason": final_reason,
+            "blocker_code": blocker, "execution_submitted": result.state == "buy_placed",
+            "order_id": result.order_id,
+            "stream_ready": stream["ready"], "stream_reason": stream["reason"],
+            "account_safe_for_new_entry": account_safe, "account_recovery_reason": account_reason,
+            "reduce_only": bool(admission.get("reduce_only", False)),
+            "active_exposure_count": admission.get("active_current_market_count"),
+            "entry_readiness_state": self._decision_shadow_state(readiness),
+            "entry_readiness_candidate": readiness.get("candidate") if isinstance(readiness, dict) else None,
+            "entry_readiness_persistent_candidate": readiness.get("persistent_candidate") if isinstance(readiness, dict) else None,
+            "market_regime_state": self._decision_shadow_state(regime),
+        }
+        important = result.state == "buy_placed" or blocker in {"entry_submit_failed", "account_recovery_block"}
+        mode = self._decision_payload_mode(
+            event_type="OUTCOME_ENTRY_ADMISSION_DECISION", market=market,
+            state_signature={
+                "side": entry_side_index, "signal_reason": entry_reason,
+                "state": result.state, "blocker": blocker, "reason": final_reason,
+                "stream": stream, "account_safe": account_safe,
+                "active": compact["active_exposure_count"],
+                "readiness": compact["entry_readiness_state"], "regime": compact["market_regime_state"],
+            }, important=important,
+        )
+        if mode == "compact":
+            self._log_best_effort_strategy_event("OUTCOME_ENTRY_ADMISSION_DECISION", compact)
+            return
         self._log_best_effort_strategy_event("OUTCOME_ENTRY_ADMISSION_DECISION", {
+            "schema_version": 2, "payload_mode": mode,
             "venue": "hyperliquid_outcome", "outcome_id": market.outcome_id,
             "period": market.period, "read_only": True,
             "raw_signal_side_index": entry_side_index, "raw_signal_reason": entry_reason,
@@ -1093,6 +1249,7 @@ class OutcomeLiveExecutionRuntime:
             "final_state": result.state, "final_reason": result.detail,
             "execution_submitted": result.state == "buy_placed",
             "order_id": result.order_id,
+            "blocker_code": blocker, "compact_summary": compact,
         })
 
     def tick(self, *, market: OutcomeMarketSpec, side_index: int, entry_permitted: bool) -> LiveExecutionResult:

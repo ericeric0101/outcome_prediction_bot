@@ -8,6 +8,7 @@ from bot.lifecycle.outcome_lifecycle import OutcomeMarketSpec
 from bot.outcome_live_execution_runtime import OutcomeLiveExecutionRuntime
 from bot.outcome_stream_health import OutcomeStreamHealth
 from bot.outcome_execution_ledger import OutcomeExecutionLedger
+from bot.outcome_runtime_types import LiveExecutionResult
 from bot.outcome_entry_lifecycle import OutcomeEntryLifecycle
 from bot.outcome_exit_lifecycle import OutcomeExitLifecycle, OutcomeExitLifecycleStore
 from bot.outcome_exit_quote_planner import OutcomeExitQuotePlanner, OutcomeExitQuotePlannerConfig
@@ -49,6 +50,61 @@ def test_runtime_is_disabled_without_both_operator_gates(monkeypatch):
     monkeypatch.delenv("OUTCOME_SDK_EXECUTION_ENABLED", raising=False)
     runtime = OutcomeLiveExecutionRuntime(account=Account(), wallet="w", gateway=Gateway())
     assert runtime.tick(market=market(), side_index=0, entry_permitted=True).state == "disabled"
+
+
+def test_v12_decision_telemetry_compacts_ticks_but_keeps_transition_and_heartbeat_evidence(tmp_path):
+    journal = TradeJournalDB(tmp_path / "telemetry.db")
+    runtime = OutcomeLiveExecutionRuntime(
+        account=Account(), wallet="w", gateway=Gateway(), ledger=OutcomeExecutionLedger(journal, "run"),
+    )
+    evidence = {
+        "decision_observed_at_ms": 1, "spot_strike_bps": "2", "oi_return_bps": "3", "mark_return_bps": "4",
+        "gate_variants": {"spot_mark_oi": {"eligible": False, "side_index": None}},
+        # This deliberately large nested object must remain only in the full
+        # transition record, never normal compact ticks.
+        "nested_research": {"blob": "x" * 4_000},
+    }
+    admission = {"account_recovery": {"safe_for_new_entry": True, "reason": "ok"}, "active_current_market_count": 0}
+    result = LiveExecutionResult("flat", "live strategy no entry: directional_confirmation_not_met")
+    runtime._record_entry_gate_decision(market=market(), entry_side_index=None, entry_reason="directional_confirmation_not_met", entry_evidence=evidence, active=[])
+    runtime._record_entry_admission_decision(market=market(), entry_side_index=None, entry_reason="directional_confirmation_not_met", entry_evidence=evidence, admission=admission, result=result)
+    runtime._record_entry_gate_decision(market=market(), entry_side_index=None, entry_reason="directional_confirmation_not_met", entry_evidence=evidence, active=[])
+    runtime._record_entry_admission_decision(market=market(), entry_side_index=None, entry_reason="directional_confirmation_not_met", entry_evidence=evidence, admission=admission, result=result)
+    with sqlite3.connect(journal.db_path) as conn:
+        rows = conn.execute("SELECT event_type,payload_json FROM strategy_events ORDER BY id").fetchall()
+    payloads = [(event_type, json.loads(raw)) for event_type, raw in rows]
+    assert [payload["payload_mode"] for _, payload in payloads] == [
+        "full_transition", "full_transition", "compact", "compact",
+    ]
+    compact_admission = payloads[-1][1]
+    compact_gate = payloads[-2][1]
+    assert "raw_signal_evidence" not in compact_admission
+    assert "entry_evidence" not in compact_gate
+    assert compact_admission["signal_summary"]["gate_variants"]["spot_mark_oi"]["eligible"] is False
+    assert len(json.dumps(compact_admission)) < 1_000
+    assert len(json.dumps(compact_gate)) < 700
+    # Full heartbeat remains available even while the decision state is unchanged.
+    runtime._decision_telemetry_state["OUTCOME_ENTRY_ADMISSION_DECISION"] = (
+        runtime._decision_telemetry_state["OUTCOME_ENTRY_ADMISSION_DECISION"][0], -1_000.0,
+    )
+    runtime._record_entry_admission_decision(market=market(), entry_side_index=None, entry_reason="directional_confirmation_not_met", entry_evidence=evidence, admission=admission, result=result)
+    with sqlite3.connect(journal.db_path) as conn:
+        heartbeat = json.loads(conn.execute("SELECT payload_json FROM strategy_events ORDER BY id DESC LIMIT 1").fetchone()[0])
+    assert heartbeat["payload_mode"] == "full_heartbeat"
+
+
+def test_v12_decision_telemetry_resets_full_snapshot_on_market_rollover_and_buy(tmp_path):
+    journal = TradeJournalDB(tmp_path / "rollover.db")
+    runtime = OutcomeLiveExecutionRuntime(account=Account(), wallet="w", gateway=Gateway(), ledger=OutcomeExecutionLedger(journal, "run"))
+    evidence = {"gate_variants": {"spot_mark_oi": {"eligible": True, "side_index": 0}}}
+    result = LiveExecutionResult("buy_placed", "buy placed")
+    runtime._record_entry_admission_decision(market=market(), entry_side_index=0, entry_reason="eligible", entry_evidence=evidence, admission={}, result=result)
+    runtime._record_entry_admission_decision(market=market(), entry_side_index=0, entry_reason="eligible", entry_evidence=evidence, admission={}, result=result)
+    next_market = OutcomeMarketSpec(1154, "@1154", "#11540", "#11541", 1, 2, "priceBinary", "BTC", "20260825-1400", 1, 0, Decimal("1"), "15m", "")
+    runtime._record_entry_admission_decision(market=next_market, entry_side_index=0, entry_reason="eligible", entry_evidence=evidence, admission={}, result=LiveExecutionResult("flat", "idle"))
+    with sqlite3.connect(journal.db_path) as conn:
+        modes = [json.loads(raw)["payload_mode"] for (raw,) in conn.execute("SELECT payload_json FROM strategy_events ORDER BY id")]
+    assert modes == ["full_transition", "full_transition", "full_transition"]
 
 
 def test_narrow_hard_failure_canary_requires_eleven_dollar_limits_and_shared_episode_budget(monkeypatch, tmp_path):

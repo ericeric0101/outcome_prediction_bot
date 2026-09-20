@@ -32,7 +32,11 @@ def _number(value: object) -> Decimal | None:
 def _reason_bucket(payload: dict[str, Any]) -> str:
     reason = str(payload.get("final_reason") or "unknown")
     admission = payload.get("admission_inputs")
-    active = admission.get("active_current_market_count", 0) if isinstance(admission, dict) else 0
+    active = (
+        admission.get("active_current_market_count", 0)
+        if isinstance(admission, dict)
+        else payload.get("active_exposure_count", 0)
+    )
     if active or reason.startswith("exit ") or "protective" in reason or "existing Outcome" in reason:
         return "capital_committed"
     if payload.get("execution_submitted") is True:

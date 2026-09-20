@@ -1,6 +1,6 @@
 # Hyperliquid Outcome (HIP-4) BTC Daily Prediction Market Trading Bot — Current Authority
 
-> **權威架構版本 (Authority Version)**：2.5.9 (Outcome-only; all-loss-exit observation mode; conservative telemetry retention V1.1 attribution)
+> **權威架構版本 (Authority Version)**：2.5.10 (Outcome-only; all-loss-exit observation mode; conservative telemetry retention V1.2 compaction)
 > **建立與審計日期**：2026-08-23；最近修訂：2026-09-20
 > **目標系統**：Hyperliquid HyperCore L1 原生預測市場 — Outcome (HIP-4 協議標準)  
 > **單一權威聲明**：本文件取代原 `project_overview.md`，為系統唯一的設計、架構、量化模型與執行權威規範。
@@ -109,6 +109,18 @@ and must be checked in the durable startup manifest.
 **模型 dependency map。** B1/B2 active dataset/model、fair-value 與 OI walk-forward 都讀 `outcome_oi_feature_rows`；其 source chain 是 P2 + `binance_oi_observations` + canonical `FILL_MARKOUT`。Deribit walk-forward 讀 `outcome_deribit_feature_rows`（P2 + Deribit snapshot）。L2/trades、holding paths 與 fill markouts 分別是 exit/entry replay/calibration 的 source evidence。因此 V1.1 沒有把「derived feature 已存在」誤解成 raw source 可刪，也沒有改 online S0 對 recent Binance OI 的讀取。
 
 **可驗證的下一步（僅建議，非本版行為）。** 優先以現有 report 的 exact bytes/day 排序後，為 admission/gate 設計相容的 compact every-tick schema + full payload only on transition/candidate/submit/block/error，並以 schema/config hash 取代重複 immutable thresholds；對 timing 類比較 all-slow rows 與 1/min compact heartbeat 的實測 rows/day；raw L2/trades/P2 先研究 completed-market event-window export/archive，保留 replays 所需 window，不能直接 TTL。每一個候選都必須先列出 consumers、historical-reader compatibility、estimated current/after bytes/day 與獨立 regression；在此之前分類為 **KEEP AS-IS**。V1.1 不改 live entry/exit/TP/loss switch/stale cancel、ML authority 或任何 existing telemetry writer。
+
+### 2026-09-20 — Outcome DB Retention / Telemetry V1.2（Admission/Gate 未來寫入壓縮）
+
+**範圍與不變量。** V1.2 只縮小未來 `OUTCOME_ENTRY_ADMISSION_DECISION` / `OUTCOME_ENTRY_GATE_DECISION` 的重複 JSON；不改、不刪、也不 migration 歷史 rows，V1 的 prune allowlist 未變，`OUTCOME_RUNTIME_TIMING` 本版也未動。完全不改 live entry/exit、60 秒 stale zero-fill cancel、`OUTCOME_LOSS_EXIT_ENABLED`、Entry Readiness、Structural Collapse、lifecycle/ambiguity、SDK path、P2/Deribit/L2/trades 或任何 model/feature table。寫入仍是 best-effort telemetry，payload construction/state tracking 不能成為 execution control-flow dependency。
+
+**consumer audit 與 v2 schema。** gate-ablation 實際需要 `gate_variants` 的 eligible/side scalar；capital-efficiency 實際需要 `final_reason`、`execution_submitted`、period、outcome 與 active exposure count。v2 every-tick payload 因此保留 `schema_version=2`、`payload_mode=compact`、market/period、raw signal side/reason、`signal_summary`（含 gate variants 與 S0 scalar）、final state/reason、stable blocker code、stream/account/reduce-only/active-count/readiness/regime scalar，卻不複製 `raw_signal_evidence`、`admission_inputs`、full active account arrays 或 nested research model outputs。gate-ablation reader 支援 legacy `raw_signal_evidence`、v2 compact `signal_summary`、以及 v2 full `compact_summary`；capital report 也支援 compact `active_exposure_count`。故 500k+ legacy rows 仍原樣可讀，沒有資料回寫。
+
+**full evidence contract。** 每個新 process／market 的第一筆是 `full_transition`；signal side/reason、final state/reason/blocker、stream readiness、account safe state、active exposure、readiness 或 regime state 改變時亦為 full；`buy_placed`、submit error、account-recovery block 不能被 compact 抑制。狀態以單一 active `outcome_id` process-local map 追蹤，rollover 會清空 map，所以不會拿舊市場壓制新市場的第一筆 full，也不會無界累積。穩定狀態每 tick 仍有 compact row；未改變時每 **300 秒** 寫一筆 `full_heartbeat`，讓 forensic reader 有完整 nested evidence。restart 不猜舊 state，直接 full。V1.1 storage report 現會依 `payload_mode` 分組，能在 3–7 天 forward window 比較 legacy/compact/transition/heartbeat 實際 bytes/day。
+
+**容量基線與保守 projection。** V1.1 實測舊 Admission 約 3,749B/row、44,293 rows/day、199MB/day；Gate 約 1,038B/row、43,992 rows/day、46.8MB/day。代表性 serializer regression（刻意含 4KB nested research evidence）為 full Admission 5,472B、full Gate 4,823B，穩定 compact Admission 823B、Gate 410B。以各 5-minute heartbeat（288/day）、目前 row rate、及**未預先假設額外 state transitions**估算：Admission 約 37.5MB/day（相對 199，省約 161.5MB/day／4.85GB per 30d）；Gate 約18.3MB/day（相對46.8，省約28.5MB/day／0.85GB per 30d）；合計約 **5.7GB/30d logical payload** 的 base-case savings。transition/full frequency 是 forward evidence，可能降低實際節省，故不得把 unit-test projection 宣稱為已實現 disk saving。
+
+**驗證與後續。** regression 覆蓋 v2 first/transition/unchanged/heartbeat/rollover/buy full、payload-size bounds、legacy + compact gate-ablation reader、capital-efficiency compact fallback、storage-report mode attribution，以及既有 execution/lifecycle tests。部署後 3–7 天只用 `--storage-report` 檢查各 mode 的 rows、avg bytes、MB/day、full-transition/heartbeat frequency；若 readers 缺欄，先補 compatibility 再考慮任何更進一步寫頻率降低。P2/Deribit/L2 與 runtime timing 需各自 dependency/replay evidence，不能藉本次 compaction 一併調整。
 
 ### 2026-09-19 — 60 秒 stale zero-fill BUY admission 與 post-fill evidence 對齊
 

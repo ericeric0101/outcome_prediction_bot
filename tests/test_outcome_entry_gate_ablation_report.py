@@ -33,3 +33,20 @@ def test_report_compares_counterfactual_eligibility_without_claiming_counterfact
     assert report["live_baseline"]["official_buy_fills"] == 1
     assert report["ready_for_live_gate_change"] is False
     assert "markout" in json.dumps(report["counterfactual_limits"])
+
+
+def test_report_reads_v12_compact_signal_summary_without_historical_migration(tmp_path):
+    journal = TradeJournalDB(tmp_path / "ablation-v12.db")
+    variants = {
+        "spot_mark_oi": {"eligible": True, "side_index": 0},
+        "spot_mark": {"eligible": True, "side_index": 0},
+        "spot_mark_or_oi": {"eligible": True, "side_index": 0},
+    }
+    journal.log_strategy_event("run", "OUTCOME_ENTRY_ADMISSION_DECISION", {
+        "schema_version": 2, "payload_mode": "compact", "period": "1d",
+        "signal_summary": {"gate_variants": variants},
+        "final_reason": "live strategy no entry", "execution_submitted": False,
+    })
+    report = as_dict(journal.db_path)
+    assert report["admission_observations_with_variants"] == 1
+    assert report["variants"]["spot_mark_oi"]["eligible_observations"] == 1

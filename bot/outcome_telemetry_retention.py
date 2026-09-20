@@ -242,7 +242,9 @@ def _event_storage_rows(conn: sqlite3.Connection, *, table: str, now: datetime) 
     cutoff_1d = utc_cutoff_iso(now=now, days=1)
     cutoff_7d = utc_cutoff_iso(now=now, days=7)
     rows = conn.execute(f"""
-        SELECT event_type, COUNT(*),
+        SELECT event_type,
+               COALESCE(json_extract(payload_json, '$.payload_mode'), 'legacy') AS payload_mode,
+               COUNT(*),
                COALESCE(SUM(LENGTH(payload_json)), 0),
                COALESCE(AVG(LENGTH(payload_json)), 0),
                COALESCE(MIN(LENGTH(payload_json)), 0), COALESCE(MAX(LENGTH(payload_json)), 0),
@@ -252,25 +254,25 @@ def _event_storage_rows(conn: sqlite3.Connection, *, table: str, now: datetime) 
                SUM(CASE WHEN ts>=? THEN 1 ELSE 0 END),
                COALESCE(SUM(CASE WHEN ts>=? THEN LENGTH(payload_json) ELSE 0 END), 0)
         FROM {_quoted_identifier(table)}
-        GROUP BY event_type
+        GROUP BY event_type, payload_mode
     """, (cutoff_1d, cutoff_1d, cutoff_7d, cutoff_7d)).fetchall()
     output: list[dict[str, Any]] = []
     for row in rows:
-        total = int(row[2] or 0)
-        bytes_7d = int(row[11] or 0)
+        total = int(row[3] or 0)
+        bytes_7d = int(row[12] or 0)
         output.append({
-            "event_type": str(row[0]), "rows": int(row[1]), "logical_payload": _bytes_metric(total),
-            "avg_payload_bytes": round(float(row[3] or 0), 3), "min_payload_bytes": int(row[4] or 0),
-            "max_payload_bytes": int(row[5] or 0), "oldest_ts": row[6], "newest_ts": row[7],
+            "event_type": str(row[0]), "payload_mode": str(row[1]), "rows": int(row[2]), "logical_payload": _bytes_metric(total),
+            "avg_payload_bytes": round(float(row[4] or 0), 3), "min_payload_bytes": int(row[5] or 0),
+            "max_payload_bytes": int(row[6] or 0), "oldest_ts": row[7], "newest_ts": row[8],
             # SQLite's bundled aggregate API has no portable exact percentile.
             # Materializing every JSON length would turn this operator report
             # into an unbounded second full scan, so callers get exact
             # total/mean/min/max and an explicit non-fabricated median state.
             "median_payload_bytes": None,
             "median_measurement": "not computed: no portable SQLite percentile aggregate",
-            "last_1d": {"rows": int(row[8] or 0), "logical_payload": _bytes_metric(int(row[9] or 0))},
-            "last_7d": {"rows": int(row[10] or 0), "logical_payload": _bytes_metric(bytes_7d)},
-            "recent_rows_per_day": round(int(row[10] or 0) / 7, 3),
+            "last_1d": {"rows": int(row[9] or 0), "logical_payload": _bytes_metric(int(row[10] or 0))},
+            "last_7d": {"rows": int(row[11] or 0), "logical_payload": _bytes_metric(bytes_7d)},
+            "recent_rows_per_day": round(int(row[11] or 0) / 7, 3),
             "recent_payload_mb_per_day": round(bytes_7d / 7 / 1_000_000, 6),
             "projected_payload_gb_30d": round(bytes_7d / 7 * 30 / 1_000_000_000, 6),
         })
