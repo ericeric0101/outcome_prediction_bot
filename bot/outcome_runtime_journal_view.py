@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from bot.lifecycle.outcome_lifecycle import OutcomeMarketSpec
+from monitoring.db_mem_diag import DbMemDiag
 
 
 class OutcomeRuntimeJournalView:
@@ -61,12 +62,15 @@ class OutcomeRuntimeJournalView:
             return bool(self._tick_cache[key])
         # Fail closed on unavailable journal.
         found = True
+        diag = DbMemDiag("runtime_journal_continuation_entries")
+        rows: list[tuple[object, ...]] = []
         try:
             with self._connect() as conn:
                 rows = conn.execute(
                     "SELECT payload_json FROM strategy_events "
                     "WHERE event_type='OUTCOME_LIVE_STRATEGY_ENTRY_PLACED' ORDER BY id DESC LIMIT 500"
                 ).fetchall()
+            diag.after_query(rows=len(rows), payload_bytes=sum(len(str(row[0] or "")) for row in rows))
             found = False
             for (raw,) in rows:
                 try:
@@ -78,6 +82,8 @@ class OutcomeRuntimeJournalView:
                     continue
         except sqlite3.Error:
             found = True
+        finally:
+            diag.finish(note="bounded_500_row_window")
         self._tick_cache[key] = found
         return found
 
@@ -118,12 +124,14 @@ class OutcomeRuntimeJournalView:
                         if valid:
                             result = (timestamp, payload)
                 else:
+                    diag = DbMemDiag("runtime_journal_persisted_entry_policy_fallback")
                     rows = conn.execute(
                         """SELECT ts, payload_json FROM order_events
                            WHERE event_type='ORDER_SUBMIT' AND side='BUY' AND instrument_id=?
                              AND CAST(json_extract(payload_json, '$.outcome_id') AS INTEGER)=?
                            ORDER BY id DESC LIMIT 20""", (coin, market.outcome_id),
                     ).fetchall()
+                    diag.after_query(rows=len(rows), payload_bytes=sum(len(str(row[1] or "")) for row in rows))
                     for timestamp, raw_payload in rows:
                         order_payload = json.loads(raw_payload or "{}")
                         audit = order_payload.get("audit") if isinstance(order_payload, dict) else None
@@ -133,6 +141,7 @@ class OutcomeRuntimeJournalView:
                         ):
                             result = (str(timestamp), audit)
                             break
+                    diag.finish(note="bounded_20_row_window")
         except (KeyError, TypeError, ValueError, sqlite3.Error, json.JSONDecodeError):
             result = None
         self._tick_cache[key] = result

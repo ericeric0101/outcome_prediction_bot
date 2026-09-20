@@ -14,6 +14,8 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_FLOOR
 from typing import Any, Iterable
 
+from monitoring.db_mem_diag import DbMemDiag
+
 
 def _decimal(value: object) -> Decimal | None:
     try:
@@ -93,6 +95,8 @@ class OutcomeTierBExecutionGate:
         # retain that exact observation bound and apply the five-minute cutoff
         # after the indexed read.
         cutoff = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+        diag = DbMemDiag("outcome_tier_b_recent_trade_shares")
+        rows: list[tuple[object, ...]] = []
         try:
             with sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True) as conn:
                 rows = conn.execute(
@@ -101,7 +105,11 @@ class OutcomeTierBExecutionGate:
                        ORDER BY id DESC LIMIT 300"""
                 ).fetchall()
         except sqlite3.Error:
+            diag.after_query(rows=len(rows))
+            diag.finish(note="sqlite_error")
             return None
+        diag.after_query(rows=len(rows), payload_bytes=sum(len(str(row[1] or "")) for row in rows))
+        diag.finish(note="bounded_300_row_window")
         seen: set[str] = set(); total = Decimal("0"); found = False
         for timestamp, raw in rows:
             if str(timestamp) < cutoff:
@@ -127,6 +135,8 @@ class OutcomeTierBExecutionGate:
     def policy(self, *, requested_shares: Decimal) -> TierBExecutionPolicy:
         # Historical audit rows are intentionally small.  They contain only
         # the BBO/depth/drift facts of a Tier-B attempt, never all-market WS.
+        diag = DbMemDiag("outcome_tier_b_policy_history")
+        rows: list[tuple[object, ...]] = []
         try:
             with sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True) as conn:
                 rows = conn.execute(
@@ -140,6 +150,8 @@ class OutcomeTierBExecutionGate:
                 ).fetchall()
         except sqlite3.Error:
             rows = []
+        diag.after_query(rows=len(rows), payload_bytes=sum(len(str(row[0] or "")) for row in rows))
+        diag.finish(note="bounded_200_row_window")
         spreads: list[Decimal] = []
         drifts: list[Decimal] = []
         depths: list[Decimal] = []
