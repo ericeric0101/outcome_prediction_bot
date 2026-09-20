@@ -1,7 +1,7 @@
 # Hyperliquid Outcome (HIP-4) BTC Daily Prediction Market Trading Bot — Current Authority
 
-> **權威架構版本 (Authority Version)**：2.5.0 (Outcome-only, typed execution-domain services; tail-risk validation roadmap)
-> **建立與審計日期**：2026-08-23；最近修訂：2026-09-19
+> **權威架構版本 (Authority Version)**：2.5.1 (Outcome-only, typed execution-domain services; bounded-observation latency hardening)
+> **建立與審計日期**：2026-08-23；最近修訂：2026-09-20
 > **目標系統**：Hyperliquid HyperCore L1 原生預測市場 — Outcome (HIP-4 協議標準)  
 > **單一權威聲明**：本文件取代原 `project_overview.md`，為系統唯一的設計、架構、量化模型與執行權威規範。
 
@@ -43,6 +43,14 @@ official BUY fill
 ```
 
 它不新增資料庫、不複製 raw L2、不建立下單路徑。`HOLD_FOR_RECOVERY` 與 `SCRATCH_*_RESEARCH` 均為 `read_only/live_authority=false`：不得取消 protective SELL、否決 narrow canary／fast-failure／S3、延後 IOC、或新增 exposure。首次 read-only sanity check 有 16 個 scratch lifecycle，其中 final FIFO 為 5 個 realized-loss、11 個 realized-profit；90 秒 shape 為 14 persistent、2 chop，但 persistent bucket 仍含 10 個最終獲利 lifecycle，故對齊成功**不等於**分類器已能授權 live veto。使用既有 `python -m bot.outcome_entry_quality_report --db logs/outcome_shadow.db --period 1d` 審查，缺 P3、holding path 或 FIFO 一律保持 missing，不得補造。
+
+### 2026-09-20 — stale-cancel price-through replay 與 serial-loop latency 拆解
+
+**stale-cancel 反事實只擴充既有 entry replay，仍為零 authority。** `scripts/outcome_entry_timing_replay_report.py`／`bot.outcome_entry_timing_replay_report.py` schema v2 對每筆 durable `OUTCOME_STALE_ENTRY_CANCEL_CONFIRMED` 讀取 immutable submitted limit/size，再在取消後 retained public `OUTCOME_WS_TRADES` 尋找同 coin 的第一筆 ask-side trade `px <= resting limit`。它只標為 `tape_price_through_observed`／candidate fill，固定輸出 `queue_fill_status=not_reconstructible_from_public_tape_and_l2`；公開 tape/L2 無法重建 queue priority、同價位前方數量、撤單與「若本單仍存在」的反射性 book 變化，故不得標成 actual fill、FIFO PnL 或策略收益。只有 candidate 存在時，才以固定 5/15/30 分鐘後第一筆在容忍 lag 內的 P2 full-depth bid walk 計算 gross hypothetical exit VWAP／return／PnL；缺 snapshot 或深度不足保持 missing。報表必須依 exchange trade timestamp 升冪選第一筆，不得因 event-type index 倒序誤選最後一筆；此項不調整 60 秒規則、重掛、TP、stop 或任何 entry/exit authority。
+
+**serial loop latency contract。** 6–40 秒 loop 尾端不能直接歸咎 SQLite：它混合帳戶真相讀取、exit recovery、fill sync、entry preflight、SDK/REST、journal 與未量測的 lifecycle/policy read。本版新增 `OUTCOME_RUNTIME_TIMING` 的 lifecycle lookup、entry-gate journal、fee read、target policy、risk gate、portfolio guard、entry submit、`measured_runtime_ms` 與 `unattributed_runtime_ms`；後者是明確殘差，不准臆測為某一服務。純 S0 OI、target-policy 與 runtime journal convenience/provenance SQLite reads 改成 **50ms** bounded read：busy/error 時走既有 fail-closed no-entry 或既有 conservative fallback，絕不可等待 SQLite 預設五秒而延遲持倉保護。account truth、durable pre-submit intent、cancel-confirm、fill/exit reconciliation 未改為 best-effort，也不會因本項跳過。read-only entry research 移至 account recovery 後，確保 protection/recovery 優先於影子觀測。
+
+**不變項。** 仍未修改 5 分鐘 signal、OI/Tier A/B、spread、價格帶、sizing、TP/loss-band、fast-failure、S3、narrow canary、IOC 或 ML/MarketRiskMonitor authority；下一步必須以新增 stage 分佈判定，不能用單一 slow-loop log 或 counterfactual candidate 直接調參。
 
 ### 2026-09-12 外部執行審查交叉驗證與修補
 

@@ -1821,10 +1821,29 @@ class OutcomeLiveExecutionRuntime:
         )
         journal_write_ms = round((time.monotonic() - journal_started_at) * 1000, 3)
         total_ms = round((time.monotonic() - started_at) * 1000, 3)
+        # The outer loop historically showed long tails whose stages did not
+        # add up.  Keep an explicit residual rather than silently assigning
+        # it to SQLite or the network.  Only non-overlapping stage timers are
+        # included; the aggregate runtime timer itself is excluded.
+        timing_stage_names = (
+            "timing_account_recovery_ms", "timing_research_shadow_ms", "timing_lifecycle_lookup_ms",
+            "timing_fill_sync_ms", "timing_exit_recovery_ms", "timing_exit_continuations_ms",
+            "timing_entry_gate_journal_ms", "timing_holding_before_stream_ms", "timing_stream_gate_ms",
+            "timing_holding_after_stream_ms", "timing_entry_preflight_ms", "timing_fee_read_ms",
+            "timing_entry_book_request_ms", "timing_target_policy_ms", "timing_risk_gate_ms",
+            "timing_portfolio_guard_ms", "timing_entry_submit_ms",
+        )
+        measured_runtime_ms = round(sum(
+            float(admission[name]) for name in timing_stage_names
+            if isinstance(admission.get(name), (int, float))
+        ), 3)
+        unattributed_runtime_ms = round(max(0.0, total_ms - journal_write_ms - measured_runtime_ms), 3)
         if self.ledger is not None and (total_ms >= 1000 or result.state in {"buy_placed", "sell_placed", "sell_resting"}):
             self._log_best_effort_strategy_event("OUTCOME_RUNTIME_TIMING", {
                 "venue": "hyperliquid_outcome", "outcome_id": market.outcome_id,
                 "runtime_state": result.state, "total_ms": total_ms,
+                "oi_signal_read_ms": entry_evidence.get("timing_oi_read_ms"),
+                "oi_signal_read_timeout_sec": entry_evidence.get("oi_read_timeout_sec"),
                 "account_recovery_ms": admission.get("timing_account_recovery_ms"),
                 "exit_recovery_ms": admission.get("timing_exit_recovery_ms"),
                 "exit_continuations_ms": admission.get("timing_exit_continuations_ms"),
@@ -1833,9 +1852,18 @@ class OutcomeLiveExecutionRuntime:
                 "stream_gate_ms": admission.get("timing_stream_gate_ms"),
                 "holding_after_stream_ms": admission.get("timing_holding_after_stream_ms"),
                 "entry_preflight_ms": admission.get("timing_entry_preflight_ms"),
+                "lifecycle_lookup_ms": admission.get("timing_lifecycle_lookup_ms"),
+                "entry_gate_journal_ms": admission.get("timing_entry_gate_journal_ms"),
+                "fee_read_ms": admission.get("timing_fee_read_ms"),
                 "research_shadow_ms": admission.get("timing_research_shadow_ms"),
                 "research_shadow_stages_ms": admission.get("timing_research_shadow_stages_ms"),
                 "book_request_ms": admission.get("timing_entry_book_request_ms"),
+                "target_policy_ms": admission.get("timing_target_policy_ms"),
+                "risk_gate_ms": admission.get("timing_risk_gate_ms"),
+                "portfolio_guard_ms": admission.get("timing_portfolio_guard_ms"),
+                "entry_submit_ms": admission.get("timing_entry_submit_ms"),
+                "measured_runtime_ms": measured_runtime_ms,
+                "unattributed_runtime_ms": unattributed_runtime_ms,
                 "journal_write_ms": journal_write_ms,
                 "journal_writer_last_ms": dict(getattr(self.ledger.journal, "last_write_timing_ms", {})),
                 # These are decision-local ledgers.  Do not replace them with
@@ -1863,14 +1891,6 @@ class OutcomeLiveExecutionRuntime:
         if self.ledger is None:
             return LiveExecutionResult("blocked", "live strategy requires an execution ledger")
         self._holding_context[market.outcome_id] = dict(market_context or entry_evidence)
-        research_started_at = time.monotonic()
-        research_timings = self.research_supervisor.observe_entry(
-            self, market=market, entry_side_index=entry_side_index,
-            entry_reason=entry_reason, entry_evidence=entry_evidence,
-            market_context=market_context, admission=admission,
-        )
-        admission["timing_research_shadow_ms"] = round((time.monotonic() - research_started_at) * 1000, 3)
-        admission["timing_research_shadow_stages_ms"] = research_timings
         config = OutcomeLiveStrategyConfig.from_env()
         tracked_markets = (market, *retiring_markets)
         recovery_started_at = time.monotonic()
@@ -1880,6 +1900,16 @@ class OutcomeLiveExecutionRuntime:
             "safe_for_new_entry": bool(getattr(report, "safe_for_new_entry", False)),
             "reason": str(getattr(report, "reason", "unknown")),
         }
+        # This observer is read-only.  Account recovery supplies holding and
+        # exit safety, so it must run first when the loop is under pressure.
+        research_started_at = time.monotonic()
+        research_timings = self.research_supervisor.observe_entry(
+            self, market=market, entry_side_index=entry_side_index,
+            entry_reason=entry_reason, entry_evidence=entry_evidence,
+            market_context=market_context, admission=admission,
+        )
+        admission["timing_research_shadow_ms"] = round((time.monotonic() - research_started_at) * 1000, 3)
+        admission["timing_research_shadow_stages_ms"] = research_timings
         retired_active = [
             finding for finding in report.findings
             if finding.market_id != market.outcome_id and finding.state != "flat"
@@ -1891,6 +1921,7 @@ class OutcomeLiveExecutionRuntime:
                 "market rollover pending: retiring Outcome has live inventory or order; new entry refused",
             )
         active = [finding for finding in report.findings if finding.market_id == market.outcome_id and finding.state != "flat"]
+        lifecycle_lookup_started_at = time.monotonic()
         pending_owned_entry = not active and self.entry_lifecycle_store is not None and any(
             self.entry_lifecycle_store.recover(
                 wallet=self.recovery.wallet, outcome_id=market.outcome_id, coin=coin,
@@ -1903,6 +1934,7 @@ class OutcomeLiveExecutionRuntime:
             ) is not None
             for coin in (market.yes_coin, market.no_coin)
         )
+        admission["timing_lifecycle_lookup_ms"] = round((time.monotonic() - lifecycle_lookup_started_at) * 1000, 3)
         # ``userFills`` has a high /info weight.  Account recovery already
         # reads balances and open orders every decision, so a healthy resting
         # BUY or covering SELL does not justify downloading the entire fill
@@ -1956,10 +1988,12 @@ class OutcomeLiveExecutionRuntime:
             ),
         )
         self._current_tick_snapshot = snapshot
+        gate_journal_started_at = time.monotonic()
         self._record_entry_gate_decision(
             market=market, entry_side_index=entry_side_index, entry_reason=entry_reason,
             entry_evidence=entry_evidence, active=active,
         )
+        admission["timing_entry_gate_journal_ms"] = round((time.monotonic() - gate_journal_started_at) * 1000, 3)
         fill_visibility_barrier = self._entry_fill_visibility_barrier(
             market=market, report=report, admission=admission,
         )
@@ -1991,9 +2025,11 @@ class OutcomeLiveExecutionRuntime:
         admission["timing_entry_preflight_ms"] = round((time.monotonic() - entry_preflight_started_at) * 1000, 3)
         if entry_preflight is not None:
             return entry_preflight
+        fee_read_started_at = time.monotonic()
         fees = self.recovery.account.get_user_fees_sync(self.recovery.wallet)
         maker_close_fee = Decimal(str(fees["userSpotAddRate"]))
         taker_close_fee = Decimal(str(fees["userSpotCrossRate"]))
+        admission["timing_fee_read_ms"] = round((time.monotonic() - fee_read_started_at) * 1000, 3)
         book_started_at = time.monotonic()
         book = self.machine.gateway.fetch_order_book(market=market, side_index=entry_side_index)
         admission["timing_entry_book_request_ms"] = round((time.monotonic() - book_started_at) * 1000, 3)
@@ -2028,9 +2064,11 @@ class OutcomeLiveExecutionRuntime:
             requested_shares=shadow_requested_shares, current_bid=price,
             confidence=admission.get("confidence_entry_shadow") if isinstance(admission.get("confidence_entry_shadow"), dict) else None,
         )
+        target_policy_started_at = time.monotonic()
         target_decision = OutcomeExitTargetPolicy(self.ledger.journal.db_path).decide(
             outcome_id=market.outcome_id, side_index=entry_side_index,
         )
+        admission["timing_target_policy_ms"] = round((time.monotonic() - target_policy_started_at) * 1000, 3)
         target_price_preview = take_profit_price(
             entry_price=price, target_return_pct=target_decision.target_return_pct,
             maker_close_fee_rate=maker_close_fee,
@@ -2166,10 +2204,12 @@ class OutcomeLiveExecutionRuntime:
                 "tier_b_policy_source": quality.policy.source,
                 "tier_b_decision_bid": str(quality.decision_bid) if quality.decision_bid is not None else None,
             })
+        risk_gate_started_at = time.monotonic()
         risk = self.risk_gate.evaluate(
             balances=self.recovery.account.get_spot_clearinghouse_state_sync(self.recovery.wallet).get("balances", []),
             open_orders=self.recovery.account.get_open_orders_sync(self.recovery.wallet), price=price, shares=shares,
         )
+        admission["timing_risk_gate_ms"] = round((time.monotonic() - risk_gate_started_at) * 1000, 3)
         if not risk.allowed:
             admission["risk_gate"] = {
                 "allowed": False, "reason": risk.reason,
@@ -2184,11 +2224,13 @@ class OutcomeLiveExecutionRuntime:
             "available_collateral": str(risk.available_collateral),
             "current_exposure": str(risk.current_exposure),
         }
+        portfolio_started_at = time.monotonic()
         portfolio = self.portfolio_guard.evaluate(
             outcome_id=market.outcome_id, prospective_notional=risk.entry_notional,
             phase_entry_cap=self.risk_gate.limits.max_entry_notional_usdc,
             phase_exposure_cap=self.risk_gate.limits.max_total_outcome_exposure_usdc,
         ) if self.portfolio_guard is not None else None
+        admission["timing_portfolio_guard_ms"] = round((time.monotonic() - portfolio_started_at) * 1000, 3)
         if portfolio is None or not portfolio.allowed:
             reason = portfolio.reason if portfolio is not None else "portfolio_guard_unavailable"
             admission["portfolio_guard"] = {"allowed": False, "reason": reason}
@@ -2252,7 +2294,8 @@ class OutcomeLiveExecutionRuntime:
             ),
             **execution_audit,
         }
-        return self.entry_execution_service.submit_new_entry(
+        submit_started_at = time.monotonic()
+        result = self.entry_execution_service.submit_new_entry(
             market=market, side_index=entry_side_index,
             coin=str(admission["selected_coin"]), price=price, shares=shares,
             entry_audit=entry_audit, entry_max_submit_price=entry_max_submit_price,
@@ -2263,6 +2306,8 @@ class OutcomeLiveExecutionRuntime:
             maker_close_fee=maker_close_fee, taker_close_fee=taker_close_fee,
             max_entry_notional=self.risk_gate.limits.max_entry_notional_usdc,
         )
+        admission["timing_entry_submit_ms"] = round((time.monotonic() - submit_started_at) * 1000, 3)
+        return result
 
     def cancel_resting_buys(
         self,

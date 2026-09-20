@@ -87,6 +87,11 @@ class OutcomeOiEntryDecision:
 class OutcomeOiEntryGate:
     """Read only the locally persisted, live (never backfilled) OI stream."""
 
+    # S0 is an admission gate, not a durable mutation boundary.  A contended
+    # research/telemetry SQLite writer must therefore mean "no new entry",
+    # never a five-second stall in the live loop.
+    READ_TIMEOUT_SEC = 0.05
+
     def __init__(self, db_path: str | Path, config: OutcomeLiveStrategyConfig | None = None) -> None:
         self.db_path = str(db_path)
         self.config = config or OutcomeLiveStrategyConfig.from_env()
@@ -253,8 +258,12 @@ class OutcomeOiEntryGate:
         now_ms = int(now_ms if now_ms is not None else time.time() * 1000)
         if not Path(self.db_path).exists():
             return OutcomeOiEntryDecision(None, "oi_journal_missing", {})
+        read_started_at = time.monotonic()
         try:
-            with sqlite3.connect(f"file:{Path(self.db_path).resolve()}?mode=ro", uri=True) as conn:
+            with sqlite3.connect(
+                f"file:{Path(self.db_path).resolve()}?mode=ro", uri=True,
+                timeout=self.READ_TIMEOUT_SEC,
+            ) as conn:
                 rows = conn.execute(
                     """
                     SELECT id, local_received_at_ms, open_interest, mark_price
@@ -265,7 +274,10 @@ class OutcomeOiEntryGate:
                     """, (now_ms,)
                 ).fetchall()
         except sqlite3.Error:
-            return OutcomeOiEntryDecision(None, "oi_read_failed", {})
+            return OutcomeOiEntryDecision(None, "oi_read_failed_fail_closed", {
+                "timing_oi_read_ms": round((time.monotonic() - read_started_at) * 1000, 3),
+                "oi_read_timeout_sec": self.READ_TIMEOUT_SEC,
+            })
         if not rows:
             return OutcomeOiEntryDecision(None, "oi_live_observation_missing", {})
         current = rows[0]
@@ -297,6 +309,8 @@ class OutcomeOiEntryGate:
             # whose owned exit completes during the same loop.
             "decision_observed_at_ms": now_ms,
             "oi_current_id": int(current[0]), "oi_prior_id": int(prior[0]), "oi_age_ms": age_ms,
+            "timing_oi_read_ms": round((time.monotonic() - read_started_at) * 1000, 3),
+            "oi_read_timeout_sec": self.READ_TIMEOUT_SEC,
             "spot_strike_bps": str(spot_strike_bps), "oi_return_bps": str(oi_return_bps),
             "mark_return_bps": str(mark_return_bps), "oi_lookback_sec": self.config.oi_lookback_sec,
             # Persist all alternatives on the ordinary S0 decision event so

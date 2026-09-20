@@ -20,6 +20,8 @@ class OutcomeRuntimeJournalView:
     exchange mutation.
     """
 
+    READ_TIMEOUT_SEC = 0.05
+
     def __init__(self, db_path: str | Path | None) -> None:
         self.db_path = str(db_path) if db_path is not None else None
         self._tick_cache: dict[tuple[object, ...], object] = {}
@@ -31,7 +33,13 @@ class OutcomeRuntimeJournalView:
     def _connect(self) -> sqlite3.Connection:
         if self.db_path is None:
             raise sqlite3.OperationalError("journal unavailable")
-        return sqlite3.connect(f"file:{Path(self.db_path).resolve()}?mode=ro", uri=True)
+        # These are convenience/provenance reads.  They never establish
+        # exchange truth, so a busy telemetry database must fail closed at the
+        # caller rather than inherit sqlite3's five-second default wait.
+        return sqlite3.connect(
+            f"file:{Path(self.db_path).resolve()}?mode=ro", uri=True,
+            timeout=self.READ_TIMEOUT_SEC,
+        )
 
     def daily_calibration_entries(self) -> int:
         key = ("daily_calibration_entries",)

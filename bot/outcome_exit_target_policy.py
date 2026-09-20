@@ -47,12 +47,21 @@ def _mid(payload: dict[str, object], side_index: int) -> Decimal | None:
 class OutcomeExitTargetPolicy:
     """Read-only estimator over accepted snapshots for the selected market."""
 
+    # This policy is an entry-quality estimator, never a lifecycle or venue
+    # reconciliation authority.  On a busy journal it must use its existing
+    # conservative fallback rather than consuming SQLite's default five-second
+    # busy wait on the execution lane.
+    READ_TIMEOUT_SEC = 0.05
+
     def __init__(self, db_path: str | Path) -> None:
         self.db_path = str(db_path)
 
     def decide(self, *, outcome_id: int, side_index: int) -> OutcomeExitTargetDecision:
         try:
-            with sqlite3.connect(f"file:{Path(self.db_path).resolve()}?mode=ro", uri=True) as conn:
+            with sqlite3.connect(
+                f"file:{Path(self.db_path).resolve()}?mode=ro", uri=True,
+                timeout=self.READ_TIMEOUT_SEC,
+            ) as conn:
                 rows = conn.execute(
                     """
                     SELECT payload_json FROM strategy_events
