@@ -226,3 +226,121 @@ def prune_database(path: str | Path, *, apply: bool, enabled: bool, now: datetim
 
 def json_report(value: dict[str, Any]) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2)
+
+
+def _bytes_metric(value: int | float | None) -> dict[str, float | int]:
+    amount = int(value or 0)
+    return {"bytes": amount, "mb_decimal": round(amount / 1_000_000, 3), "gb_decimal": round(amount / 1_000_000_000, 6)}
+
+
+def _quoted_identifier(name: str) -> str:
+    return '"' + name.replace('"', '""') + '"'
+
+
+def _event_storage_rows(conn: sqlite3.Connection, *, table: str, now: datetime) -> list[dict[str, Any]]:
+    """Exact payload attribution for an event table; deliberately read-only."""
+    cutoff_1d = utc_cutoff_iso(now=now, days=1)
+    cutoff_7d = utc_cutoff_iso(now=now, days=7)
+    rows = conn.execute(f"""
+        SELECT event_type, COUNT(*),
+               COALESCE(SUM(LENGTH(payload_json)), 0),
+               COALESCE(AVG(LENGTH(payload_json)), 0),
+               COALESCE(MIN(LENGTH(payload_json)), 0), COALESCE(MAX(LENGTH(payload_json)), 0),
+               MIN(ts), MAX(ts),
+               SUM(CASE WHEN ts>=? THEN 1 ELSE 0 END),
+               COALESCE(SUM(CASE WHEN ts>=? THEN LENGTH(payload_json) ELSE 0 END), 0),
+               SUM(CASE WHEN ts>=? THEN 1 ELSE 0 END),
+               COALESCE(SUM(CASE WHEN ts>=? THEN LENGTH(payload_json) ELSE 0 END), 0)
+        FROM {_quoted_identifier(table)}
+        GROUP BY event_type
+    """, (cutoff_1d, cutoff_1d, cutoff_7d, cutoff_7d)).fetchall()
+    output: list[dict[str, Any]] = []
+    for row in rows:
+        total = int(row[2] or 0)
+        bytes_7d = int(row[11] or 0)
+        output.append({
+            "event_type": str(row[0]), "rows": int(row[1]), "logical_payload": _bytes_metric(total),
+            "avg_payload_bytes": round(float(row[3] or 0), 3), "min_payload_bytes": int(row[4] or 0),
+            "max_payload_bytes": int(row[5] or 0), "oldest_ts": row[6], "newest_ts": row[7],
+            # SQLite's bundled aggregate API has no portable exact percentile.
+            # Materializing every JSON length would turn this operator report
+            # into an unbounded second full scan, so callers get exact
+            # total/mean/min/max and an explicit non-fabricated median state.
+            "median_payload_bytes": None,
+            "median_measurement": "not computed: no portable SQLite percentile aggregate",
+            "last_1d": {"rows": int(row[8] or 0), "logical_payload": _bytes_metric(int(row[9] or 0))},
+            "last_7d": {"rows": int(row[10] or 0), "logical_payload": _bytes_metric(bytes_7d)},
+            "recent_rows_per_day": round(int(row[10] or 0) / 7, 3),
+            "recent_payload_mb_per_day": round(bytes_7d / 7 / 1_000_000, 6),
+            "projected_payload_gb_30d": round(bytes_7d / 7 * 30 / 1_000_000_000, 6),
+        })
+    return output
+
+
+def _table_logical_content(conn: sqlite3.Connection, table: str) -> dict[str, Any]:
+    """Estimate JSON/text content, never claiming it equals physical pages."""
+    columns = [str(row[1]) for row in conn.execute(f"PRAGMA table_info({_quoted_identifier(table)})")]
+    content_columns = [name for name in columns if name.endswith("_json") or name == "payload_json"]
+    row_count = int(conn.execute(f"SELECT COUNT(*) FROM {_quoted_identifier(table)}").fetchone()[0])
+    if not content_columns:
+        return {"rows": row_count, "logical_content": _bytes_metric(0), "avg_content_bytes": 0.0,
+                "content_columns": []}
+    terms = " + ".join(f"COALESCE(LENGTH({_quoted_identifier(name)}), 0)" for name in content_columns)
+    total = int(conn.execute(f"SELECT COALESCE(SUM({terms}), 0) FROM {_quoted_identifier(table)}").fetchone()[0] or 0)
+    return {"rows": row_count, "logical_content": _bytes_metric(total),
+            "avg_content_bytes": round(total / row_count, 3) if row_count else 0.0,
+            "content_columns": content_columns}
+
+
+def _dbstat_physical(conn: sqlite3.Connection) -> dict[str, Any]:
+    """Optional per-object physical attribution; SQLite builds may omit dbstat."""
+    try:
+        rows = conn.execute("SELECT name, SUM(pgsize) FROM dbstat GROUP BY name ORDER BY SUM(pgsize) DESC").fetchall()
+    except sqlite3.Error as exc:
+        return {"available": False, "reason": str(exc), "objects": []}
+    return {"available": True, "objects": [
+        {"name": str(name), "physical": _bytes_metric(int(size or 0))} for name, size in rows
+    ]}
+
+
+def storage_attribution_report(path: str | Path, *, now: datetime | None = None, top: int = 15,
+                               include_dbstat: bool = False) -> dict[str, Any]:
+    """Compute physical-vs-logical, per-family storage and seven-day growth.
+
+    It never opens a writable connection.  On a multi-GB journal the exact
+    payload scan is intentionally an operator report, not a live health probe.
+    """
+    db_path, current = Path(path), now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        raise ValueError("storage report now must be timezone-aware")
+    wal, shm = Path(f"{db_path}-wal"), Path(f"{db_path}-shm")
+    with _connect_readonly(db_path) as conn:
+        page_size = int(conn.execute("PRAGMA page_size").fetchone()[0])
+        page_count = int(conn.execute("PRAGMA page_count").fetchone()[0])
+        freelist_count = int(conn.execute("PRAGMA freelist_count").fetchone()[0])
+        tables = _database_tables(conn)
+        strategy = _event_storage_rows(conn, table="strategy_events", now=current) if "strategy_events" in tables else []
+        orders = _event_storage_rows(conn, table="order_events", now=current) if "order_events" in tables else []
+        logical_tables = {table: _table_logical_content(conn, table) for table in sorted(tables)}
+        physical = _dbstat_physical(conn) if include_dbstat else {
+            "available": False, "reason": "not requested; use --dbstat during offline maintenance", "objects": []}
+    ranked_total = sorted(strategy, key=lambda item: item["logical_payload"]["bytes"], reverse=True)
+    ranked_rate = sorted(strategy, key=lambda item: item["recent_payload_mb_per_day"], reverse=True)
+    ranked_average = sorted(strategy, key=lambda item: item["avg_payload_bytes"], reverse=True)
+    return {
+        "schema": "outcome_db_storage_attribution_v1_1", "db": str(db_path), "as_of_utc": current.astimezone(timezone.utc).isoformat(),
+        "physical": {"db_file": _bytes_metric(db_path.stat().st_size), "wal_file": _bytes_metric(wal.stat().st_size if wal.exists() else 0),
+                     "shm_file": _bytes_metric(shm.stat().st_size if shm.exists() else 0), "page_size": page_size,
+                     "page_count": page_count, "allocated_pages": _bytes_metric(page_count * page_size),
+                     "freelist_count": freelist_count, "freelist": _bytes_metric(freelist_count * page_size),
+                     "dbstat": physical},
+        "logical_table_content": logical_tables,
+        "strategy_event_families": strategy, "order_event_families": orders,
+        "rankings": {"top_by_total_payload": ranked_total[:max(1, top)],
+                     "top_by_recent_mb_per_day": ranked_rate[:max(1, top)],
+                     "top_by_average_payload": ranked_average[:max(1, top)]},
+        "notes": ["Logical JSON/text bytes are not SQLite physical page bytes.",
+                  "Recent rates use the preceding seven UTC days and can be zero for inactive families.",
+                  "This report is read-only; it changes neither retention rules nor journal content."],
+        "retention_allowlist_unchanged": [rule.name for rule in PRUNABLE_RULES],
+    }

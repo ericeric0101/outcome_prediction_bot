@@ -8,6 +8,7 @@ from bot.outcome_telemetry_retention import (
     audit_database,
     prune_database,
     retention_enabled,
+    storage_attribution_report,
     utc_cutoff_iso,
 )
 from monitoring.trade_journal_db import TradeJournalDB
@@ -108,3 +109,38 @@ def test_cleanup_failure_rolls_back_before_it_can_harm_even_allowlisted_rows(tmp
     else:
         raise AssertionError("malformed allowlist predicate must fail")
     assert _events(db) == ["OUTCOME_WS_ALL_MIDS"]
+
+
+def test_storage_attribution_is_read_only_and_reports_exact_event_payloads(tmp_path):
+    db = TradeJournalDB(tmp_path / "journal.db")
+    _event(db, "OUTCOME_WS_L2_BOOK", {"book": "x" * 100}, age_days=1)
+    _event(db, "OUTCOME_WS_L2_BOOK", {"book": "y" * 50}, age_days=8)
+    _event(db, "OUTCOME_ENTRY_READINESS_SHADOW", {"state": "ready"}, age_days=2)
+    db.log_order_event("run", "FILL_MARKOUT", payload={"horizon_sec": 30, "value": "z" * 20})
+    with sqlite3.connect(db.db_path) as conn:
+        before_events = conn.execute("SELECT COUNT(*) FROM strategy_events").fetchone()[0]
+        before_orders = conn.execute("SELECT COUNT(*) FROM order_events").fetchone()[0]
+    report = storage_attribution_report(db.db_path, now=NOW, top=2)
+    family = next(item for item in report["strategy_event_families"] if item["event_type"] == "OUTCOME_WS_L2_BOOK")
+    assert family["rows"] == 2
+    assert family["logical_payload"]["bytes"] == len('{"book": "' + 'x' * 100 + '"}') + len('{"book": "' + 'y' * 50 + '"}')
+    assert family["last_7d"]["rows"] == 1
+    assert family["recent_rows_per_day"] == round(1 / 7, 3)
+    assert report["physical"]["page_size"] > 0
+    assert report["physical"]["page_count"] > 0
+    assert report["retention_allowlist_unchanged"] == [rule.name for rule in PRUNABLE_RULES]
+    assert report["logical_table_content"]["order_events"]["rows"] == 1
+    with sqlite3.connect(db.db_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM strategy_events").fetchone()[0] == before_events
+        assert conn.execute("SELECT COUNT(*) FROM order_events").fetchone()[0] == before_orders
+
+
+def test_storage_attribution_gracefully_handles_unavailable_dbstat(tmp_path, monkeypatch):
+    db = TradeJournalDB(tmp_path / "journal.db")
+    _event(db, "OUTCOME_ENTRY_ADMISSION_DECISION", {"signal": "present"})
+    monkeypatch.setattr(
+        "bot.outcome_telemetry_retention._dbstat_physical",
+        lambda _conn: {"available": False, "reason": "not compiled", "objects": []},
+    )
+    report = storage_attribution_report(db.db_path, now=NOW, include_dbstat=True)
+    assert report["physical"]["dbstat"] == {"available": False, "reason": "not compiled", "objects": []}

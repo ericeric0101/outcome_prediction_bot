@@ -1,6 +1,6 @@
 # Hyperliquid Outcome (HIP-4) BTC Daily Prediction Market Trading Bot — Current Authority
 
-> **權威架構版本 (Authority Version)**：2.5.8 (Outcome-only; all-loss-exit observation mode; conservative telemetry retention V1)
+> **權威架構版本 (Authority Version)**：2.5.9 (Outcome-only; all-loss-exit observation mode; conservative telemetry retention V1.1 attribution)
 > **建立與審計日期**：2026-08-23；最近修訂：2026-09-20
 > **目標系統**：Hyperliquid HyperCore L1 原生預測市場 — Outcome (HIP-4 協議標準)  
 > **單一權威聲明**：本文件取代原 `project_overview.md`，為系統唯一的設計、架構、量化模型與執行權威規範。
@@ -97,6 +97,18 @@ and must be checked in the durable startup manifest.
 **V1 唯一 allowlist。** 唯一可刪除 family 是 `strategy_events.OUTCOME_WS_ALL_MIDS`，且僅限兩個明確 predicate：(1) current compact scope `btc_and_active_outcome_only_v2` 超過 **30 UTC days**；(2) pre-v2、缺 `raw.recording_scope` 的 legacy full-map payload，在 operator 維運時可立即移除（0 days）。稽核沒有找到這兩種 row 的 ML、replay、recovery、calibration、report 或 live consumer；live pricing/readiness 直接讀 WS callback，而 compact Entry Readiness 結果本身長期保留。這不是 wildcard TTL：L2、trades、P2、Deribit、admission 或任何新/未知 event 都不會被匹配。未知/new family 的預設永遠是 **KEEP**。
 
 **操作與 SQLite policy。** `scripts/outcome_journal_maintenance.py --journal-path logs/outcome_shadow.db --audit` 為預設唯讀 inventory；`--dry-run` 才做可能較慢的 exact JSON eligibility/byte estimate，但仍零 delete；真正刪除必須同時指定 `OUTCOME_TELEMETRY_RETENTION_ENABLED=1` 及 `--apply`，使用 1,000-row event-scoped batches 與 exclusive SQLite lock，若 bot/collector 持鎖即拒絕，不會在 live tick、background worker、startup 或 shutdown 自動運行。沒有自動 checkpoint/VACUUM；需要回收 OS file size 時，操作者必須在獨立停機、備份與磁碟空間審核後另行執行 SQLite `VACUUM`，不可手動刪除 `-wal/-shm`。此 V1 不新增 DB、沒有 migration、沒有 archive deletion，也不變更 Entry Readiness、Structural Collapse、60 秒 stale cancel、SDK mutation、exit protection 或 `OUTCOME_LOSS_EXIT_ENABLED`。
+
+### 2026-09-20 — Outcome DB Storage Attribution / Retention V1.1（唯讀歸因；不擴大刪除）
+
+**V1 規則完全不變。** 本版只增加 `scripts/outcome_journal_maintenance.py --journal-path logs/outcome_shadow.db --storage-report [--top 25] [--dbstat]`。它以 read-only SQLite connection 報告 DB/WAL/SHM bytes、`page_size`、`page_count`、`freelist_count` 與（若該 SQLite build 支援）`dbstat` object pages；任何 `dbstat` 不可用只標記 unavailable，不會使報告失敗。JSON/text 的 `SUM(LENGTH(...))` 是邏輯 payload estimate，**不是** SQLite 實體 page bytes；delete 後 file size 亦不會自動縮小。`--storage-report` 不可與 `--apply`/`--dry-run` 合用，沒有 mutation、VACUUM、schema migration 或 background schedule。V1 的唯一 `OUTCOME_WS_ALL_MIDS` allowlist、`UNKNOWN=KEEP`、`OUTCOME_TELEMETRY_RETENTION_ENABLED=0` default 均不變。
+
+**歸因輸出與已知基線。** 每個 `strategy_events` 與 `order_events` family 現報 row count、logical payload sum/avg/min/max、oldest/newest、last 1/7-day rows/bytes、7-day rows/day、MB/day、30-day projected GB，以及 total/rate/average payload rankings；每個 table 另報 JSON/text logical content 和 V1 authority class。V1.0 基線的 9.4 GiB、3,707,153 strategy rows、8,545 order rows、`freelist_count=0` 已證明「row count 不等於 disk impact」：近期 sample 顯示 `OUTCOME_ENTRY_ADMISSION_DECISION` 約 6.9 KiB/row，因而是優先檢查的 logical-payload candidate；`OUTCOME_WS_L2_BOOK` 雖 row 數最多，sample 約 1.0 KiB；P2 約 3.0 KiB；runtime timing 約 1.4 KiB；Deribit 約 0.75 KiB。exact report 對 multi-GiB journal 會掃描 JSON，僅可在 operator/offline maintenance 時執行，不可放入 live health/tick。
+
+**producer / consumer / 保留結論。** `OUTCOME_ENTRY_ADMISSION_DECISION` 與 `OUTCOME_ENTRY_GATE_DECISION` 都由 `OutcomeLiveExecutionRuntime` 每 strategy tick 寫入；前者重複 `raw_signal_evidence`、`admission_inputs`、stream/result context，後者重複 `entry_evidence` 與 active-account order lists。它們被 gate-ablation/capital-efficiency reports 讀取，尚不可刪。`OUTCOME_RUNTIME_TIMING` 只在 >=1s 或 mutation result 寫入，`OUTCOME_LOOP_TIMING` 只在 >=3s slow turn 寫入；目前是 operational diagnostics，沒有 ML dependency，屬未來「slow path + state change + periodic compact heartbeat」的 write-time compaction candidate，仍不可在沒有 report compatibility test 前壓縮/TTL。`OUTCOME_WS_L2_BOOK` 供 exit/fast-failure replay；`OUTCOME_WS_TRADES` 供 entry-timing replay/Tier-B；`OUTCOME_P2_PARITY_SNAPSHOT` 供 OI/Deribit feature builders、entry/exit replay；`DERIBIT_FEATURE_SNAPSHOT` 供 Deribit builder/report；`OUTCOME_TREND_CONTINUATION_PATH`、reversal/holding-risk shadows 是 exit/post-fill evidence。以上皆 KEEP_LONG_TERM。
+
+**模型 dependency map。** B1/B2 active dataset/model、fair-value 與 OI walk-forward 都讀 `outcome_oi_feature_rows`；其 source chain 是 P2 + `binance_oi_observations` + canonical `FILL_MARKOUT`。Deribit walk-forward 讀 `outcome_deribit_feature_rows`（P2 + Deribit snapshot）。L2/trades、holding paths 與 fill markouts 分別是 exit/entry replay/calibration 的 source evidence。因此 V1.1 沒有把「derived feature 已存在」誤解成 raw source 可刪，也沒有改 online S0 對 recent Binance OI 的讀取。
+
+**可驗證的下一步（僅建議，非本版行為）。** 優先以現有 report 的 exact bytes/day 排序後，為 admission/gate 設計相容的 compact every-tick schema + full payload only on transition/candidate/submit/block/error，並以 schema/config hash 取代重複 immutable thresholds；對 timing 類比較 all-slow rows 與 1/min compact heartbeat 的實測 rows/day；raw L2/trades/P2 先研究 completed-market event-window export/archive，保留 replays 所需 window，不能直接 TTL。每一個候選都必須先列出 consumers、historical-reader compatibility、estimated current/after bytes/day 與獨立 regression；在此之前分類為 **KEEP AS-IS**。V1.1 不改 live entry/exit/TP/loss switch/stale cancel、ML authority 或任何 existing telemetry writer。
 
 ### 2026-09-19 — 60 秒 stale zero-fill BUY admission 與 post-fill evidence 對齊
 
