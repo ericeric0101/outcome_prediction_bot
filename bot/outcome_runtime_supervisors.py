@@ -26,6 +26,11 @@ class OutcomeResearchSupervisor:
         """Run observers and expose their cost without giving them authority."""
         timings: dict[str, float] = {}
         started_at = time.monotonic()
+        admission["entry_readiness_shadow"] = runtime._observe_entry_readiness_shadow(
+            market=market, entry_side_index=entry_side_index, entry_evidence=entry_evidence,
+        )
+        timings["entry_readiness_shadow_ms"] = round((time.monotonic() - started_at) * 1000, 3)
+        started_at = time.monotonic()
         admission["market_regime_shadow"] = runtime._observe_market_regime_shadow(
             market=market, entry_side_index=entry_side_index,
             entry_evidence=entry_evidence, market_context=market_context,

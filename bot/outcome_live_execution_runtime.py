@@ -61,6 +61,7 @@ from bot.outcome_entry_quality_shadow import OutcomeEntryQualityShadow, OutcomeP
 from bot.outcome_crash_circuit_shadow import OutcomeCrashCircuitObservation, OutcomeCrashCircuitShadow
 from bot.outcome_market_risk_monitor import OutcomeMarketRiskMonitor, OutcomeMarketRiskObservation
 from bot.outcome_structural_collapse_shadow import OutcomeStructuralCollapseShadow
+from bot.outcome_entry_readiness_shadow import OutcomeEntryReadinessShadow
 from bot.outcome_stress_exitability import OutcomeStressExitabilitySizer
 from bot.outcome_runtime_supervisors import (
     OutcomeEntrySupervisor,
@@ -86,7 +87,7 @@ class OutcomeLiveExecutionRuntime:
     _REVERSAL_RISK_MIN_INTERVAL_SEC = 5.0
     _CRASH_SHADOW_MIN_INTERVAL_SEC = 10.0
 
-    def __init__(self, *, account: OutcomeClient, wallet: str, gateway: OutcomeExecutionGateway | None = None, risk_gate: OutcomePreTradeRiskGate | None = None, stream_health: OutcomeStreamHealth | None = None, ledger: OutcomeExecutionLedger | None = None, research_gate: OutcomeResearchGate | None = None, exit_planner: OutcomeExitQuotePlanner | None = None, exit_lifecycle_store: OutcomeExitLifecycleStore | None = None, exit_requote_controller: OutcomeExitRequoteController | None = None, entry_planner: OutcomeEntryQuotePlanner | None = None, entry_lifecycle_store: OutcomeEntryLifecycleStore | None = None, entry_requote_controller: OutcomeEntryRequoteController | None = None, structural_collapse_shadow: OutcomeStructuralCollapseShadow | None = None) -> None:
+    def __init__(self, *, account: OutcomeClient, wallet: str, gateway: OutcomeExecutionGateway | None = None, risk_gate: OutcomePreTradeRiskGate | None = None, stream_health: OutcomeStreamHealth | None = None, ledger: OutcomeExecutionLedger | None = None, research_gate: OutcomeResearchGate | None = None, exit_planner: OutcomeExitQuotePlanner | None = None, exit_lifecycle_store: OutcomeExitLifecycleStore | None = None, exit_requote_controller: OutcomeExitRequoteController | None = None, entry_planner: OutcomeEntryQuotePlanner | None = None, entry_lifecycle_store: OutcomeEntryLifecycleStore | None = None, entry_requote_controller: OutcomeEntryRequoteController | None = None, structural_collapse_shadow: OutcomeStructuralCollapseShadow | None = None, entry_readiness_shadow: OutcomeEntryReadinessShadow | None = None) -> None:
         self._account_reads = OutcomeAccountReadCache(account)
         self.recovery = OutcomeAccountRecovery(account=self._account_reads, wallet=wallet)
         self.machine = OutcomeMakerStateMachine(
@@ -173,6 +174,7 @@ class OutcomeLiveExecutionRuntime:
         self.crash_circuit_shadow = OutcomeCrashCircuitShadow()
         self.market_risk_monitor = OutcomeMarketRiskMonitor()
         self.structural_collapse_shadow = structural_collapse_shadow
+        self.entry_readiness_shadow = entry_readiness_shadow
         self.emergency_exit_policy = OutcomeEmergencyExitPolicy()
         self.emergency_exit_controller = (
             OutcomeEmergencyExitController(
@@ -220,6 +222,7 @@ class OutcomeLiveExecutionRuntime:
         self._last_crash_shadow_record: dict[str, tuple[str, float]] = {}
         self._last_market_risk_record: dict[str, tuple[str, float]] = {}
         self._last_structural_collapse_shadow_record: dict[str, tuple[str, float]] = {}
+        self._last_entry_readiness_shadow_record: dict[tuple[int, int], tuple[str, float]] = {}
         self._last_fast_failure_lane_record: dict[str, tuple[str, float]] = {}
         self._last_holding_risk_decision_record: dict[str, tuple[str, float]] = {}
         self._last_postfill_quality_record: dict[str, tuple[str, float]] = {}
@@ -511,6 +514,78 @@ class OutcomeLiveExecutionRuntime:
             top3_depth_shares=getattr(quality, "top_depth_shares", None),
             recent_trade_shares_5m=getattr(quality, "recent_trade_shares", None),
         )
+
+    def _observe_entry_readiness_shadow(
+        self, *, market: OutcomeMarketSpec, entry_side_index: int | None,
+        entry_evidence: dict[str, object],
+    ) -> dict[str, object]:
+        """Journal a compact, candidate-bound read-only readiness result.
+
+        This is intentionally invoked before admission gates, but its output
+        is stored only in ``admission`` and never read by the entry state
+        machine.  Absent upstream candidates therefore produce an explicit
+        not-evaluated record rather than fabricated positive evidence.
+        """
+        now = time.time()
+        decision_observed_at_ms = entry_evidence.get("decision_observed_at_ms")
+        if entry_side_index not in (0, 1):
+            payload: dict[str, object] = {
+                "schema_version": 1, "venue": "hyperliquid_outcome", "read_only": True,
+                "live_authority": False, "execution_submitted": False,
+                "outcome_id": market.outcome_id, "period": market.period,
+                "side_index": entry_side_index, "timestamp": now,
+                "decision_observed_at_ms": decision_observed_at_ms,
+                "candidate": False, "persistent_candidate": False,
+                "state": "ENTRY_READINESS_NOT_EVALUATED_SHADOW",
+                "reason": "no_upstream_entry_candidate",
+                "promotion_boundary": {"shadow_only": True, "may_submit_order": False,
+                                       "may_cancel_order": False, "may_replace_order": False,
+                                       "may_block_entry": False, "may_change_stale_cancel_age": False},
+            }
+        elif self.entry_readiness_shadow is None:
+            payload = {
+                "schema_version": 1, "venue": "hyperliquid_outcome", "read_only": True,
+                "live_authority": False, "execution_submitted": False,
+                "outcome_id": market.outcome_id, "period": market.period,
+                "side_index": entry_side_index, "timestamp": now,
+                "decision_observed_at_ms": decision_observed_at_ms,
+                "candidate": False, "persistent_candidate": False,
+                "state": "ENTRY_READINESS_NOT_EVALUATED_SHADOW", "reason": "observer_unavailable",
+                "promotion_boundary": {"shadow_only": True, "may_submit_order": False,
+                                       "may_cancel_order": False, "may_replace_order": False,
+                                       "may_block_entry": False, "may_change_stale_cancel_age": False},
+            }
+        else:
+            try:
+                payload = self.entry_readiness_shadow.evaluate(
+                    outcome_id=market.outcome_id, period=market.period, side_index=entry_side_index,
+                    yes_coin=market.yes_coin, no_coin=market.no_coin, now=now,
+                    decision_observed_at_ms=(int(decision_observed_at_ms)
+                                             if decision_observed_at_ms is not None else None),
+                )
+            except Exception:
+                payload = {
+                    "schema_version": 1, "venue": "hyperliquid_outcome", "read_only": True,
+                    "live_authority": False, "execution_submitted": False,
+                    "outcome_id": market.outcome_id, "period": market.period,
+                    "side_index": entry_side_index, "timestamp": now,
+                    "decision_observed_at_ms": decision_observed_at_ms,
+                    "candidate": False, "persistent_candidate": False,
+                    "state": "ENTRY_READINESS_NOT_READY_SHADOW", "reason": "observer_error",
+                    "promotion_boundary": {"shadow_only": True, "may_submit_order": False,
+                                           "may_cancel_order": False, "may_replace_order": False,
+                                           "may_block_entry": False, "may_change_stale_cancel_age": False},
+                }
+        if self.ledger is not None:
+            side_key = int(entry_side_index) if entry_side_index in (0, 1) else -1
+            fingerprint = ":".join((str(payload.get("state")), str(payload.get("candidate")),
+                                      str(payload.get("persistent_candidate")), str(payload.get("reason"))))
+            key, observed = (market.outcome_id, side_key), time.monotonic()
+            previous = self._last_entry_readiness_shadow_record.get(key)
+            if previous is None or previous[0] != fingerprint or observed - previous[1] >= 30.0:
+                self._log_best_effort_strategy_event("OUTCOME_ENTRY_READINESS_SHADOW", payload)
+                self._last_entry_readiness_shadow_record[key] = (fingerprint, observed)
+        return payload
 
     def _observe_market_regime_shadow(
         self, *, market: OutcomeMarketSpec, entry_side_index: int | None,

@@ -114,6 +114,45 @@ def test_structural_shadow_parse_failure_does_not_block_ws_health_or_wakeup(tmp_
     assert recorder._l2_update.is_set()
 
 
+def test_entry_readiness_shadow_errors_do_not_block_ws_callbacks(tmp_path):
+    class BrokenReadiness:
+        def observe_l2(self, **_kwargs):
+            raise RuntimeError("bad l2")
+
+        def observe_trades(self, **_kwargs):
+            raise RuntimeError("bad trades")
+
+        def observe_btc_mid(self, **_kwargs):
+            raise RuntimeError("bad mids")
+
+    recorder = OutcomeWebSocketRecorder(
+        CallbackClient(), TradeJournalDB(tmp_path / "stream.db"), "stream-run",
+        entry_readiness_shadow=BrokenReadiness(),
+    )
+    recorder._on_l2({"channel": "l2Book", "data": {"coin": "#11450", "time": 456, "levels": [[{"px": "0.60", "sz": "10"}], [{"px": "0.61", "sz": "11"}]]}})
+    recorder._on_mids({"channel": "allMids", "data": {"time": 456, "mids": {"BTC": "80000"}}})
+    recorder._on_trades({"channel": "trades", "data": [{"coin": "#11450", "timestamp": 789}]})
+    assert recorder._l2_update.is_set()
+
+
+def test_entry_readiness_receives_btc_with_local_receipt_time_when_all_mids_has_no_timestamp(tmp_path, monkeypatch):
+    class Readiness:
+        def __init__(self):
+            self.calls = []
+
+        def observe_btc_mid(self, **kwargs):
+            self.calls.append(kwargs)
+
+    observer = Readiness()
+    monkeypatch.setattr("bot.outcome_ws_recorder.time.time", lambda: 123.0)
+    recorder = OutcomeWebSocketRecorder(
+        CallbackClient(), TradeJournalDB(tmp_path / "stream.db"), "stream-run",
+        entry_readiness_shadow=observer,
+    )
+    recorder._on_mids({"channel": "allMids", "data": {"mids": {"BTC": "80000"}}})
+    assert observer.calls == [{"timestamp": 123.0, "price": "80000"}]
+
+
 def test_l2_callback_coalesces_an_execution_loop_wakeup(tmp_path):
     recorder = OutcomeWebSocketRecorder(
         CallbackClient(), TradeJournalDB(tmp_path / "stream.db"), "stream-run",

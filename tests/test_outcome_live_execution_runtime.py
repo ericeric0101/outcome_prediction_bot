@@ -247,6 +247,44 @@ def test_market_regime_shadow_is_journalled_without_execution_authority(tmp_path
     assert json.loads(payload)["execution_submitted"] is False
 
 
+def test_entry_readiness_shadow_is_candidate_bound_and_has_no_entry_authority(tmp_path):
+    class Readiness:
+        def __init__(self):
+            self.calls = []
+
+        def evaluate(self, **kwargs):
+            self.calls.append(kwargs)
+            return {
+                "state": "ENTRY_READINESS_READY_SHADOW", "candidate": True,
+                "persistent_candidate": False, "read_only": True,
+                "live_authority": False, "execution_submitted": False,
+                "promotion_boundary": {"may_submit_order": False, "may_block_entry": False},
+            }
+
+    journal = TradeJournalDB(tmp_path / "readiness.db")
+    observer = Readiness()
+    runtime = OutcomeLiveExecutionRuntime(
+        account=CalibrationAccount(), wallet="w", gateway=Gateway(),
+        ledger=OutcomeExecutionLedger(journal, "run"), entry_readiness_shadow=observer,
+    )
+    result = runtime._observe_entry_readiness_shadow(
+        market=market(), entry_side_index=0, entry_evidence={"decision_observed_at_ms": 123},
+    )
+    assert observer.calls and observer.calls[0]["yes_coin"] == "#11530"
+    assert result["live_authority"] is False
+    with sqlite3.connect(journal.db_path) as conn:
+        payload = json.loads(conn.execute(
+            "SELECT payload_json FROM strategy_events WHERE event_type='OUTCOME_ENTRY_READINESS_SHADOW'"
+        ).fetchone()[0])
+    assert payload["execution_submitted"] is False
+
+    missing_candidate = runtime._observe_entry_readiness_shadow(
+        market=market(), entry_side_index=None, entry_evidence={},
+    )
+    assert missing_candidate["state"] == "ENTRY_READINESS_NOT_EVALUATED_SHADOW"
+    assert len(observer.calls) == 1
+
+
 def test_holding_risk_decision_shadow_persists_three_counterfactuals_without_mutation(tmp_path):
     journal = TradeJournalDB(tmp_path / "holding-risk-shadow.db")
     runtime = OutcomeLiveExecutionRuntime(

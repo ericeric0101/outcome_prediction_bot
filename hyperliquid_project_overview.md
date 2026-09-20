@@ -1,6 +1,6 @@
 # Hyperliquid Outcome (HIP-4) BTC Daily Prediction Market Trading Bot — Current Authority
 
-> **權威架構版本 (Authority Version)**：2.5.6 (Outcome-only; all-loss-exit observation mode; lifecycle-bound structural-collapse forward shadow)
+> **權威架構版本 (Authority Version)**：2.5.7 (Outcome-only; all-loss-exit observation mode; lifecycle-bound tail-risk and entry-readiness forward shadows)
 > **建立與審計日期**：2026-08-23；最近修訂：2026-09-20
 > **目標系統**：Hyperliquid HyperCore L1 原生預測市場 — Outcome (HIP-4 協議標準)  
 > **單一權威聲明**：本文件取代原 `project_overview.md`，為系統唯一的設計、架構、量化模型與執行權威規範。
@@ -77,6 +77,14 @@ and must be checked in the durable startup manifest.
 **目前與未來。** V16 不改 entry、TP、TP reprice、settlement、reduce-only、reconciliation、任何 IOC/stop，亦不改寫或繞過 `OUTCOME_LOSS_EXIT_ENABLED=0` 的 operator experiment。目標是累積約 20–30 個新的、獨立 FailedRecovery WATCH，審核 candidate lead time、15-share executable depth、後續 recover/collapse、false positives 與門檻是否在未重新擬合下穩定；這不是自動 promotion 門檻。任何 live promotion 必須先有獨立 evidence review 與獨立 code/authorization change。
 
 **V16.1 correctness/coverage repair（同日）。** WATCH 不再以 coin 的第一個歷史事件永久保存；每次 `evaluate` 必須帶 exact `entry_lifecycle_id` 的 official `entry_filled_at`，只由該時間後已完成的五分鐘 bars 重建 FailedRecovery，因此進場前的 market episode 不可污染新 holding。adverse phase 在 recovery 尚未成立前會持續把 trough 更新為更低價格並重新計算 recovery threshold，避免 deep-crash 後的真實回補被首次淺 trough 遮蔽。A/B 現在明確輸出並要求 book-window coverage（端點與最大 gap）；trade baseline 有值但 WS coverage 不完整也必須拒絕 candidate。每個既有 holding-path fresh full-depth REST observation 同時以 read-only interface 記錄 exact lifecycle 的 full-inventory executable VWAP、net-after-taker-fee price、可執行 return、timestamp 和 freshness；candidate journal 可直接回答當時約 15 shares 是否仍可全數出場，而 observer 不會自行讀 book 或取得 gateway。新增 natural FailedRecovery、deep trough、late Branch B、pre-entry isolation、partial coverage 和 fresh/stale exitability regressions；這些仍只驗證 shadow 正確性，不增加 live authority。
+
+### 2026-09-20 — Entry Readiness Forward Shadow（V1/V2；shadow-only）
+
+**目的、既有研究與資料流。** V1 的 149 筆 30 秒 markout fills 中，正 markout 僅 20.1%、中位數為 `-1.018¢/share`；V2 leave-one-market-out（LOMO）下 READY 36/149（24.2%）、正 markout 30.6%、中位數 `-0.5¢`；V3 的 pre-30 majority-ready 僅 17 筆、正 markout 35.3%。這是值得 forward validation 的候選品質差異，並不是已證明的 entry alpha；readiness decay 沒有支持 dynamic cancellation，resting age 仍只支持既有 60 秒 stale boundary。此線只檢驗「快速的 public 市場品質是否能在既有 S0 candidate 出現時提供額外可驗證資訊」，不把它誤稱為新訊號或下單 router。launcher 建立單一 `OutcomeEntryReadinessShadow`，`OutcomeWebSocketRecorder` 以 best-effort 方式餵入同一市場的 YES/NO `l2Book`、market-level 去重 trades、以及 BTC `allMids`；`OutcomeLiveExecutionRuntime` 僅在既有 `OutcomeResearchSupervisor.observe_entry` 階段評估，將結果留在 `admission["entry_readiness_shadow"]`，並以 state transition 或 30 秒 cadence 寫入 compact `OUTCOME_ENTRY_READINESS_SHADOW`。WS parser／observer error 或 lock contention 都只能產生 missing/not-ready shadow evidence，絕不能影響 pricing、stream health、wake-up、account recovery 或 execution。
+
+**凍結定義。** 在每個 candidate 以 `t=-30,-20,-10,0` 四個 snapshot 檢查四個家族：雙側 top-3 最小深度、方向正規化 BTC 30 秒 velocity、market-level 30 秒/前 120 秒 participation acceleration、以及 held-side 相對 opposite-side 的 30 秒 bid cross-side confirmation。V1/V2 前向門檻固定為 depth `>=1160`、BTC favorable velocity `>=1.85 bps`、participation ratio `>=1.00`、cross-side `>=300 bps`，current snapshot 必須四項皆完整，至少 3/4 votes 才記 `ENTRY_READINESS_READY_SHADOW`；四個時間點皆完整且至少 3 個 ready 才記 `ENTRY_READINESS_PERSISTENT_SHADOW`。缺任何 baseline/window/fresh snapshot 一律 incomplete/not-ready，不以零、平均值或相鄰資料補值。NO side 只對 BTC 與 held/opposite relative return 做方向正規化；participation 是 market activity，不鏡射成方向性 tape。交易去重 key 是 public economic trade ID，跨 YES/NO 不會 double count。
+
+**權限邊界與禁止事項。** payload 固定 `read_only=true`、`live_authority=false`、`execution_submitted=false`，promotion boundary 一律禁止 submit/cancel/replace、block entry 或改變 stale-cancel age。沒有 upstream entry candidate 時明確記 `ENTRY_READINESS_NOT_EVALUATED_SHADOW`，不製造假 positive；observer 不 import account、gateway、controller、SDK 或 mutation primitive。它不改 5m confirmation、ALO、OI gate、Tier A/B、spread、sizing、TP、loss band、fast-failure、S3、narrow canary、`OUTCOME_LOSS_EXIT_ENABLED=0` 實驗或 V16 結構性崩壞觀測。任何 future promotion 必須用獨立 market、out-of-sample forward evidence 證明增益，另行授權與修改；本版本完全沒有 live entry authority。
 
 ### 2026-09-19 — 60 秒 stale zero-fill BUY admission 與 post-fill evidence 對齊
 

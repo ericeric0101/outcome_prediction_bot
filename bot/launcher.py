@@ -41,6 +41,7 @@ from bot.outcome_live_strategy import OutcomeOiEntryGate
 from bot.outcome_settlement_worker import OutcomeSettlementWorker
 from bot.outcome_ws_recorder import OutcomeWebSocketRecorder
 from bot.outcome_structural_collapse_shadow import OutcomeStructuralCollapseShadow
+from bot.outcome_entry_readiness_shadow import OutcomeEntryReadinessShadow
 from bot.outcome_execution_ledger import OutcomeExecutionLedger
 from bot.outcome_operations_monitor import OutcomeOperationsMonitor
 from bot.outcome_research_capture import OutcomeResearchCapture
@@ -286,10 +287,14 @@ def run_integrated_hyperliquid_bot(
     # One shared, public-data-only instance binds WS observations to the
     # actual holding lifecycle.  It receives no execution primitive.
     structural_collapse_shadow = OutcomeStructuralCollapseShadow()
+    # Public forward-validation only.  This observer cannot change S0 or own
+    # an execution primitive; it merely receives the same WS stream.
+    entry_readiness_shadow = OutcomeEntryReadinessShadow()
     live_execution = OutcomeLiveExecutionRuntime(
         account=client, wallet=auth.wallet_address,
         ledger=OutcomeExecutionLedger(live_journal, f"outcome-live-{uuid.uuid4().hex[:10]}"),
         structural_collapse_shadow=structural_collapse_shadow,
+        entry_readiness_shadow=entry_readiness_shadow,
     )
     live_strategy_gate = OutcomeOiEntryGate(live_journal.db_path) if live_execution.live_strategy_enabled() else None
     settlement_worker = None
@@ -413,6 +418,7 @@ def run_integrated_hyperliquid_bot(
                             client, live_journal, f"outcome-live-ws-{uuid.uuid4().hex[:10]}",
                             pricing_state=pricing,
                             structural_collapse_shadow=structural_collapse_shadow,
+                            entry_readiness_shadow=entry_readiness_shadow,
                         )
                         live_execution.set_open_orders_stream(live_ws_recorder.open_orders_cache)
                     live_ws_recorder.start(outcome_id=market.outcome_id, yes_coin=market.yes_coin, no_coin=market.no_coin)

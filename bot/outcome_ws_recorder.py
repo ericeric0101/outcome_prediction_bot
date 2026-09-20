@@ -16,7 +16,8 @@ class OutcomeWebSocketRecorder:
     """Persist raw market stream messages; no trading client method is called."""
 
     def __init__(self, client: Any, journal: TradeJournalDB, run_id: str, *, pricing_state: Any | None = None,
-                 structural_collapse_shadow: Any | None = None) -> None:
+                 structural_collapse_shadow: Any | None = None,
+                 entry_readiness_shadow: Any | None = None) -> None:
         self.client, self.journal, self.run_id = client, journal, run_id
         # The recorder is the single subscription owner for the live launcher.
         # Feeding its *received* L2 snapshots into the display cache prevents a
@@ -26,6 +27,9 @@ class OutcomeWebSocketRecorder:
         # Public-data-only observer; failures are isolated from WS health and
         # execution wakeups below.
         self.structural_collapse_shadow = structural_collapse_shadow
+        # Independent public-data-only entry observer.  It must never affect
+        # stream health, display pricing, recording, or execution wakeups.
+        self.entry_readiness_shadow = entry_readiness_shadow
         self._market_id: Optional[int] = None
         self._coins: tuple[str, str] = ("", "")
         self._thread: Optional[threading.Thread] = None
@@ -68,6 +72,21 @@ class OutcomeWebSocketRecorder:
             "raw": dict(payload),
         })
 
+    @staticmethod
+    def _shadow_observed_at(data: Mapping[str, Any]) -> float:
+        """Use exchange time when available, otherwise actual local receipt.
+
+        ``allMids`` does not guarantee an exchange timestamp.  Local receipt
+        is still a valid public observation time; refusing it would leave the
+        readiness observer permanently incomplete despite a healthy stream.
+        """
+        try:
+            raw = data.get("time", data.get("timestamp"))
+            observed = float(raw)
+            return observed / 1000 if observed > 10_000_000_000 else observed
+        except (TypeError, ValueError):
+            return time.time()
+
     def _on_lifecycle(self, payload: Mapping[str, Any]) -> None:
         self._record("OUTCOME_WS_LIFECYCLE", payload)
         self.health.on_lifecycle(str(payload.get("event", "")))
@@ -96,6 +115,13 @@ class OutcomeWebSocketRecorder:
                     )
                 except Exception:
                     pass
+            if self.entry_readiness_shadow is not None:
+                try:
+                    self.entry_readiness_shadow.observe_l2(
+                        coin=str(data["coin"]), timestamp=self._shadow_observed_at(data), payload=dict(data),
+                    )
+                except Exception:
+                    pass
             self._l2_update.set()
         self._record("OUTCOME_WS_L2_BOOK", payload)
 
@@ -109,6 +135,13 @@ class OutcomeWebSocketRecorder:
                 btc = mids.get("BTC")
                 if btc is not None:
                     self.pricing_state.update_btc_mark_price(str(btc))
+            except Exception:
+                pass
+        if self.entry_readiness_shadow is not None and isinstance(mids, Mapping):
+            try:
+                btc = mids.get("BTC")
+                if btc is not None:
+                    self.entry_readiness_shadow.observe_btc_mid(timestamp=self._shadow_observed_at(data), price=btc)
             except Exception:
                 pass
         # allMids contains every Hyperliquid asset and was previously copied
@@ -144,6 +177,15 @@ class OutcomeWebSocketRecorder:
                 for coin, rows in groups.items():
                     self.structural_collapse_shadow.observe_trades(
                         coin=coin, items=rows, received_at=time.time(),
+                    )
+            except Exception:
+                pass
+        if self.entry_readiness_shadow is not None:
+            try:
+                data = payload.get("data")
+                if isinstance(data, list):
+                    self.entry_readiness_shadow.observe_trades(
+                        items=[dict(row) for row in data if isinstance(row, Mapping)], received_at=time.time(),
                     )
             except Exception:
                 pass

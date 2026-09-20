@@ -25,6 +25,7 @@ def _snapshot(*, active=(), side_index=0, reduce_only=False, safe=True):
 def test_research_supervisor_is_observation_only_and_preserves_order():
     calls = []
     runtime = SimpleNamespace(
+        _observe_entry_readiness_shadow=lambda **_: calls.append("readiness") or {"state": "SHADOW"},
         _observe_market_regime_shadow=lambda **_: calls.append("regime") or {"state": "TREND"},
         _observe_confidence_entry_shadow=lambda **_: calls.append("confidence") or {"p": 0.7},
         _observe_active_challenger_shadow=lambda **_: calls.append("challenger") or {"action": "HOLD"},
@@ -35,7 +36,8 @@ def test_research_supervisor_is_observation_only_and_preserves_order():
         runtime, market=SimpleNamespace(outcome_id=7), entry_side_index=0,
         entry_reason="confirmed", entry_evidence={}, market_context={}, admission=admission,
     )
-    assert calls == ["regime", "confidence", "challenger", "continuation"]
+    assert calls == ["readiness", "regime", "confidence", "challenger", "continuation"]
+    assert admission["entry_readiness_shadow"]["state"] == "SHADOW"
     assert admission["market_regime_shadow"]["state"] == "TREND"
 
 
