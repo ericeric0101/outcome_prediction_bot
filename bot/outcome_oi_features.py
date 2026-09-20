@@ -373,16 +373,11 @@ class OutcomeOiFeaturePipeline:
             market_index[outcome_id] = (
                 tuple(int(snapshot["snapshot_timestamp_ms"]) for snapshot in ordered), ordered,
             )
-        newest_snapshot_ms = max((int(snapshot["snapshot_timestamp_ms"]) for _, snapshot in snapshots), default=0)
-        refresh_after_ms = newest_snapshot_ms - (max(LABEL_HORIZONS_SEC) + LABEL_TOLERANCE_MS // 1000) * 1000
-        work = [
-            (event_id, snapshot)
-            for event_id, snapshot in snapshots
-            # An explicit historical-backfill run intentionally changes the
-            # permitted OI evidence, so it must recompute the current schema.
-            if checkpoint is None or event_id > checkpoint[0]
-            or int(snapshot["snapshot_timestamp_ms"]) >= refresh_after_ms
-        ]
+        # ``snapshots`` already contains every new row plus the full old
+        # label tail.  Recompute that selected tail: a newly appended future
+        # snapshot can complete a horizon label near the checkpoint boundary.
+        # Re-applying a second cutoff here can silently skip that update.
+        work = snapshots
         joined = 0
         coverage = {horizon: 0 for horizon in LABEL_HORIZONS_SEC}
 

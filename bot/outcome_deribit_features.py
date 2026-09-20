@@ -18,6 +18,7 @@ from typing import Any, Callable, Mapping
 
 from bot.outcome_oi_features import _bbo
 from bot.outcome_p2_quality import is_eligible_p2_snapshot
+from monitoring.db_mem_diag import DbMemDiag
 from monitoring.trade_journal_db import TradeJournalDB
 
 
@@ -82,61 +83,97 @@ class OutcomeDeribitFeaturePipeline:
     def __init__(self, journal: TradeJournalDB) -> None:
         self.journal = journal
 
-    @staticmethod
     def _outcome_snapshots(
+        self,
         conn: sqlite3.Connection, *, after_ms: int | None, after_event_id: int | None,
+        checkpoint_event_id: int | None = None, refresh_after_ms: int | None = None,
     ) -> list[tuple[int, dict[str, Any]]]:
         # The journal id is only an efficient lower bound on scanning; it is
         # never used as timing evidence.  The actual join still requires
         # Deribit local receipt <= Outcome snapshot timestamp.
-        if after_event_id is None:
-            rows = conn.execute(
-                "SELECT id,payload_json FROM strategy_events WHERE event_type='OUTCOME_P2_PARITY_SNAPSHOT' ORDER BY id"
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                "SELECT id,payload_json FROM strategy_events "
-                "WHERE event_type='OUTCOME_P2_PARITY_SNAPSHOT' AND id>=? ORDER BY id", (after_event_id,)
-            ).fetchall()
+        diag = DbMemDiag("outcome_deribit_feature_outcome_snapshots")
         snapshots: list[tuple[int, dict[str, Any]]] = []
-        for event_id, raw in rows:
-            try:
-                payload = json.loads(raw or "{}")
-                timestamp = int(payload.get("snapshot_timestamp_ms"))
-            except (TypeError, ValueError, json.JSONDecodeError):
-                continue
-            if (
-                isinstance(payload, dict) and payload.get("period") == "1d"
-                and is_eligible_p2_snapshot(payload) and (after_ms is None or timestamp >= after_ms)
-            ):
-                snapshots.append((int(event_id), payload))
-        return snapshots
+        row_count = payload_bytes = 0
+        try:
+            sql = "SELECT id,payload_json FROM strategy_events WHERE event_type='OUTCOME_P2_PARITY_SNAPSHOT'"
+            params: tuple[int, ...] = ()
+            if checkpoint_event_id is not None and refresh_after_ms is not None:
+                sql += """ AND (id > ? OR id IN (
+                    SELECT outcome_snapshot_event_id
+                    FROM outcome_deribit_feature_rows
+                    WHERE feature_schema_version=? AND snapshot_timestamp_ms>=?
+                ))"""
+                params = (checkpoint_event_id, DERIBIT_FEATURE_SCHEMA_VERSION, refresh_after_ms)
+            elif after_event_id is not None:
+                sql += " AND id>=?"
+                params = (after_event_id,)
+            for event_id, raw in conn.execute(sql + " ORDER BY id", params):
+                row_count += 1
+                if raw is not None:
+                    payload_bytes += len(str(raw).encode("utf-8"))
+                try:
+                    payload = json.loads(raw or "{}")
+                    timestamp = int(payload.get("snapshot_timestamp_ms"))
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    continue
+                if (
+                    isinstance(payload, dict) and payload.get("period") == "1d"
+                    and is_eligible_p2_snapshot(payload) and (after_ms is None or timestamp >= after_ms)
+                ):
+                    snapshots.append((int(event_id), payload))
+            diag.after_query(rows=row_count, payload_bytes=payload_bytes)
+            return snapshots
+        finally:
+            diag.finish(note=(
+                "incremental_new_plus_label_tail"
+                if checkpoint_event_id is not None else "full_history_streamed"
+            ))
 
     @staticmethod
     def _deribit_points(conn: sqlite3.Connection) -> list[_DeribitPoint]:
-        rows = conn.execute(
-            "SELECT id,payload_json FROM strategy_events WHERE event_type='DERIBIT_FEATURE_SNAPSHOT' ORDER BY id"
-        ).fetchall()
+        diag = DbMemDiag("outcome_deribit_feature_points")
         points: list[_DeribitPoint] = []
-        for event_id, raw in rows:
-            try:
-                payload = json.loads(raw or "{}")
-                local = int(payload.get("local_received_at_ms"))
-            except (TypeError, ValueError, json.JSONDecodeError):
-                continue
-            if not isinstance(payload, dict) or payload.get("valid") is not True:
-                continue
-            source = payload.get("source_timestamp_ms")
-            try:
-                source_ms = int(source) if source is not None else None
-            except (TypeError, ValueError):
-                continue
-            # Collector's immutable declaration means the book was continuous
-            # and fresh.  Reject pathological clocks instead of repairing.
-            if source_ms is not None and source_ms > local:
-                continue
-            points.append(_DeribitPoint(int(event_id), source_ms, local, payload))
-        return points
+        row_count = payload_bytes = 0
+        try:
+            cursor = conn.execute(
+                "SELECT id,payload_json FROM strategy_events WHERE event_type='DERIBIT_FEATURE_SNAPSHOT' ORDER BY id"
+            )
+            for event_id, raw in cursor:
+                row_count += 1
+                if raw is not None:
+                    payload_bytes += len(str(raw).encode("utf-8"))
+                try:
+                    payload = json.loads(raw or "{}")
+                    local = int(payload.get("local_received_at_ms"))
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    continue
+                if not isinstance(payload, dict) or payload.get("valid") is not True:
+                    continue
+                source = payload.get("source_timestamp_ms")
+                try:
+                    source_ms = int(source) if source is not None else None
+                except (TypeError, ValueError):
+                    continue
+                # Collector's immutable declaration means the book was continuous
+                # and fresh.  Reject pathological clocks instead of repairing.
+                if source_ms is not None and source_ms > local:
+                    continue
+                points.append(_DeribitPoint(int(event_id), source_ms, local, payload))
+            diag.after_query(rows=row_count, payload_bytes=payload_bytes)
+            return points
+        finally:
+            diag.finish(note="streamed_but_asof_history_is_retained_for_returns")
+
+    @staticmethod
+    def _checkpoint(conn: sqlite3.Connection) -> tuple[int, int] | None:
+        row = conn.execute(
+            """SELECT MAX(outcome_snapshot_event_id), MAX(snapshot_timestamp_ms)
+               FROM outcome_deribit_feature_rows WHERE feature_schema_version=?""",
+            (DERIBIT_FEATURE_SCHEMA_VERSION,),
+        ).fetchone()
+        if row is None or row[0] is None or row[1] is None:
+            return None
+        return int(row[0]), int(row[1])
 
     @staticmethod
     def _labels(current: dict[str, Any], market_times: tuple[int, ...], market_rows: tuple[dict[str, Any], ...]) -> dict[str, Any]:
@@ -206,13 +243,26 @@ class OutcomeDeribitFeaturePipeline:
             points = self._deribit_points(conn)
             first = min((point.local_received_at_ms for point in points), default=None)
             first_event_id = min((point.event_id for point in points), default=None)
-            snapshots = self._outcome_snapshots(conn, after_ms=first, after_event_id=first_event_id)
-            existing = set() if rebuild else {
-                int(row[0]) for row in conn.execute(
-                    "SELECT outcome_snapshot_event_id FROM outcome_deribit_feature_rows WHERE feature_schema_version=?",
-                    (DERIBIT_FEATURE_SCHEMA_VERSION,),
+            checkpoint = None if rebuild else self._checkpoint(conn)
+            refresh_after = None if checkpoint is None else (
+                checkpoint[1] - (max(DERIBIT_LABEL_HORIZONS_SEC) * 1_000 + DERIBIT_LABEL_TOLERANCE_MS)
+            )
+            snapshots = self._outcome_snapshots(
+                conn, after_ms=first, after_event_id=first_event_id,
+                checkpoint_event_id=checkpoint[0] if checkpoint is not None else None,
+                refresh_after_ms=refresh_after,
+            )
+            # A valid, late source row can alter labels before the retained
+            # tail.  Fall back to the existing full reconstruction behaviour.
+            if checkpoint is not None and refresh_after is not None and any(
+                event_id > checkpoint[0]
+                and int(snapshot["snapshot_timestamp_ms"]) < refresh_after
+                for event_id, snapshot in snapshots
+            ):
+                snapshots = self._outcome_snapshots(
+                    conn, after_ms=first, after_event_id=first_event_id,
                 )
-            }
+                checkpoint = None
         index = _DeribitIndex(points)
         by_market: dict[int, list[dict[str, Any]]] = defaultdict(list)
         for _event_id, snapshot in snapshots:
@@ -223,12 +273,10 @@ class OutcomeDeribitFeaturePipeline:
             ) for outcome_id, group in by_market.items()
             for ordered in (sorted(group, key=lambda row: int(row["snapshot_timestamp_ms"])),)
         }
-        newest = max((int(snapshot["snapshot_timestamp_ms"]) for _id, snapshot in snapshots), default=0)
-        refresh_after = newest - (max(DERIBIT_LABEL_HORIZONS_SEC) * 1_000 + DERIBIT_LABEL_TOLERANCE_MS)
-        work = [
-            (event_id, snapshot) for event_id, snapshot in snapshots
-            if rebuild or event_id not in existing or int(snapshot["snapshot_timestamp_ms"]) >= refresh_after
-        ]
+        # The source selection already includes all newly appended rows and
+        # the complete old D2 label tail.  Rebuild that selected tail so a new
+        # future observation can complete labels at its lower boundary.
+        work = snapshots
         joined = unavailable = stale_rejected = 0
         labels_available = {horizon: 0 for horizon in DERIBIT_LABEL_HORIZONS_SEC}
 
@@ -290,8 +338,13 @@ class OutcomeDeribitFeaturePipeline:
             rows(), batch_size=batch_size, timeout_sec=write_timeout_sec,
             progress=(lambda completed: progress(completed, len(work))) if progress else None,
         )
+        with sqlite3.connect(self.journal.db_path) as conn:
+            eligible_outcome_snapshots = int(conn.execute(
+                "SELECT COUNT(*) FROM outcome_deribit_feature_rows WHERE feature_schema_version=?",
+                (DERIBIT_FEATURE_SCHEMA_VERSION,),
+            ).fetchone()[0])
         return D2BuildResult(
-            eligible_outcome_snapshots=len(snapshots), rows_written=written, deribit_joined=joined,
+            eligible_outcome_snapshots=eligible_outcome_snapshots, rows_written=written, deribit_joined=joined,
             deribit_unavailable=unavailable, deribit_stale_rejected=stale_rejected, labels_available=labels_available,
             first_deribit_received_at_ms=first,
             last_deribit_received_at_ms=max((point.local_received_at_ms for point in points), default=None),

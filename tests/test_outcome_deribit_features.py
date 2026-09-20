@@ -83,3 +83,66 @@ def test_d2_rejects_an_asof_snapshot_that_exceeds_immutable_freshness_budget(tmp
     features = json.loads(raw)
     assert features["deribit_available"] is False
     assert features["deribit_unavailable_reason"] == "deribit_snapshot_stale_for_outcome_decision"
+
+
+def _d2_rows(journal):
+    with sqlite3.connect(journal.db_path) as conn:
+        return conn.execute(
+            """SELECT outcome_snapshot_event_id,outcome_id,period,snapshot_timestamp_ms,
+                      deribit_snapshot_event_id,deribit_source_timestamp_ms,
+                      deribit_local_received_at_ms,deribit_age_ms,deribit_join_direction,
+                      deribit_valid,features_json,labels_json,market_context_json
+               FROM outcome_deribit_feature_rows
+               WHERE feature_schema_version=? ORDER BY outcome_snapshot_event_id""",
+            (DERIBIT_FEATURE_SCHEMA_VERSION,),
+        ).fetchall()
+
+
+def _record_d2_source(journal, timestamp):
+    journal.log_strategy_event("deribit", "DERIBIT_FEATURE_SNAPSHOT", _deribit(timestamp - 1))
+    journal.log_strategy_event("outcome", "OUTCOME_P2_PARITY_SNAPSHOT", _outcome(timestamp))
+
+
+def test_d2_incremental_window_matches_full_rebuild(tmp_path):
+    base = 2_300_000_000_000
+    incremental = TradeJournalDB(tmp_path / "incremental.db")
+    full = TradeJournalDB(tmp_path / "full.db")
+    initial_times = [base + minute * 60_000 for minute in range(70)]
+    appended_times = [base + minute * 60_000 for minute in (70, 71)]
+    for timestamp in initial_times:
+        _record_d2_source(incremental, timestamp)
+    OutcomeDeribitFeaturePipeline(incremental).build(batch_size=10)
+    for timestamp in appended_times:
+        _record_d2_source(incremental, timestamp)
+    resumed = OutcomeDeribitFeaturePipeline(incremental).build(batch_size=10)
+
+    for timestamp in (*initial_times, *appended_times):
+        _record_d2_source(full, timestamp)
+    OutcomeDeribitFeaturePipeline(full).build(batch_size=10)
+
+    # The D2 label tail is 307.5 seconds; its complete selected tail plus the
+    # two new rows is refreshed so boundary labels remain identical to a full
+    # reconstruction.
+    assert resumed.rows_written == 8
+    assert resumed.eligible_outcome_snapshots == 72
+    assert _d2_rows(incremental) == _d2_rows(full)
+
+
+def test_d2_late_snapshot_falls_back_to_full_rebuild(tmp_path):
+    journal = TradeJournalDB(tmp_path / "journal.db")
+    base = 2_400_000_000_000
+    for timestamp in (base, base + 60_000, base + 90_000, base + 400_000):
+        _record_d2_source(journal, timestamp)
+    OutcomeDeribitFeaturePipeline(journal).build(batch_size=10)
+
+    # The source event is newly appended but its decision time predates the
+    # retained 307.5-second label tail, so all rows are safely rebuilt.
+    _record_d2_source(journal, base + 30_000)
+    resumed = OutcomeDeribitFeaturePipeline(journal).build(batch_size=10)
+
+    assert resumed.rows_written == 5
+    with sqlite3.connect(journal.db_path) as conn:
+        labels = json.loads(conn.execute(
+            "SELECT labels_json FROM outcome_deribit_feature_rows WHERE outcome_snapshot_event_id=10"
+        ).fetchone()[0])
+    assert labels["future_60s"]["available"] is True

@@ -134,7 +134,7 @@ def test_x3_incremental_window_matches_full_rebuild_without_reparsing_old_histor
 
     # The 62-minute label tail is refreshed; the eight older rows are neither
     # parsed nor rewritten on the resumed run.
-    assert resumed.rows_written == 63
+    assert resumed.rows_written == 65
     assert resumed.eligible_snapshots == 72
     assert _feature_rows(incremental) == _feature_rows(full)
 
