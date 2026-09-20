@@ -29,9 +29,17 @@ def _rss_bytes() -> int | None:
 
         class _MachTaskBasicInfo(ctypes.Structure):
             _fields_ = [
-                ("policy", ctypes.c_uint32), ("resident_size", ctypes.c_uint64),
-                ("resident_size_max", ctypes.c_uint64), ("virtual_size", ctypes.c_uint64),
+                # mach_task_basic_info_data_t on macOS.  The earlier layout
+                # was not the ABI layout, so task_info correctly declined it
+                # and the diagnostic emitted RSS as "na".
                 ("suspend_count", ctypes.c_int),
+                ("virtual_size", ctypes.c_uint64),
+                ("resident_size", ctypes.c_uint64),
+                ("user_seconds", ctypes.c_int),
+                ("user_microseconds", ctypes.c_int),
+                ("system_seconds", ctypes.c_int),
+                ("system_microseconds", ctypes.c_int),
+                ("policy", ctypes.c_int),
             ]
 
         info = _MachTaskBasicInfo()

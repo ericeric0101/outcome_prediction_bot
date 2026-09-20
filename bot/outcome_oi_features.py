@@ -17,6 +17,7 @@ from typing import Any, Callable, Mapping
 
 from bot.outcome_p2_quality import is_eligible_p2_snapshot
 from bot.outcome_markout import P3_MARKOUT_HORIZONS_SEC, P3_MARKOUT_SCHEMA_VERSION
+from monitoring.db_mem_diag import DbMemDiag
 from monitoring.trade_journal_db import TradeJournalDB
 
 FEATURE_SCHEMA_VERSION = 2
@@ -115,17 +116,33 @@ class OutcomeOiFeaturePipeline:
         self.include_backfilled = include_backfilled
 
     def _snapshots(self, conn: sqlite3.Connection) -> list[tuple[int, dict[str, Any]]]:
-        rows = conn.execute("SELECT id, payload_json FROM strategy_events WHERE event_type='OUTCOME_P2_PARITY_SNAPSHOT' ORDER BY id").fetchall()
-        output = []
-        for event_id, raw in rows:
-            try:
-                payload = json.loads(raw)
-            except (TypeError, json.JSONDecodeError):
-                continue
-            if not isinstance(payload, dict) or payload.get("period") != "1d" or not is_eligible_p2_snapshot(payload):
-                continue
-            output.append((int(event_id), payload))
-        return output
+        # This historical research build can encounter hundreds of thousands
+        # of large P2 snapshots. Stream SQLite rows into the already-required
+        # parsed output rather than retaining a second, raw fetchall() list.
+        # Query order and every accepted/rejected payload are unchanged.
+        diag = DbMemDiag("outcome_oi_feature_snapshots")
+        output: list[tuple[int, dict[str, Any]]] = []
+        row_count = payload_bytes = 0
+        try:
+            cursor = conn.execute(
+                "SELECT id, payload_json FROM strategy_events "
+                "WHERE event_type='OUTCOME_P2_PARITY_SNAPSHOT' ORDER BY id"
+            )
+            for event_id, raw in cursor:
+                row_count += 1
+                if raw is not None:
+                    payload_bytes += len(str(raw).encode("utf-8"))
+                try:
+                    payload = json.loads(raw)
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                if not isinstance(payload, dict) or payload.get("period") != "1d" or not is_eligible_p2_snapshot(payload):
+                    continue
+                output.append((int(event_id), payload))
+            diag.after_query(rows=row_count, payload_bytes=payload_bytes)
+            return output
+        finally:
+            diag.finish(note="streamed_but_parsed_history_is_still_retained_for_feature_build")
 
     def _observations(self, conn: sqlite3.Connection) -> list[_Oi]:
         where = "" if self.include_backfilled else "WHERE backfilled=0"

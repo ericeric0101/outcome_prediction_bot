@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
+from monitoring.db_mem_diag import DbMemDiag
 from monitoring.trade_journal_db import TradeJournalDB
 
 
@@ -98,32 +99,41 @@ class OutcomeLossReentryGate:
         self, conn: sqlite3.Connection, *, outcome_id: int
     ) -> tuple[int, str, str] | None:
         """Return the latest loss event, skipping proven-profitable v1 rows."""
-        rows = conn.execute(
-            """SELECT id, ts, payload_json FROM strategy_events WHERE event_type=?
-               AND CAST(json_extract(payload_json, '$.outcome_id') AS INTEGER)=?
-               ORDER BY id DESC""",
-            (self.EVENT, outcome_id),
-        ).fetchall()
-        for row in rows:
-            try:
-                payload = json.loads(row[2] or "{}")
-                if not isinstance(payload, dict):
-                    return row
-                if "net_realized_pnl_usdc" in payload:
-                    # v2 events are generated only after the same complete-lot
-                    # check.  Treat malformed numeric evidence as fail-closed.
-                    if Decimal(str(payload["net_realized_pnl_usdc"])) >= 0:
+        diag = DbMemDiag("loss_reentry_latest_verified_loss_event")
+        rows: list[tuple[int, str, str]] = []
+        try:
+            rows = conn.execute(
+                """SELECT id, ts, payload_json FROM strategy_events WHERE event_type=?
+                   AND CAST(json_extract(payload_json, '$.outcome_id') AS INTEGER)=?
+                   ORDER BY id DESC""",
+                (self.EVENT, outcome_id),
+            ).fetchall()
+            diag.after_query(
+                rows=len(rows),
+                payload_bytes=sum(len(str(row[2] or "").encode("utf-8")) for row in rows),
+            )
+            for row in rows:
+                try:
+                    payload = json.loads(row[2] or "{}")
+                    if not isinstance(payload, dict):
+                        return row
+                    if "net_realized_pnl_usdc" in payload:
+                        # v2 events are generated only after the same complete-lot
+                        # check.  Treat malformed numeric evidence as fail-closed.
+                        if Decimal(str(payload["net_realized_pnl_usdc"])) >= 0:
+                            continue
+                        return row
+                    legacy_pnl = self._legacy_event_net_pnl(
+                        conn, outcome_id=outcome_id, event_ts=str(row[1]), payload=payload,
+                    )
+                    if legacy_pnl is not None and legacy_pnl >= 0:
                         continue
                     return row
-                legacy_pnl = self._legacy_event_net_pnl(
-                    conn, outcome_id=outcome_id, event_ts=str(row[1]), payload=payload,
-                )
-                if legacy_pnl is not None and legacy_pnl >= 0:
-                    continue
-                return row
-            except (InvalidOperation, TypeError, ValueError, json.JSONDecodeError):
-                return row
-        return None
+                except (InvalidOperation, TypeError, ValueError, json.JSONDecodeError):
+                    return row
+            return None
+        finally:
+            diag.finish(note="unbounded_json_filtered_history")
 
     def record_confirmed_loss_exit(self, *, outcome_id: int, period: str, coin: str, order_id: str) -> bool:
         """Record only a verified, fee-inclusive losing round trip.
