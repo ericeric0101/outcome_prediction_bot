@@ -1395,10 +1395,19 @@ class OutcomeLiveExecutionRuntime:
             # forward-validation stream.  Its output is journaled solely as
             # research and is never passed to any execution owner.
             if self.structural_collapse_shadow is not None:
+                try:
+                    entry_filled_at = datetime.fromisoformat(str(provenance["entry_filled_at"])).timestamp()
+                except (KeyError, TypeError, ValueError, OSError, OverflowError):
+                    # The observer is lifecycle-bound; a submit-time or
+                    # guessed timestamp would reintroduce pre-entry leakage.
+                    entry_filled_at = None
+                if entry_filled_at is None:
+                    return True
                 structural = self.structural_collapse_shadow.evaluate(
                     lifecycle_id=lifecycle_id, outcome_id=market.outcome_id, period=market.period,
                     held_coin=coin, yes_coin=market.yes_coin, no_coin=market.no_coin,
-                    now=now, position_size=inventory, entry_price=vwap,
+                    now=now, entry_filled_at=entry_filled_at,
+                    position_size=inventory, entry_price=vwap,
                 )
                 state = str(structural.get("state")) + ":" + ",".join(
                     str(item) for item in structural.get("candidate_branches", ())
@@ -1531,6 +1540,11 @@ class OutcomeLiveExecutionRuntime:
             ))
             lifecycle_id = str(provenance.get("entry_lifecycle_id") or "")
             if lifecycle_id:
+                if self.structural_collapse_shadow is not None:
+                    self.structural_collapse_shadow.observe_exitability(
+                        lifecycle_id=lifecycle_id, timestamp=time.time(), inventory=inventory,
+                        executable_vwap=marketable_vwap, taker_fee_rate=taker_fee,
+                    )
                 lane = self.market_risk_monitor.assess_full_depth(
                     lifecycle_id=lifecycle_id, timestamp=time.time(), entry_price=vwap,
                     full_inventory_vwap=marketable_vwap, full_inventory=marketable_vwap is not None,

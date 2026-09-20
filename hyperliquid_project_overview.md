@@ -1,6 +1,6 @@
 # Hyperliquid Outcome (HIP-4) BTC Daily Prediction Market Trading Bot — Current Authority
 
-> **權威架構版本 (Authority Version)**：2.5.5 (Outcome-only; all-loss-exit observation mode; structural-collapse forward shadow)
+> **權威架構版本 (Authority Version)**：2.5.6 (Outcome-only; all-loss-exit observation mode; lifecycle-bound structural-collapse forward shadow)
 > **建立與審計日期**：2026-08-23；最近修訂：2026-09-20
 > **目標系統**：Hyperliquid HyperCore L1 原生預測市場 — Outcome (HIP-4 協議標準)  
 > **單一權威聲明**：本文件取代原 `project_overview.md`，為系統唯一的設計、架構、量化模型與執行權威規範。
@@ -75,6 +75,8 @@ and must be checked in the durable startup manifest.
 **前向實作與權限邊界。** launcher 建立一個共享 observer，交給 `OutcomeWebSocketRecorder`（best-effort public `l2Book`/`trades`）及 `OutcomeLiveExecutionRuntime`；runtime 僅在 exact owned holding lifecycle 存在時，最多每 30 秒或 state transition 寫入 compact `OUTCOME_STRUCTURAL_COLLAPSE_SHADOW`。trade 以 trade ID 去重且不以 A/B side 區分，缺任一側 baseline 或 spread evidence 一律不形成 Branch B。五分鐘 close 僅在下一 bucket 抵達後封存，避免未完成 bar 的 lookahead；restart 不重建猜測中的 WATCH。所有 payload 固定 `read_only=true`、`live_authority=false`、`execution_submitted=false`，以及 `may_submit_order=false`、`may_cancel_order=false`、`may_replace_order=false`、`may_veto_existing_safety_lane=false`。observer 不持有 account、gateway、SDK、controller 或任何 mutation primitive；WS parse failure 也不得影響 health 或 execution wakeup。
 
 **目前與未來。** V16 不改 entry、TP、TP reprice、settlement、reduce-only、reconciliation、任何 IOC/stop，亦不改寫或繞過 `OUTCOME_LOSS_EXIT_ENABLED=0` 的 operator experiment。目標是累積約 20–30 個新的、獨立 FailedRecovery WATCH，審核 candidate lead time、15-share executable depth、後續 recover/collapse、false positives 與門檻是否在未重新擬合下穩定；這不是自動 promotion 門檻。任何 live promotion 必須先有獨立 evidence review 與獨立 code/authorization change。
+
+**V16.1 correctness/coverage repair（同日）。** WATCH 不再以 coin 的第一個歷史事件永久保存；每次 `evaluate` 必須帶 exact `entry_lifecycle_id` 的 official `entry_filled_at`，只由該時間後已完成的五分鐘 bars 重建 FailedRecovery，因此進場前的 market episode 不可污染新 holding。adverse phase 在 recovery 尚未成立前會持續把 trough 更新為更低價格並重新計算 recovery threshold，避免 deep-crash 後的真實回補被首次淺 trough 遮蔽。A/B 現在明確輸出並要求 book-window coverage（端點與最大 gap）；trade baseline 有值但 WS coverage 不完整也必須拒絕 candidate。每個既有 holding-path fresh full-depth REST observation 同時以 read-only interface 記錄 exact lifecycle 的 full-inventory executable VWAP、net-after-taker-fee price、可執行 return、timestamp 和 freshness；candidate journal 可直接回答當時約 15 shares 是否仍可全數出場，而 observer 不會自行讀 book 或取得 gateway。新增 natural FailedRecovery、deep trough、late Branch B、pre-entry isolation、partial coverage 和 fresh/stale exitability regressions；這些仍只驗證 shadow 正確性，不增加 live authority。
 
 ### 2026-09-19 — 60 秒 stale zero-fill BUY admission 與 post-fill evidence 對齊
 

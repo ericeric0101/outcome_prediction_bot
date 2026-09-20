@@ -22,6 +22,8 @@ class StructuralCollapseConfig:
     bilateral_spread_bps_threshold: Decimal = Decimal("200")
     max_history_sec: float = 35 * 60
     max_samples_per_coin: int = 20_000
+    max_book_gap_sec: float = 90.0
+    fresh_exitability_sec: float = 35.0
 
 
 @dataclass(frozen=True)
@@ -49,7 +51,7 @@ class OutcomeStructuralCollapseShadow:
         self._trade_ids: dict[str, set[str]] = {}
         self._bar_closes: dict[str, dict[int, Decimal]] = {}
         self._current_bar: dict[str, tuple[int, Decimal]] = {}
-        self._watch: dict[str, dict[str, Any]] = {}
+        self._exitability: dict[str, dict[str, Any]] = {}
 
     @staticmethod
     def _decimal(value: Any) -> Decimal | None:
@@ -94,10 +96,16 @@ class OutcomeStructuralCollapseShadow:
         # A bucket becomes usable only when a later bucket is observed.  This
         # avoids treating the current five-minute midpoint as a completed bar.
         previous = self._current_bar.get(coin)
-        if previous is not None and bucket > previous[0]:
+        close = (bid + ask) / 2
+        if previous is None:
+            self._current_bar[coin] = (bucket, close)
+        elif bucket > previous[0]:
             self._bar_closes.setdefault(coin, {})[previous[0]] = previous[1]
-            self._update_watch(coin)
-        self._current_bar[coin] = (bucket, (bid + ask) / 2)
+            self._current_bar[coin] = (bucket, close)
+        elif bucket == previous[0]:
+            self._current_bar[coin] = (bucket, close)
+        # Older WS messages are still useful for bounded book windows, but
+        # cannot rewrite an already advanced bar-close sequence.
 
     def observe_trades(self, *, coin: str, items: Iterable[dict[str, Any]], received_at: float) -> None:
         trades, ids = self._trades.setdefault(coin, deque()), self._trade_ids.setdefault(coin, set())
@@ -131,12 +139,19 @@ class OutcomeStructuralCollapseShadow:
             if bucket < oldest_bucket:
                 del self._bar_closes[coin][bucket]
 
-    def _update_watch(self, coin: str) -> None:
-        if coin in self._watch:
-            return
-        closes = [(bucket, price) for bucket, price in sorted(self._bar_closes.get(coin, {}).items())]
+    def _watch_after_entry(self, coin: str, entry_filled_at: float) -> dict[str, Any] | None:
+        """Derive a WATCH from completed bars belonging to this lifecycle.
+
+        A market-level pre-entry watch must never be attributed to a later
+        holding.  Recomputing from the bounded completed-bar history is cheap
+        and lets each exact lifecycle start with a clean state.
+        """
+        closes = [
+            (bucket, price) for bucket, price in sorted(self._bar_closes.get(coin, {}).items())
+            if (bucket + 1) * self._BAR_SEC >= entry_filled_at
+        ]
         if len(closes) < 4:
-            return
+            return None
         peak = closes[0][1]; trough: Decimal | None = None; recovery_high: Decimal | None = None; recovered = False
         for bucket, price in closes[1:]:
             if trough is None:
@@ -144,20 +159,48 @@ class OutcomeStructuralCollapseShadow:
                 if peak - price >= self.config.adverse_impulse_pp:
                     trough, recovery_high = price, price
                 continue
+            # Until recovery is established, a deeper low changes the true
+            # drawdown and therefore the recovery threshold.  Keeping the
+            # first threshold would miss deep-crash FailedRecovery episodes.
+            if not recovered and price < trough:
+                trough, recovery_high = price, price
+                continue
             recovery_high = max(recovery_high or price, price)
             drawdown = max(peak - trough, Decimal("0.000000001"))
             if price >= trough + drawdown * self.config.minimum_recovery_fraction:
                 recovered = True
             if recovered and recovery_high - price >= self.config.renewed_drop_pp:
-                self._watch[coin] = {"trigger_ts": (bucket + 1) * self._BAR_SEC, "trigger_price": price, "peak": peak, "trough": trough, "recovery_high": recovery_high}
-                return
+                return {"trigger_ts": (bucket + 1) * self._BAR_SEC, "trigger_price": price, "peak": peak, "trough": trough, "recovery_high": recovery_high}
+        return None
 
     @staticmethod
     def _median(values: list[Decimal]) -> Decimal | None:
         return Decimal(str(median(values))) if values else None
 
     def _books_in(self, coin: str, lo: float, hi: float) -> list[_Book]:
-        return [row for row in self._books.get(coin, ()) if lo < row.ts <= hi]
+        return sorted((row for row in self._books.get(coin, ()) if lo < row.ts <= hi), key=lambda row: row.ts)
+
+    def _book_coverage(self, coin: str, lo: float, hi: float) -> tuple[bool, int]:
+        rows = self._books_in(coin, lo, hi)
+        if len(rows) < 2:
+            return False, len(rows)
+        if rows[0].ts > lo + self.config.max_book_gap_sec or rows[-1].ts < hi - self.config.max_book_gap_sec:
+            return False, len(rows)
+        timestamps = [row.ts for row in rows]
+        return all(b - a <= self.config.max_book_gap_sec for a, b in zip(timestamps, timestamps[1:])), len(rows)
+
+    def observe_exitability(self, *, lifecycle_id: str, timestamp: float, inventory: Decimal,
+                            executable_vwap: Decimal | None, taker_fee_rate: Decimal | None) -> None:
+        """Accept existing fresh full-depth evidence; never requests a book."""
+        net_return = None
+        if executable_vwap is not None and taker_fee_rate is not None and Decimal("0") <= taker_fee_rate < Decimal("1"):
+            net_return = executable_vwap * (Decimal("1") - taker_fee_rate)
+        self._exitability[lifecycle_id] = {
+            "timestamp": timestamp, "position_size": str(inventory),
+            "full_inventory_executable": executable_vwap is not None,
+            "sell_vwap": str(executable_vwap) if executable_vwap is not None else None,
+            "net_after_taker_fee_price": str(net_return) if net_return is not None else None,
+        }
 
     def _rate(self, coin: str, lo: float, hi: float) -> Decimal | None:
         if hi <= lo:
@@ -168,12 +211,12 @@ class OutcomeStructuralCollapseShadow:
         baseline, current = self._rate(coin, trigger - 900, trigger), self._rate(coin, trigger + lo, trigger + hi)
         return current / baseline if baseline is not None and current is not None and baseline > 0 else None
 
-    def evaluate(self, *, lifecycle_id: str, outcome_id: int, period: str, held_coin: str, yes_coin: str, no_coin: str, now: float, position_size: Decimal | None = None, entry_price: Decimal | None = None) -> dict[str, Any]:
-        watch = self._watch.get(held_coin)
+    def evaluate(self, *, lifecycle_id: str, outcome_id: int, period: str, held_coin: str, yes_coin: str, no_coin: str, now: float, entry_filled_at: float, position_size: Decimal | None = None, entry_price: Decimal | None = None) -> dict[str, Any]:
+        watch = self._watch_after_entry(held_coin, entry_filled_at)
         base: dict[str, Any] = {
             "schema_version": 1, "read_only": True, "live_authority": False, "execution_submitted": False,
             "outcome_id": outcome_id, "period": period, "entry_lifecycle_id": lifecycle_id, "held_coin": held_coin, "yes_coin": yes_coin, "no_coin": no_coin, "timestamp": now,
-            "entry_price": str(entry_price) if entry_price is not None else None, "position_size": str(position_size) if position_size is not None else None,
+            "entry_price": str(entry_price) if entry_price is not None else None, "position_size": str(position_size) if position_size is not None else None, "entry_filled_at": entry_filled_at,
             "failed_recovery": {"active": watch is not None, "trigger_ts": watch.get("trigger_ts") if watch else None, "trigger_price": str(watch["trigger_price"]) if watch else None, "pre_shock_peak": str(watch["peak"]) if watch else None, "trough": str(watch["trough"]) if watch else None, "recovery_high": str(watch["recovery_high"]) if watch else None},
             "branch_a": {"eligible": False, "reason": "watch_not_started"}, "branch_b": {"eligible": False, "reason": "watch_not_started"}, "candidate": False, "candidate_branches": [],
             "state": "WAITING_FOR_FAILED_RECOVERY", "promotion_boundary": {"shadow_only": True, "may_submit_order": False, "may_cancel_order": False, "may_replace_order": False, "may_veto_existing_safety_lane": False},
@@ -184,10 +227,12 @@ class OutcomeStructuralCollapseShadow:
         branches: list[str] = []
         if age >= 900:
             pre, post = self._books_in(held_coin, trigger - 300, trigger), self._books_in(held_coin, trigger, trigger + 900)
+            pre_complete, pre_samples = self._book_coverage(held_coin, trigger - 300, trigger)
+            post_complete, post_samples = self._book_coverage(held_coin, trigger, trigger + 900)
             a, b = self._median([x.depth for x in pre]), self._median([x.depth for x in post])
             retention = b / a if a is not None and b is not None and a > 0 else None
-            eligible = retention is not None and retention < self.config.depth_retention_threshold
-            base["branch_a"] = {"eligible": eligible, "reason": "depth_retention_below_threshold" if eligible else "insufficient_or_above_threshold", "confirm_after_sec": 900, "pre_depth_median": str(a) if a is not None else None, "post_depth_median": str(b) if b is not None else None, "depth_retention": str(retention) if retention is not None else None, "threshold": str(self.config.depth_retention_threshold)}
+            eligible = pre_complete and post_complete and retention is not None and retention < self.config.depth_retention_threshold
+            base["branch_a"] = {"eligible": eligible, "reason": "depth_retention_below_threshold" if eligible else ("insufficient_depth_coverage" if not (pre_complete and post_complete) else "depth_retention_not_below_threshold"), "confirm_after_sec": 900, "pre_depth_median": str(a) if a is not None else None, "post_depth_median": str(b) if b is not None else None, "depth_retention": str(retention) if retention is not None else None, "pre_window_complete": pre_complete, "post_window_complete": post_complete, "pre_samples": pre_samples, "post_samples": post_samples, "threshold": str(self.config.depth_retention_threshold)}
             if eligible: branches.append("A_DEPTH_FAILURE")
         windows: dict[str, Any] = {}
         for name, lo, hi in (("early", 0, 300), ("late", 300, 900)):
@@ -196,11 +241,18 @@ class OutcomeStructuralCollapseShadow:
             yr, nr = self._retention(yes_coin, trigger, lo, hi), self._retention(no_coin, trigger, lo, hi)
             ys = self._median([x.spread_bps for x in self._books_in(yes_coin, trigger + lo, trigger + hi)])
             ns = self._median([x.spread_bps for x in self._books_in(no_coin, trigger + lo, trigger + hi)])
-            complete = all(x is not None for x in (yr, nr, ys, ns))
+            yes_baseline, yes_post = self._book_coverage(yes_coin, trigger - 900, trigger)[0], self._book_coverage(yes_coin, trigger + lo, trigger + hi)[0]
+            no_baseline, no_post = self._book_coverage(no_coin, trigger - 900, trigger)[0], self._book_coverage(no_coin, trigger + lo, trigger + hi)[0]
+            complete = all(x is not None for x in (yr, nr, ys, ns)) and yes_baseline and no_baseline and yes_post and no_post
             max_ret, min_spread = (max(yr, nr), min(ys, ns)) if complete else (None, None)
             eligible = bool(complete and max_ret is not None and min_spread is not None and max_ret < self.config.participation_retention_threshold and min_spread >= self.config.bilateral_spread_bps_threshold)
-            windows[name] = {"eligible": eligible, "reason": "bilateral_participation_failure" if eligible else ("insufficient_bilateral_evidence" if not complete else "criteria_not_met"), "yes_participation_retention": str(yr) if yr is not None else None, "no_participation_retention": str(nr) if nr is not None else None, "bilateral_participation_max": str(max_ret) if max_ret is not None else None, "yes_spread_bps": str(ys) if ys is not None else None, "no_spread_bps": str(ns) if ns is not None else None, "bilateral_spread_min_bps": str(min_spread) if min_spread is not None else None, "participation_threshold": str(self.config.participation_retention_threshold), "spread_threshold_bps": str(self.config.bilateral_spread_bps_threshold)}
+            windows[name] = {"eligible": eligible, "reason": "bilateral_participation_failure" if eligible else ("insufficient_bilateral_evidence" if not complete else "criteria_not_met"), "yes_participation_retention": str(yr) if yr is not None else None, "no_participation_retention": str(nr) if nr is not None else None, "bilateral_participation_max": str(max_ret) if max_ret is not None else None, "yes_spread_bps": str(ys) if ys is not None else None, "no_spread_bps": str(ns) if ns is not None else None, "bilateral_spread_min_bps": str(min_spread) if min_spread is not None else None, "yes_baseline_complete": yes_baseline, "no_baseline_complete": no_baseline, "yes_window_complete": yes_post, "no_window_complete": no_post, "participation_threshold": str(self.config.participation_retention_threshold), "spread_threshold_bps": str(self.config.bilateral_spread_bps_threshold)}
             if eligible: branches.append("B_" + name.upper() + "_PARTICIPATION_FAILURE")
         base["branch_b"] = {"eligible": any(v.get("eligible") for v in windows.values()), "windows": windows}
-        base.update({"candidate": bool(branches), "candidate_branches": branches, "state": "STRUCTURAL_COLLAPSE_CANDIDATE_SHADOW" if branches else "STRUCTURAL_RISK_WATCH", "watch_age_sec": max(0, age)})
+        exitability = self._exitability.get(lifecycle_id)
+        if exitability is not None:
+            exitability = {**exitability, "age_sec": max(0.0, now - float(exitability["timestamp"])), "fresh": now - float(exitability["timestamp"]) <= self.config.fresh_exitability_sec}
+            if entry_price is not None and entry_price > 0 and exitability.get("net_after_taker_fee_price") is not None:
+                exitability["executable_return"] = str(Decimal(str(exitability["net_after_taker_fee_price"])) / entry_price - Decimal("1"))
+        base.update({"candidate": bool(branches), "candidate_branches": branches, "state": "STRUCTURAL_COLLAPSE_CANDIDATE_SHADOW" if branches else "STRUCTURAL_RISK_WATCH", "watch_age_sec": max(0, age), "fresh_full_depth_exitability": exitability})
         return base
