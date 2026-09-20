@@ -14,6 +14,8 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
+from monitoring.db_mem_diag import DbMemDiag
+
 
 @dataclass(frozen=True)
 class OutcomeLiveStrategyConfig:
@@ -259,12 +261,14 @@ class OutcomeOiEntryGate:
         if not Path(self.db_path).exists():
             return OutcomeOiEntryDecision(None, "oi_journal_missing", {})
         read_started_at = time.monotonic()
+        diag = DbMemDiag("outcome_oi_entry_gate_observations")
+        rows: list[tuple[Any, ...]] = []
         try:
             with sqlite3.connect(
                 f"file:{Path(self.db_path).resolve()}?mode=ro", uri=True,
                 timeout=self.READ_TIMEOUT_SEC,
             ) as conn:
-                rows = conn.execute(
+                cursor = conn.execute(
                     """
                     SELECT id, local_received_at_ms, open_interest, mark_price
                     FROM binance_oi_observations
@@ -272,12 +276,23 @@ class OutcomeOiEntryGate:
                       AND local_received_at_ms <= ?
                     ORDER BY local_received_at_ms DESC LIMIT 250
                     """, (now_ms,)
-                ).fetchall()
+                )
+                # This is intentionally still bounded at 250; retain the
+                # complete ordered window because later calculations need
+                # multiple passes and random access.
+                rows = list(cursor)
         except sqlite3.Error:
+            diag.after_query(rows=len(rows))
+            diag.finish(note="sqlite_error_fail_closed")
             return OutcomeOiEntryDecision(None, "oi_read_failed_fail_closed", {
                 "timing_oi_read_ms": round((time.monotonic() - read_started_at) * 1000, 3),
                 "oi_read_timeout_sec": self.READ_TIMEOUT_SEC,
             })
+        diag.after_query(rows=len(rows))
+        # This path has many fail-closed returns.  Emit immediately after the
+        # actual DB read so diagnostics cannot complicate decision control
+        # flow; subsequent Decimal work is bounded to 250 rows.
+        diag.finish(note="bounded_250_row_window")
         if not rows:
             return OutcomeOiEntryDecision(None, "oi_live_observation_missing", {})
         current = rows[0]
