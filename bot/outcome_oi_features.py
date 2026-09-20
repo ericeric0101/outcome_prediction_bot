@@ -115,7 +115,13 @@ class OutcomeOiFeaturePipeline:
         self.journal = journal
         self.include_backfilled = include_backfilled
 
-    def _snapshots(self, conn: sqlite3.Connection) -> list[tuple[int, dict[str, Any]]]:
+    def _snapshots(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        after_event_id: int | None = None,
+        refresh_after_ms: int | None = None,
+    ) -> list[tuple[int, dict[str, Any]]]:
         # This historical research build can encounter hundreds of thousands
         # of large P2 snapshots. Stream SQLite rows into the already-required
         # parsed output rather than retaining a second, raw fetchall() list.
@@ -124,10 +130,23 @@ class OutcomeOiFeaturePipeline:
         output: list[tuple[int, dict[str, Any]]] = []
         row_count = payload_bytes = 0
         try:
-            cursor = conn.execute(
+            sql = (
                 "SELECT id, payload_json FROM strategy_events "
-                "WHERE event_type='OUTCOME_P2_PARITY_SNAPSHOT' ORDER BY id"
+                "WHERE event_type='OUTCOME_P2_PARITY_SNAPSHOT'"
             )
+            params: tuple[int, ...] = ()
+            if after_event_id is not None and refresh_after_ms is not None:
+                # The derived table is an indexed checkpoint.  It supplies
+                # only the source ids in the open label window, while newly
+                # appended source events are read by monotonically increasing
+                # journal id.  This avoids reparsing historical P2 JSON.
+                sql += """ AND (id > ? OR id IN (
+                    SELECT outcome_snapshot_event_id
+                    FROM outcome_oi_feature_rows
+                    WHERE feature_schema_version=? AND snapshot_timestamp_ms>=?
+                ))"""
+                params = (after_event_id, FEATURE_SCHEMA_VERSION, refresh_after_ms)
+            cursor = conn.execute(sql + " ORDER BY id", params)
             for event_id, raw in cursor:
                 row_count += 1
                 if raw is not None:
@@ -142,7 +161,22 @@ class OutcomeOiFeaturePipeline:
             diag.after_query(rows=row_count, payload_bytes=payload_bytes)
             return output
         finally:
-            diag.finish(note="streamed_but_parsed_history_is_still_retained_for_feature_build")
+            diag.finish(note=(
+                "incremental_new_plus_label_tail"
+                if after_event_id is not None else
+                "full_history_streamed_but_parsed_history_is_retained_for_feature_build"
+            ))
+
+    @staticmethod
+    def _checkpoint(conn: sqlite3.Connection) -> tuple[int, int] | None:
+        row = conn.execute(
+            """SELECT MAX(outcome_snapshot_event_id), MAX(snapshot_timestamp_ms)
+               FROM outcome_oi_feature_rows WHERE feature_schema_version=?""",
+            (FEATURE_SCHEMA_VERSION,),
+        ).fetchone()
+        if row is None or row[0] is None or row[1] is None:
+            return None
+        return int(row[0]), int(row[1])
 
     def _observations(self, conn: sqlite3.Connection) -> list[_Oi]:
         where = "" if self.include_backfilled else "WHERE backfilled=0"
@@ -307,16 +341,28 @@ class OutcomeOiFeaturePipeline:
         may become observable after a later snapshot arrives.
         """
         with sqlite3.connect(self.journal.db_path) as conn:
-            snapshots = self._snapshots(conn)
+            checkpoint = None if (rebuild or self.include_backfilled) else self._checkpoint(conn)
+            refresh_after_ms = None if checkpoint is None else (
+                checkpoint[1] - (max(LABEL_HORIZONS_SEC) + LABEL_TOLERANCE_MS // 1000) * 1000
+            )
+            snapshots = self._snapshots(
+                conn,
+                after_event_id=checkpoint[0] if checkpoint is not None else None,
+                refresh_after_ms=refresh_after_ms,
+            )
+            # P2 capture is normally append-only.  A valid late snapshot can
+            # affect labels before the retained tail, however, so preserve
+            # full-rebuild semantics rather than silently losing that update.
+            if checkpoint is not None and refresh_after_ms is not None and any(
+                event_id > checkpoint[0]
+                and int(snapshot["snapshot_timestamp_ms"]) < refresh_after_ms
+                for event_id, snapshot in snapshots
+            ):
+                snapshots = self._snapshots(conn)
+                checkpoint = None
             observations = self._observations(conn)
             maker_fills = self._actual_maker_fills(conn)
             markouts_by_fill = self._markouts_by_fill(conn)
-            existing_ids = set() if rebuild else {
-                int(row[0]) for row in conn.execute(
-                    "SELECT outcome_snapshot_event_id FROM outcome_oi_feature_rows WHERE feature_schema_version=?",
-                    (FEATURE_SCHEMA_VERSION,),
-                )
-            }
         oi_index = _OiIndex.from_points(observations)
         by_market: dict[int, list[dict[str, Any]]] = defaultdict(list)
         for _, snapshot in snapshots:
@@ -334,7 +380,7 @@ class OutcomeOiFeaturePipeline:
             for event_id, snapshot in snapshots
             # An explicit historical-backfill run intentionally changes the
             # permitted OI evidence, so it must recompute the current schema.
-            if rebuild or self.include_backfilled or event_id not in existing_ids
+            if checkpoint is None or event_id > checkpoint[0]
             or int(snapshot["snapshot_timestamp_ms"]) >= refresh_after_ms
         ]
         joined = 0
@@ -398,4 +444,9 @@ class OutcomeOiFeaturePipeline:
             progress=(lambda completed: progress(completed, len(work))) if progress else None,
             timeout_sec=write_timeout_sec,
         )
-        return X3BuildResult(len(snapshots), written, joined, coverage, fill_rows)
+        with sqlite3.connect(self.journal.db_path) as conn:
+            eligible_snapshots = int(conn.execute(
+                "SELECT COUNT(*) FROM outcome_oi_feature_rows WHERE feature_schema_version=?",
+                (FEATURE_SCHEMA_VERSION,),
+            ).fetchone()[0])
+        return X3BuildResult(eligible_snapshots, written, joined, coverage, fill_rows)
