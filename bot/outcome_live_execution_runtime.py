@@ -289,6 +289,7 @@ class OutcomeLiveExecutionRuntime:
             strategy_exit_tier=self._strategy_exit_tier,
             enabled=self.exit_requote_enabled,
             canary_enabled=self.exit_requote_canary_enabled,
+            loss_exit_enabled=lambda: self.loss_exit_enabled,
             gate_audit=self._audit_exit_requote_gate,
         )
         self._current_tick_snapshot: OutcomeRuntimeTickSnapshot | None = None
@@ -303,7 +304,7 @@ class OutcomeLiveExecutionRuntime:
             SafetyComponent("exit_ambiguity_fence", self.exit_lifecycle_store is not None, "safety_critical", "v1", "ready" if self.exit_lifecycle_store else "missing", self.exit_lifecycle_store is not None, True),
             SafetyComponent("exit_lifecycle", self.exit_lifecycle_store is not None, "safety_critical", "v1", "ready" if self.exit_lifecycle_store else "missing", self.exit_lifecycle_store is not None, True),
             SafetyComponent("exit_requote", self.exit_requote_enabled(), "live_exit_authorization", "e4", "ready" if exit_ready else "missing", exit_ready, True),
-            SafetyComponent("loss_band", self.exit_requote_enabled(), "live_exit_authorization", "e4", "ready" if exit_ready else "missing", exit_ready, True),
+            SafetyComponent("loss_band", self.loss_exit_enabled and self.exit_requote_enabled(), "live_exit_authorization", "e4", "ready" if self.loss_exit_enabled and exit_ready else ("operator_disabled" if not self.loss_exit_enabled else "missing"), True if not self.loss_exit_enabled else exit_ready, True),
             SafetyComponent("fast_failure", self.loss_exit_enabled and self.fast_failure_exit_controller is not None, "live_exit_authorization", "v1", "ready" if self.loss_exit_enabled and self.fast_failure_exit_controller else ("operator_disabled" if not self.loss_exit_enabled else "missing"), True if not self.loss_exit_enabled else self.fast_failure_exit_controller is not None, True),
             SafetyComponent("narrow_hard_failure_canary", self.loss_exit_enabled and self.narrow_hard_failure_canary_enabled, "live_exit_authorization", "v1", "ready" if self.loss_exit_enabled and self.narrow_hard_failure_controller else ("operator_disabled" if not self.loss_exit_enabled else "disabled_or_missing_shared_budget"), True if not self.loss_exit_enabled else self.narrow_hard_failure_controller is not None, self.narrow_hard_failure_canary_enabled),
             SafetyComponent("s3_emergency", self.loss_exit_enabled and self.emergency_exit_controller is not None, "live_exit_authorization", "s3", "ready" if self.loss_exit_enabled and self.emergency_exit_controller else ("operator_disabled" if not self.loss_exit_enabled else "missing"), True if not self.loss_exit_enabled else self.emergency_exit_controller is not None, True),

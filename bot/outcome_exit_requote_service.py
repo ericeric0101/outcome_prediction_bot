@@ -29,6 +29,7 @@ class OutcomeExitRequoteService:
         persisted_maker_fee: Callable[..., Decimal | None],
         strategy_exit_tier: Callable[..., tuple[Decimal, Decimal | None] | None],
         enabled: Callable[[], bool], canary_enabled: Callable[[], bool],
+        loss_exit_enabled: Callable[[], bool] = lambda: True,
         gate_audit: Callable[..., None] | None = None,
     ) -> None:
         self.recovery = recovery
@@ -48,6 +49,7 @@ class OutcomeExitRequoteService:
         self.strategy_exit_tier = strategy_exit_tier
         self.enabled = enabled
         self.canary_enabled = canary_enabled
+        self.loss_exit_enabled = loss_exit_enabled
         self.gate_audit = gate_audit
         self._last_modify_shadow: dict[str, tuple[str, float]] = {}
 
@@ -134,7 +136,14 @@ class OutcomeExitRequoteService:
             0 <= oi_age_ms <= 90_000,
             self.opposite_observation_counts.get((market.outcome_id, coin), 0),
         ))
-        loss_band_authorized = reversal.state is OutcomeReversalState.REVERSAL_CONFIRMED
+        # This is deliberately the same operator authority as the three IOC
+        # loss lanes.  A "loss exits off" observation must not silently turn
+        # a TP into a passive loss-band SELL.
+        loss_exits_enabled = self.loss_exit_enabled()
+        loss_band_authorized = (
+            loss_exits_enabled
+            and reversal.state is OutcomeReversalState.REVERSAL_CONFIRMED
+        )
         current_signal = {
             key: raw_context.get(key)
             for key in (
@@ -151,10 +160,12 @@ class OutcomeExitRequoteService:
                 **current_signal, "reversal_state": str(reversal.state), "reversal_reason": reversal.reason,
                 "opposite_observation_count": self.opposite_observation_counts.get((market.outcome_id, coin), 0),
                 "loss_band_authorized": loss_band_authorized,
+                "loss_exit_enabled": loss_exits_enabled,
             },
         }
         if (
             self.canary_enabled()
+            and not (not loss_exits_enabled and lifecycle.state in {"LOSS_BAND_RESTING", "LOSS_BAND_UNFILLED"})
             and lifecycle.order_id in self.canary_eligible_order_ids
             and lifecycle.replacement_count == 0
         ):
@@ -178,12 +189,21 @@ class OutcomeExitRequoteService:
             minimum_return_pct=minimum_return_pct, loss_reprice_pct=loss_reprice_pct,
             existing_order_id=lifecycle.order_id, existing_price=lifecycle.target_price,
             best_bid=bid, best_ask=ask, book_age_sec=0.0, now_ts=time.time(),
-            last_requote_ts=lifecycle.updated_at_ts, replacement_count=lifecycle.replacement_count,
+            # A previously resting loss-band must be migrated promptly after
+            # the operator disables loss exits.  Do not let the normal
+            # requote interval preserve that old loss order; all mutation
+            # safeguards still live in the controller below.
+            last_requote_ts=(
+                None
+                if not loss_exits_enabled and lifecycle.state in {"LOSS_BAND_RESTING", "LOSS_BAND_UNFILLED"}
+                else lifecycle.updated_at_ts
+            ),
+            replacement_count=lifecycle.replacement_count,
             loss_band_authorized=loss_band_authorized,
         ))
         if self.gate_audit is not None:
             self.gate_audit(
-                component="loss_band", eligible=plan.exit_mode == "loss_band",
+                component="loss_band", eligible=loss_exits_enabled and plan.exit_mode == "loss_band",
                 reason=plan.reason, market=market, lifecycle=lifecycle,
                 position_age_sec=(None if lifecycle.updated_at_ts is None else max(0.0, time.time() - lifecycle.updated_at_ts)),
                 executable_pnl=str(bid / vwap - Decimal("1")),
@@ -199,6 +219,12 @@ class OutcomeExitRequoteService:
                 )
             return LiveExecutionResult("sell_resting", f"exit reprice keep: {plan.reason}", lifecycle.order_id)
         if plan.action is ExitQuoteAction.BLOCK:
+            if not loss_exits_enabled and lifecycle.state in {"LOSS_BAND_RESTING", "LOSS_BAND_UNFILLED"}:
+                self.store.journal.log_strategy_event(self.store.run_id, "OUTCOME_LOSS_BAND_DISABLE_MIGRATION_BLOCKED", {
+                    "outcome_id": market.outcome_id, "coin": coin, "order_id": lifecycle.order_id,
+                    "state": lifecycle.state, "reason": plan.reason,
+                    "loss_exit_enabled": False, "live_authority": False,
+                })
             return LiveExecutionResult("blocked", f"exit reprice blocked: {plan.reason}", lifecycle.order_id)
         self._record_modify_order_shadow(
             market=market, lifecycle=lifecycle, plan=plan, inventory=inventory, bid=bid, ask=ask,
@@ -207,4 +233,12 @@ class OutcomeExitRequoteService:
             market=market, side_index=side_index, lifecycle=lifecycle, plan=plan,
             replacement_context=replacement_context,
         )
+        if not loss_exits_enabled and lifecycle.state in {"LOSS_BAND_RESTING", "LOSS_BAND_UNFILLED"}:
+            self.store.journal.log_strategy_event(self.store.run_id, "OUTCOME_LOSS_BAND_DISABLE_MIGRATION", {
+                "outcome_id": market.outcome_id, "coin": coin, "old_order_id": lifecycle.order_id,
+                "new_order_id": result.new_order_id, "prior_state": lifecycle.state,
+                "result_state": result.state, "detail": result.detail,
+                "replacement_exit_mode": plan.exit_mode,
+                "loss_exit_enabled": False,
+            })
         return LiveExecutionResult(result.state, result.detail, result.new_order_id or result.old_order_id)

@@ -77,7 +77,7 @@ def test_narrow_hard_failure_canary_requires_eleven_dollar_limits_and_shared_epi
     assert blocked.narrow_hard_failure_controller is None
 
 
-def test_operator_loss_exit_switch_disables_all_loss_ioc_lanes_but_keeps_runtime_ready(monkeypatch, tmp_path):
+def test_operator_loss_exit_switch_disables_all_loss_lanes_but_keeps_runtime_ready(monkeypatch, tmp_path):
     monkeypatch.setenv("OUTCOME_LOSS_EXIT_ENABLED", "0")
     journal = TradeJournalDB(tmp_path / "loss_exit_off.db")
     ledger = OutcomeExecutionLedger(journal, "run")
@@ -93,7 +93,7 @@ def test_operator_loss_exit_switch_disables_all_loss_ioc_lanes_but_keeps_runtime
     assert runtime.holding_risk_service.maybe_emergency(market=market(), finding=finding) is None
 
     components = {item.name: item for item in runtime.safety_components()}
-    for name in ("fast_failure", "narrow_hard_failure_canary", "s3_emergency"):
+    for name in ("loss_band", "fast_failure", "narrow_hard_failure_canary", "s3_emergency"):
         assert components[name].enabled is False
         assert components[name].health == "operator_disabled"
         assert components[name].ready is True

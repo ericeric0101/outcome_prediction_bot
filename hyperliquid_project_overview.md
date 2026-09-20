@@ -1,6 +1,6 @@
 # Hyperliquid Outcome (HIP-4) BTC Daily Prediction Market Trading Bot — Current Authority
 
-> **權威架構版本 (Authority Version)**：2.5.3 (Outcome-only, durable settlement retry; operator-controlled loss-IOC observation mode)
+> **權威架構版本 (Authority Version)**：2.5.4 (Outcome-only, durable settlement retry; operator-controlled all-loss-exit observation mode)
 > **建立與審計日期**：2026-08-23；最近修訂：2026-09-20
 > **目標系統**：Hyperliquid HyperCore L1 原生預測市場 — Outcome (HIP-4 協議標準)  
 > **單一權威聲明**：本文件取代原 `project_overview.md`，為系統唯一的設計、架構、量化模型與執行權威規範。
@@ -22,7 +22,7 @@
 7. **Outcome coin canonicalization。** inventory 來源 `+<asset>` 與 book/order 來源 `#<asset>` 先 canonicalize 為 `#<asset>` 後才做 risk/exposure/recovery 判斷；unknown malformed coin 仍 fail-closed。
 8. **唯一 live execution path 與可診斷 sidecar。** legacy `bot/execution/outcome_execution.py` 與其測試已刪除；唯一 mutation path 為 `OutcomeLiveExecutionRuntime → OutcomeExecutionGateway → official TypeScript SDK sidecar`。sidecar stderr 寫入 bounded rotating `logs/outcome_sdk_sidecar.stderr.log`（2 MiB + 一個 rollover），不再丟棄 crash diagnostics。Telegram polling/control code 已完全移除；沒有 `/pause` 或 `/flatten` 這類會誤稱為 kill switch 的控制面。
 
-### 2026-09-20 — durable settlement retry 與 loss-IOC operator switch
+### 2026-09-20 — durable settlement retry 與 all-loss-exit operator switch
 
 **Settlement retry correctness repair.** `OutcomeSettlementWorker` no longer
 relies solely on its process-local candidate set.  Every non-terminal durable
@@ -34,18 +34,24 @@ worker remains read-only with respect to the venue.  A one-off official SDK
 retry on 2026-09-20 recorded #3719 as `settle_fraction=1.0` / side 0 winner;
 it did not infer the outcome from BTC or UI prices.
 
-**From this release onward, loss exits are explicitly switchable.**
+**From this release onward, all loss-triggered exits are explicitly switchable.**
 `OUTCOME_LOSS_EXIT_ENABLED` is an allowlisted operator setting and defaults to
-`1`, preserving historical behavior.  Setting it to `0` disables only the
-three loss-triggered IOC mutation lanes: `fast_failure`, `s3_emergency`, and
-`narrow_hard_failure_canary`.  It does **not** disable normal protective
-take-profit SELL management, reduce-only cleanup, settlement, account truth,
-durable intent, ambiguity fencing, lifecycle recovery, or read-only
-holding-risk/post-fill/continuation evidence.  When disabled, each affected
-lane durably records the transition reason
-`operator_loss_exit_disabled`; it must not cancel a protective SELL or send
-an IOC.  The startup manifest marks the three lanes `operator_disabled` and
-ready (an intentional policy choice, not a missing safety dependency).
+`1`, preserving historical behavior.  Setting it to `0` disables the three
+loss-triggered IOC mutation lanes (`fast_failure`, `s3_emergency`, and
+`narrow_hard_failure_canary`) **and** the passive E4 loss-band reprice.
+It does **not** disable normal protective take-profit SELL management,
+reduce-only cleanup, settlement, account truth, durable intent, ambiguity
+fencing, lifecycle recovery, or read-only holding-risk/post-fill/continuation
+evidence.  A pre-existing, strictly bot-owned `LOSS_BAND_RESTING` or
+`LOSS_BAND_UNFILLED` SELL is not simply abandoned after a restart: the runtime
+first calculates a fresh passive TP plan, then uses the same
+ownership → cancel-confirm → inventory reread → durable intent → fresh-book
+→ ALO rebook controller to migrate it to `SELL_RESTING`.  If ownership,
+cancellation, fresh TP bounds, inventory, durable persistence, or SDK/account
+truth is ambiguous, it records a migration-blocked/reconciliation result and
+never claims cancellation or leaves inventory intentionally naked.  The
+startup manifest marks all four loss lanes `operator_disabled` and ready (an
+intentional policy choice, not a missing safety dependency).
 
 **Current authorized observation profile.** The private local deployment
 sets `OUTCOME_LOSS_EXIT_ENABLED=0` to observe several independent markets
