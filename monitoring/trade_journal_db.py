@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from loguru import logger
+from monitoring.db_mem_diag import DbMemDiag
 
 
 def _utc_now_iso() -> str:
@@ -1844,9 +1845,12 @@ class TradeJournalDB:
         """
         if inventory <= 0:
             return None
+        diag = DbMemDiag("verified_outcome_fill_vwap_for_inventory")
+        lots: list[list[Decimal]] = []
+        row_count = 0
         try:
             with self._connect() as conn:
-                rows = conn.execute(
+                cursor = conn.execute(
                     """
                     SELECT side, price, qty
                     FROM order_events
@@ -1857,39 +1861,42 @@ class TradeJournalDB:
                     ORDER BY CAST(json_extract(payload_json, '$.timestamp_ms') AS INTEGER), id
                     """,
                     (str(coin),),
-                ).fetchall()
+                )
+                # Preserve SQLite's timestamp/id order while reconstructing
+                # FIFO.  This removes only the duplicate raw-row list.
+                for side, price_raw, qty_raw in cursor:
+                    row_count += 1
+                    quantity, price = Decimal(str(qty_raw)), Decimal(str(price_raw))
+                    if quantity <= 0 or not Decimal("0") < price < Decimal("1"):
+                        return None
+                    normalized_side = str(side or "").upper()
+                    if normalized_side == "BUY":
+                        lots.append([quantity, price])
+                    elif normalized_side == "SELL":
+                        remaining = quantity
+                        while remaining > 0 and lots:
+                            lot = lots[0]
+                            consumed = min(remaining, lot[0])
+                            lot[0] -= consumed
+                            remaining -= consumed
+                            if lot[0] == 0:
+                                lots.pop(0)
+                        if remaining > 0:
+                            return None
+                    else:
+                        return None
         except (sqlite3.Error, ValueError):
             return None
-
-        lots: list[list[Decimal]] = []
+        finally:
+            diag.after_query(rows=row_count)
+            diag.finish(note="streamed_fifo")
         try:
-            for side, price_raw, qty_raw in rows:
-                quantity, price = Decimal(str(qty_raw)), Decimal(str(price_raw))
-                if quantity <= 0 or not Decimal("0") < price < Decimal("1"):
-                    return None
-                normalized_side = str(side or "").upper()
-                if normalized_side == "BUY":
-                    lots.append([quantity, price])
-                elif normalized_side == "SELL":
-                    remaining = quantity
-                    while remaining > 0 and lots:
-                        lot = lots[0]
-                        consumed = min(remaining, lot[0])
-                        lot[0] -= consumed
-                        remaining -= consumed
-                        if lot[0] == 0:
-                            lots.pop(0)
-                    if remaining > 0:
-                        return None
-                else:
-                    return None
+            reconstructed = sum((lot[0] for lot in lots), Decimal("0"))
+            if reconstructed != inventory:
+                return None
+            return sum((lot[0] * lot[1] for lot in lots), Decimal("0")) / inventory
         except (ArithmeticError, ValueError):
             return None
-
-        reconstructed = sum((lot[0] for lot in lots), Decimal("0"))
-        if reconstructed != inventory:
-            return None
-        return sum((lot[0] * lot[1] for lot in lots), Decimal("0")) / inventory
 
     def repair_duplicate_outcome_fills(self, *, run_id: str, dry_run: bool = True) -> Dict[str, int]:
         """Remove only proven duplicate HIP-4 fill rows, preserving the first fact.

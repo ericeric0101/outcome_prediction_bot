@@ -141,6 +141,27 @@ def test_calibration_uses_exact_durable_fill_fallback_when_userfills_is_incomple
     assert result.audit is not None and Decimal(result.audit["fill_entry_vwap"]) == Decimal("0.80")
 
 
+def test_durable_fill_fallback_preserves_timestamp_fifo_across_partial_fills(tmp_path):
+    journal = TradeJournalDB(tmp_path / "journal.db")
+    # Deliberately ingest out of exchange order: the durable fallback must use
+    # the same timestamp/id FIFO chronology as before streaming was introduced.
+    for trade_id, side, price, qty, timestamp in (
+        ("sell", "SELL", "0.90", 4, 300),
+        ("buy-new", "BUY", "0.70", 5, 200),
+        ("buy-old", "BUY", "0.60", 5, 100),
+    ):
+        assert journal.log_outcome_fill_once(
+            "run", trade_id=trade_id, side=side, price=float(price), qty=float(qty),
+            status="FILLED", instrument_id="#11530", commission_usdc=0,
+            payload={"venue": "hyperliquid_outcome", "actual_fill": True, "timestamp_ms": timestamp},
+        )
+
+    # FIFO leaves one $0.60 share and five $0.70 shares: 4.1 / 6.
+    assert journal.verified_outcome_fill_vwap_for_inventory(
+        coin="#11530", inventory=Decimal("6"),
+    ) == Decimal("4.1") / Decimal("6")
+
+
 def test_calibration_loss_band_cancels_old_profit_sell_without_taking():
     class LossGateway(Gateway):
         def fetch_order_book(self, **_): return {"bids": [{"price": "0.70"}], "asks": [{"price": "0.71"}]}

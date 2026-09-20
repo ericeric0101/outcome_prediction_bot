@@ -17,6 +17,7 @@ from typing import Any, Iterable, Mapping
 
 from bot.outcome_event_bridge import parse_outcome_balance_coin, parse_outcome_coin
 from bot.outcome_settlement import OutcomeSettlement
+from monitoring.db_mem_diag import DbMemDiag
 from monitoring.trade_journal_db import TradeJournalDB
 
 
@@ -52,37 +53,47 @@ class OutcomePnLReconciler:
         self.journal, self.run_id = journal, run_id
 
     def _fills(self) -> list[_Fill]:
+        diag = DbMemDiag("outcome_pnl_reconciler_fills")
+        output: list[_Fill] = []
+        row_count = payload_bytes = 0
         with sqlite3.connect(self.journal.db_path) as conn:
-            rows = conn.execute(
+            cursor = conn.execute(
                 """SELECT id,payload_json,side,price,qty,commission_usdc FROM order_events
                    WHERE event_type='ORDER_FILLED' ORDER BY id ASC"""
-            ).fetchall()
-        output: list[_Fill] = []
-        for event_id, raw, side, price, qty, fee in rows:
-            try:
-                payload = json.loads(raw or "{}")
-                if payload.get("venue") != "hyperliquid_outcome" or payload.get("actual_fill") is not True:
+            )
+            # Retain the same _Fill objects and final authoritative sort, but
+            # do not retain the raw SQLite tuple list at the same time.
+            for event_id, raw, side, price, qty, fee in cursor:
+                row_count += 1
+                payload_bytes += len(raw or "")
+                try:
+                    payload = json.loads(raw or "{}")
+                    if payload.get("venue") != "hyperliquid_outcome" or payload.get("actual_fill") is not True:
+                        continue
+                    outcome_id = int(payload["outcome_id"])
+                    side_index = int(payload["side_index"])
+                    trade_id = str(payload["trade_id"])
+                    if side not in {"BUY", "SELL"} or not trade_id or price is None or qty is None:
+                        continue
+                    timestamp_raw = payload.get("timestamp_ms")
+                    timestamp_ms = int(timestamp_raw) if timestamp_raw is not None else None
+                    output.append(_Fill(
+                        event_id, timestamp_ms, trade_id, outcome_id, side_index,
+                        str(side), _d(qty), _d(price), _d(fee or 0),
+                    ))
+                except (KeyError, TypeError, ValueError, ArithmeticError, json.JSONDecodeError):
                     continue
-                outcome_id = int(payload["outcome_id"])
-                side_index = int(payload["side_index"])
-                trade_id = str(payload["trade_id"])
-                if side not in {"BUY", "SELL"} or not trade_id or price is None or qty is None:
-                    continue
-                timestamp_raw = payload.get("timestamp_ms")
-                timestamp_ms = int(timestamp_raw) if timestamp_raw is not None else None
-                output.append(_Fill(
-                    event_id, timestamp_ms, trade_id, outcome_id, side_index,
-                    str(side), _d(qty), _d(price), _d(fee or 0),
-                ))
-            except (KeyError, TypeError, ValueError, ArithmeticError, json.JSONDecodeError):
-                continue
+        diag.after_query(rows=row_count, payload_bytes=payload_bytes)
         # ``userFills`` can be returned newest-first during restart recovery.
         # A local row id is ingestion order, not exchange chronology.
-        return sorted(output, key=lambda fill: (
-            fill.timestamp_ms is None,
-            fill.timestamp_ms if fill.timestamp_ms is not None else fill.event_id,
-            fill.event_id,
-        ))
+        try:
+            return sorted(output, key=lambda fill: (
+                fill.timestamp_ms is None,
+                fill.timestamp_ms if fill.timestamp_ms is not None else fill.event_id,
+                fill.event_id,
+            ))
+        finally:
+            diag.finish(note="streamed_rows_then_authoritative_sort")
 
     def _open_lots(
         self, fills: list[_Fill] | None = None,
