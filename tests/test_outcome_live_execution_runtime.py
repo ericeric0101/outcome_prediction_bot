@@ -172,7 +172,7 @@ def test_runtime_blocks_cross_side_existing_exposure(monkeypatch):
     assert runtime.tick(market=market(), side_index=0, entry_permitted=True).state == "blocked"
 
 
-def test_high_weight_fill_sync_is_backgrounded_when_safe_but_unsafe_inventory_is_immediate():
+def test_high_weight_fill_sync_is_cadenced_only_for_verified_stable_protective_sell():
     runtime = OutcomeLiveExecutionRuntime(account=Account(), wallet="w", gateway=Gateway())
     runtime._last_fill_sync_at = 100.0
     assert runtime._should_sync_fills(
@@ -182,8 +182,23 @@ def test_high_weight_fill_sync_is_backgrounded_when_safe_but_unsafe_inventory_is
         active=[SimpleNamespace(state="protected_inventory")], pending_owned_entry=False, now=129.9,
     ) is False
     assert runtime._should_sync_fills(
-        active=[SimpleNamespace(state="protected_inventory")], pending_owned_entry=False, now=130.0,
+        active=[SimpleNamespace(state="protected_inventory")], pending_owned_entry=False,
+        pending_owned_exit=True, stable_protective_exit=True, now=129.9,
     ) is False
+    assert runtime._should_sync_fills(
+        active=[SimpleNamespace(state="protected_inventory")], pending_owned_entry=False,
+        pending_owned_exit=True, stable_protective_exit=True, now=130.0,
+    ) is True
+    # A lifecycle without an account-confirmed matching covering SELL, or an
+    # ambiguous exit submit, must still force independent fill proof now.
+    assert runtime._should_sync_fills(
+        active=[SimpleNamespace(state="protected_inventory")], pending_owned_entry=False,
+        pending_owned_exit=True, stable_protective_exit=False, now=101.5,
+    ) is True
+    assert runtime._should_sync_fills(
+        active=[SimpleNamespace(state="protected_inventory")], pending_owned_entry=False,
+        pending_owned_exit=True, stable_protective_exit=True, pending_ambiguous_exit=True, now=101.5,
+    ) is True
     assert runtime._should_sync_fills(
         active=[SimpleNamespace(state="unprotected_inventory")], pending_owned_entry=False, now=101.5,
     ) is True

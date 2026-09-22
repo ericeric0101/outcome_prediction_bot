@@ -396,22 +396,24 @@ class OutcomeLiveExecutionRuntime:
 
     def _should_sync_fills(
         self, *, active: list[object], pending_owned_entry: bool, now: float,
-        pending_owned_exit: bool = False,
+        pending_owned_exit: bool = False, stable_protective_exit: bool = False,
+        pending_ambiguous_exit: bool = False,
     ) -> bool:
-        """Reserve synchronous high-weight fill reads for unsafe states only.
+        """Reserve synchronous high-weight fill reads for unsafe states.
 
         The read-only research worker independently records the ordinary
-        30-second ``userFills`` evidence stream. Keeping that periodic read
-        out of a flat live tick prevents non-decision research latency from
-        delaying an entry decision. A fill that could leave inventory
-        unprotected, or an owned BUY that disappeared from account truth,
-        remains an immediate synchronous reconciliation boundary.
+        30-second ``userFills`` evidence stream.  A stable, account-confirmed
+        covering SELL may use that cadence; every other owned-exit state
+        remains immediate so a flat/stale lifecycle cannot be terminalised
+        without independent fill proof.
         """
-        urgent = pending_owned_entry or pending_owned_exit or any(
+        urgent = pending_owned_entry or pending_ambiguous_exit or (
+            pending_owned_exit and not stable_protective_exit
+        ) or any(
             str(getattr(finding, "state", "")) in {"unprotected_inventory", "conflicting_orders", "orphan_sell"}
             for finding in active
         )
-        return urgent
+        return urgent or now - self._last_fill_sync_at >= 30.0
 
     @staticmethod
     def _audit_decimal(audit: dict[str, object], name: str) -> Decimal | None:
@@ -2199,12 +2201,30 @@ class OutcomeLiveExecutionRuntime:
             ) is not None
             for coin in (market.yes_coin, market.no_coin)
         )
-        pending_owned_exit = self.exit_lifecycle_store is not None and any(
-            self.exit_lifecycle_store.recover(
+        exit_lifecycles = {
+            coin: self.exit_lifecycle_store.recover(
+                wallet=self.recovery.wallet, outcome_id=market.outcome_id, coin=coin,
+            )
+            for coin in (market.yes_coin, market.no_coin)
+        } if self.exit_lifecycle_store is not None else {}
+        pending_owned_exit = any(lifecycle is not None for lifecycle in exit_lifecycles.values())
+        pending_ambiguous_exit = self.exit_lifecycle_store is not None and any(
+            self.exit_lifecycle_store.pending_ambiguous_submit(
                 wallet=self.recovery.wallet, outcome_id=market.outcome_id, coin=coin,
             ) is not None
             for coin in (market.yes_coin, market.no_coin)
         )
+        active_by_coin = {str(getattr(finding, "coin", "")): finding for finding in active}
+        stable_protective_exit = pending_owned_exit and all(
+            lifecycle is not None
+            and str(getattr(lifecycle, "state", "")) in {"SELL_RESTING", "LOSS_BAND_RESTING"}
+            and (finding := active_by_coin.get(coin)) is not None
+            and str(getattr(finding, "state", "")) == "protected_inventory"
+            and not tuple(getattr(finding, "buy_order_ids", ()))
+            and tuple(getattr(finding, "sell_order_ids", ())) == (str(getattr(lifecycle, "order_id", "")),)
+            for coin, lifecycle in exit_lifecycles.items()
+            if lifecycle is not None
+        ) and not pending_ambiguous_exit
         admission["timing_lifecycle_lookup_ms"] = round((time.monotonic() - lifecycle_lookup_started_at) * 1000, 3)
         # ``userFills`` has a high /info weight.  Account recovery already
         # reads balances and open orders every decision, so a healthy resting
@@ -2217,7 +2237,8 @@ class OutcomeLiveExecutionRuntime:
         now_monotonic = time.monotonic()
         if self._should_sync_fills(
             active=active, pending_owned_entry=pending_owned_entry,
-            pending_owned_exit=pending_owned_exit, now=now_monotonic,
+            pending_owned_exit=pending_owned_exit, stable_protective_exit=stable_protective_exit,
+            pending_ambiguous_exit=pending_ambiguous_exit, now=now_monotonic,
         ):
             fill_sync_started_at = time.monotonic()
             try:

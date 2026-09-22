@@ -1,6 +1,6 @@
 # Hyperliquid Outcome (HIP-4) BTC Daily Prediction Market Trading Bot — Current Authority
 
-> **權威架構版本 (Authority Version)**：2.5.12 (Outcome-only; all-loss-exit observation mode; conservative telemetry retention V1.2 compaction; bounded P2/D2 and X3 raw-read materialization)
+> **權威架構版本 (Authority Version)**：2.5.13 (Outcome-only; all-loss-exit observation mode; conservative telemetry retention V1.2 compaction; bounded P2/D2/X3 reads and stable-exit fill cadence)
 > **建立與審計日期**：2026-08-23；最近修訂：2026-09-22
 > **目標系統**：Hyperliquid HyperCore L1 原生預測市場 — Outcome (HIP-4 協議標準)  
 > **單一權威聲明**：本文件取代原 `project_overview.md`，為系統唯一的設計、架構、量化模型與執行權威規範。
@@ -137,6 +137,14 @@ and must be checked in the durable startup manifest.
 ### 2026-09-22 — X3 OI raw-read materialization 縮減（語意不變）
 
 `OutcomeOiFeaturePipeline._observations()`、`_actual_maker_fills()` 與 `_markouts_by_fill()` 已將 SQLite `fetchall()` 改為同一 SQL cursor 的單次 iteration；沒有改 SQL predicate、排序、JSON parsing、filter、P3 timing validation、duplicate overwrite、feature horizon、label 或 OI math。此改動只移除 SQLite raw tuple list 的額外 peak：`_observations()` 仍必須完整保留已解析的 `_Oi` list，供 `_OiIndex` 的 as-of/prefix-stat construction 使用；maker fills 與 markout dict 也仍保留其既有最終 parsed collection。因此這不是所有 X3 路徑的 O(1) memory 宣告，而是在不改研究/交易語意下消除可避免的第二份 raw-result materialization。focused OI/X3 tests 覆蓋 ordering、backfill、非法 numeric/JSON、maker filters、P3 validation 與 duplicate last-write semantics，均通過。
+
+### 2026-09-22 — Stable protective SELL fill cadence 與 runtime latency 報表（安全邊界不變）
+
+**實測歸因。** 在 recent 10,000 primary-id window 的 692 筆 `OUTCOME_RUNTIME_TIMING` 中，`fill_sync_ms` 合計約 519.8 秒、中位約 883.8ms、p90 約 1,562.2ms；journal write 中位僅約 0.63ms。SDK `fetch_order_book` 中位約 1,943.7ms，`place_limit_order` 中位約 2,954.0ms，`cancel_order` 約 4,740.2ms。因此 3–10 秒 loop tail 的主因是 external account/SDK serial safety IO，不是目前已修正的 SQLite JSON/RAM materialization。
+
+**唯一 cadence 修正。** 先前 `pending_owned_exit` 使任何 durable exit lifecycle 都每 1.5 秒同步 `userFills`。現在僅當同一輪 fresh account recovery 已同時證實：`protected_inventory`、無 BUY、唯一 covering SELL 的 OID 與 durable lifecycle 精確一致、lifecycle 為 `SELL_RESTING` 或 `LOSS_BAND_RESTING`，且沒有 ambiguous exit submit，才採既有 **30 秒** fill audit cadence。任何 lifecycle/account mismatch、flat/stale lifecycle、unprotected/conflicting/orphan account state、pending entry 或 ambiguous exit 仍在**當輪**同步 fills；mutation 前後 fresh account/cancel-confirm、durable intent、VWAP/accounting、risk/recovery 與 execution semantics 均未放寬。
+
+**唯讀量測工具。** `python scripts/outcome_runtime_timing_report.py --db logs/outcome_shadow.db --recent-event-limit 10000` 只讀 bounded primary-key window 的 `OUTCOME_RUNTIME_TIMING`，輸出 stage、account endpoint 與本輪 SDK command 的 count/sum/median/p90/max；不掃描整個 journal、不寫 DB、不呼叫 venue，也不改任何 live authority。下一步只能以此 report 檢查 stable SELL 的 `fill_sync_ms` 實際下降；mutation path 的 SDK book/submit/cancel tail 必須保留並另行審計，不得為追求 cadence 而跳過 fresh confirmation。
 
 ### 2026-09-19 — 60 秒 stale zero-fill BUY admission 與 post-fill evidence 對齊
 
