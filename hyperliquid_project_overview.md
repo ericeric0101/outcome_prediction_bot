@@ -1,6 +1,6 @@
 # Hyperliquid Outcome (HIP-4) BTC Daily Prediction Market Trading Bot — Current Authority
 
-> **權威架構版本 (Authority Version)**：2.5.13 (Outcome-only; all-loss-exit observation mode; conservative telemetry retention V1.2 compaction; bounded P2/D2/X3 reads and stable-exit fill cadence)
+> **權威架構版本 (Authority Version)**：2.5.14 (Outcome-only; all-loss-exit observation mode; conservative telemetry retention V1.2 compaction; bounded recovery-probe replay)
 > **建立與審計日期**：2026-08-23；最近修訂：2026-09-22
 > **目標系統**：Hyperliquid HyperCore L1 原生預測市場 — Outcome (HIP-4 協議標準)  
 > **單一權威聲明**：本文件取代原 `project_overview.md`，為系統唯一的設計、架構、量化模型與執行權威規範。
@@ -63,6 +63,14 @@ No automatic re-enable, threshold change, re-entry relaxation, size increase,
 or new entry authority is authorized.  A launcher restart is required; a
 shell-exported `OUTCOME_LOSS_EXIT_ENABLED` still takes precedence over `.env`
 and must be checked in the durable startup manifest.
+
+### 2026-09-22 — Recovery-building 60 秒 probe replay（read-only）
+
+**問題與精確界線。** `HOLD_FOR_RECOVERY` 的完整、預先宣告定義仍要求方向翻轉、90 秒 bid trend efficiency `<=0.60`、depth 自低點回補 `>=1.25x`、以及 spread 收斂至最高值 `<=0.80x`。這使它在首次 `HARD_IOC_COUNTERFACTUAL` 時可能尚未完成，即使翻轉、depth 回補與 spread 收斂已經存在。這不是把既有 HOLD 門檻放寬，也不把「-15% cap」誤當作可以直接延後的 trigger：現行 `-10%` 是 hard trigger、`-15%` 是含 fee 的全倉成交上限；若兩者設為同一值，book/fee 幾乎沒有緩衝，通常只會增加 `DEPTH_OR_CAP_BLOCKED`，不是安全的 recovery 策略。
+
+**唯一新增的研究輸出。** 既有 `python -m bot.outcome_exit_decision_replay_report --db logs/outcome_shadow.db --period 1d` 現重用 `OUTCOME_HOLDING_RISK_DECISION_SHADOW` 與 canonical FIFO lot，為每個已有 full-depth hard candidate 產生 read-only `recovery_probe_cases`。`RECOVERY_BUILDING` 是完整 HOLD 前的三項 conjunction：至少一次 bid direction flip、depth recovery `>=1.25x`、spread contraction `<=0.80x`；它只在**首次已 cap-eligible hard boundary**存在時，反事實地比較 immediate IOC 與保留既有 protective SELL 後的 30／60 秒既有 full-depth checkpoint。60 秒時只有已完整滿足既有 HOLD 才記 `HOLD_FOR_RECOVERY_AFTER_60S_COUNTERFACTUAL`；未完成但仍 cap-eligible 則記 `HARD_IOC_AFTER_60S_PROBE_COUNTERFACTUAL`；缺 checkpoint 或 cap/depth 消失一律明記，不插值、不假設 IOC/passive fill。
+
+**目前 evidence 與權限。** 2026-09-22 的第一個 bounded replay 只有 3 個 hard lifecycles：1 個 early-building 後於約 63 秒達完整 HOLD 且最終 FIFO `+$0.23`；1 個單邊、無 flip 的 initial hard 最終 `-$1.29`，仍為 immediate IOC；另 1 個最終 `+$0.21` 的 hard lifecycle 不符合 early-building，顯示此 probe 不是普遍的 winner detector。個位數樣本絕不可 promotion。這個報表不讀 gateway、controller 或 SDK，沒有 `.env`、runtime、stop/TP/fast-failure/S3/narrow-canary、size、entry 或 cancel/rebook 的 live 改動；`RECOVERY_BUILDING` 和所有 probe action 均 `live_authority=false`。未來若考慮 live，必須先以足夠的獨立 hard episodes 比較：probe 保住的 false-stop PnL、延後後仍可全倉 cap 內退出比例、以及因等待而失去 tail rescue 的損失；warning-lane 的替代保護也必須先取得獨立授權。
 
 ### 2026-09-20 — Structural Collapse / Tail-Risk Forward Validation（V16；shadow-only）
 

@@ -22,8 +22,16 @@ RISK_EVENTS = (
     "OUTCOME_CRASH_CIRCUIT_SHADOW",
     "OUTCOME_FAST_FAILURE_LANE_SHADOW",
     "OUTCOME_HOLDING_PATH_OBSERVATION",
+    "OUTCOME_HOLDING_RISK_DECISION_SHADOW",
 )
 NARROW_EXECUTION_TYPE = "narrow_hard_failure_price_protected_fak_ioc"
+
+# This is a replay-only proposal, deliberately separate from the complete
+# HOLD_FOR_RECOVERY definition.  It captures the three *early* recovery facts
+# that can be visible while the 90-second trend-efficiency denominator still
+# reflects the preceding one-way selloff.  It has no live caller.
+RECOVERY_PROBE_SEC = 60
+RECOVERY_PROBE_TOLERANCE_SEC = 45
 
 # These are exact entry lifecycles, rather than outcome ids.  A single daily
 # market can contain several unrelated BUY/SELL lots, so an outcome-id lookup
@@ -124,6 +132,105 @@ def _control_label(*, bids: list[float], depths: list[float], spreads: list[floa
     # #2437 is an explicit counterexample.  Persistent book deterioration can
     # still be an observed tail-risk regime while thesis remains intact.
     return "persistent_or_unresolved_deterioration"
+
+
+def _recovery_building(shape: dict[str, Any]) -> bool:
+    """Return the predeclared early-recovery shape for replay only.
+
+    Full ``HOLD_FOR_RECOVERY`` additionally requires trend efficiency <= .60.
+    This earlier state does not relax that production definition; it asks a
+    bounded counterfactual question: would retaining passive protection for
+    60 seconds have allowed the full shape to resolve before an IOC?
+    """
+    try:
+        flips = int(shape.get("bid_direction_flips"))
+        depth = float(shape.get("depth_recovery_ratio"))
+        spread = float(shape.get("spread_contraction_ratio"))
+    except (TypeError, ValueError):
+        return False
+    return flips >= 1 and depth >= 1.25 and spread <= 0.80
+
+
+def _counterfactual_eligible(payload: dict[str, Any], lane: str) -> bool:
+    actions = payload.get("counterfactual_actions")
+    action = actions.get(lane) if isinstance(actions, dict) else None
+    return bool(action.get("eligible")) if isinstance(action, dict) else False
+
+
+def _first_checkpoint(
+    rows: list[tuple[datetime, dict[str, Any]]], *, after: datetime, seconds: int,
+) -> tuple[datetime, dict[str, Any]] | None:
+    """Use the first observed checkpoint, never interpolated book data."""
+    earliest = after + timedelta(seconds=seconds)
+    latest = earliest + timedelta(seconds=RECOVERY_PROBE_TOLERANCE_SEC)
+    return next(((at, payload) for at, payload in rows if earliest <= at <= latest), None)
+
+
+def _recovery_probe_case(
+    lifecycle_id: str, rows: list[tuple[datetime, dict[str, Any]]], *, final_pnl: float | None,
+) -> dict[str, Any] | None:
+    """Replay immediate IOC vs a bounded 60-second recovery observation.
+
+    A missing row, lost cap capacity, or missing final FIFO result remains an
+    explicit unknown.  The helper deliberately never claims that an IOC or a
+    passive order would have filled.
+    """
+    first_hard = next((item for item in rows if _counterfactual_eligible(item[1], "hard_ioc")), None)
+    if first_hard is None:
+        return None
+    hard_at, hard_payload = first_hard
+    initial_shape = hard_payload.get("recovery_shape")
+    initial_shape = initial_shape if isinstance(initial_shape, dict) else {}
+    building = _recovery_building(initial_shape)
+    checkpoints: dict[str, dict[str, Any] | None] = {}
+    for seconds in (30, RECOVERY_PROBE_SEC):
+        checkpoint = _first_checkpoint(rows, after=hard_at, seconds=seconds)
+        if checkpoint is None:
+            checkpoints[str(seconds)] = None
+            continue
+        observed_at, payload = checkpoint
+        shape = payload.get("recovery_shape")
+        shape = shape if isinstance(shape, dict) else {}
+        checkpoints[str(seconds)] = {
+            "observed_ts": observed_at.isoformat(),
+            "delay_sec": (observed_at - hard_at).total_seconds(),
+            "net_return_pct": payload.get("full_depth_net_return_pct"),
+            "hard_ioc_eligible": _counterfactual_eligible(payload, "hard_ioc"),
+            "hold_for_recovery_eligible": _counterfactual_eligible(payload, "hold_for_recovery"),
+            "recovery_building": _recovery_building(shape),
+            "classification": shape.get("classification"),
+        }
+    at_probe = checkpoints.get(str(RECOVERY_PROBE_SEC))
+    if not building:
+        proposed_action = "IMMEDIATE_HARD_IOC_COUNTERFACTUAL"
+    elif at_probe is None:
+        proposed_action = "RECOVERY_PROBE_INSUFFICIENT_CHECKPOINT_DATA"
+    elif at_probe["hold_for_recovery_eligible"]:
+        proposed_action = "HOLD_FOR_RECOVERY_AFTER_60S_COUNTERFACTUAL"
+    elif at_probe["hard_ioc_eligible"]:
+        proposed_action = "HARD_IOC_AFTER_60S_PROBE_COUNTERFACTUAL"
+    else:
+        proposed_action = "RECOVERY_PROBE_LOST_CAP_OR_DEPTH_CAPACITY"
+    return {
+        "entry_lifecycle_id": lifecycle_id,
+        "initial_hard_ts": hard_at.isoformat(),
+        "initial_net_return_pct": hard_payload.get("full_depth_net_return_pct"),
+        "initial_recovery_shape": initial_shape,
+        "recovery_building_at_initial_hard": building,
+        "immediate_action": "HARD_IOC_COUNTERFACTUAL",
+        "checkpoints": checkpoints,
+        "proposed_60s_action": proposed_action,
+        "final_canonical_fifo_pnl": final_pnl,
+        "final_label": (
+            "profit" if final_pnl is not None and final_pnl > 0
+            else "loss" if final_pnl is not None and final_pnl < 0
+            else "flat" if final_pnl == 0 else "missing"
+        ),
+        "limits": [
+            "read-only counterfactual", "no passive-fill inference",
+            "no IOC-fill-price inference", "no live authority",
+        ],
+    }
 
 
 def _raw_l2_window(
@@ -250,10 +357,12 @@ def report(
         "control_raw_requested": include_control_raw,
         "episodes": [],
         "control_cases": [],
+        "recovery_probe_cases": [],
         "blockers": [],
         "limits": [
             "This report labels observed conditions; it never promotes a live exit threshold.",
             "A post-exit recovery is factual only when raw WS coverage is available; UI or settlement prices are not substituted.",
+            "RECOVERY_BUILDING is a 60-second read-only counterfactual, not a live HOLD_FOR_RECOVERY veto.",
         ],
     }
     if not path.exists():
@@ -267,6 +376,15 @@ def report(
         order_rows = conn.execute(
             "SELECT id,ts,event_type,venue_order_id,side,price,qty,instrument_id,payload_json FROM order_events ORDER BY id"
         ).fetchall()
+        realized_by_open_trade: dict[str, float] = {}
+        if "outcome_realized_pnl_lots" in tables:
+            for open_trade_id, pnl in conn.execute(
+                "SELECT open_trade_id,SUM(CAST(realized_net_usdc AS REAL)) "
+                "FROM outcome_realized_pnl_lots GROUP BY open_trade_id"
+            ):
+                parsed = _number(pnl)
+                if parsed is not None:
+                    realized_by_open_trade[str(open_trade_id)] = parsed
         exits: list[dict[str, Any]] = []
         for event_id, ts, event_type, order_id, side, price, qty, instrument, raw in order_rows:
             payload = _payload(raw)
@@ -354,6 +472,27 @@ def report(
             values.sort(key=lambda item: item[0])
         for values in monitor_paths.values():
             values.sort(key=lambda item: item[0])
+
+        # Reuse the existing full-depth boundary records.  This does not scan
+        # raw L2, mutate the DB, or reconstruct missing path points.
+        holding_risk_paths: dict[str, list[tuple[datetime, dict[str, Any]]]] = defaultdict(list)
+        for ts, event_type, payload in events:
+            if event_type != "OUTCOME_HOLDING_RISK_DECISION_SHADOW" or payload.get("period") != period:
+                continue
+            lifecycle_id = str(payload.get("entry_lifecycle_id") or "")
+            observed = _timestamp(ts)
+            if lifecycle_id and observed is not None:
+                holding_risk_paths[lifecycle_id].append((observed, payload))
+        for lifecycle_id, rows in holding_risk_paths.items():
+            rows.sort(key=lambda item: item[0])
+            # Official lifecycle ids end in the immutable BUY fill id, which
+            # is the FIFO table's open_trade_id.  Do not fall back to outcome
+            # id or coin when this identity is absent.
+            parts = lifecycle_id.rsplit(":", 1)
+            final_pnl = realized_by_open_trade.get(parts[1]) if len(parts) == 2 else None
+            case = _recovery_probe_case(lifecycle_id, rows, final_pnl=final_pnl)
+            if case is not None:
+                result["recovery_probe_cases"].append(case)
 
         control_inputs: list[tuple[dict[str, str], list[tuple[datetime, dict[str, Any]]], datetime | None, str | None, dict[str, Any]]] = []
         for control in CONTROL_LIFECYCLES:
@@ -470,6 +609,28 @@ def report(
                 row["post_exit_raw_ws"] = raw_outcomes.get(row["exit_order_id"], {"raw_ws_status": "missing"})
         result["episodes"] = exits
         result["episode_count"] = len(exits)
+        probe_cases = result["recovery_probe_cases"]
+        result["recovery_probe_summary"] = {
+            "probe_sec": RECOVERY_PROBE_SEC,
+            "checkpoint_tolerance_sec": RECOVERY_PROBE_TOLERANCE_SEC,
+            "hard_candidates": len(probe_cases),
+            "initial_recovery_building": sum(bool(item["recovery_building_at_initial_hard"]) for item in probe_cases),
+            "would_hold_after_probe": sum(
+                item["proposed_60s_action"] == "HOLD_FOR_RECOVERY_AFTER_60S_COUNTERFACTUAL"
+                for item in probe_cases
+            ),
+            "would_ioc_after_probe": sum(
+                item["proposed_60s_action"] == "HARD_IOC_AFTER_60S_PROBE_COUNTERFACTUAL"
+                for item in probe_cases
+            ),
+            "lost_capacity_or_missing_checkpoint": sum(
+                item["proposed_60s_action"] in {
+                    "RECOVERY_PROBE_LOST_CAP_OR_DEPTH_CAPACITY",
+                    "RECOVERY_PROBE_INSUFFICIENT_CHECKPOINT_DATA",
+                }
+                for item in probe_cases
+            ),
+        }
         if not exits:
             result["blockers"].append("no_narrow_hard_failure_ioc_submits")
     return result
