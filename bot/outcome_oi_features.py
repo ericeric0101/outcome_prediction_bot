@@ -180,7 +180,7 @@ class OutcomeOiFeaturePipeline:
 
     def _observations(self, conn: sqlite3.Connection) -> list[_Oi]:
         where = "" if self.include_backfilled else "WHERE backfilled=0"
-        rows = conn.execute(f"""
+        cursor = conn.execute(f"""
             SELECT id,exchange_timestamp_ms,local_received_at_ms,open_interest,mark_price,taker_imbalance,backfilled
             FROM binance_oi_observations {where}
             WHERE exchange_timestamp_ms <= local_received_at_ms
@@ -190,9 +190,9 @@ class OutcomeOiFeaturePipeline:
             FROM binance_oi_observations
             WHERE exchange_timestamp_ms <= local_received_at_ms
             ORDER BY local_received_at_ms
-        """).fetchall()
+        """)
         output = []
-        for row in rows:
+        for row in cursor:
             oi = _number(row[3])
             if oi is not None and oi > 0:
                 output.append(_Oi(int(row[0]), int(row[1]), int(row[2]), oi, _number(row[4]), _number(row[5]), bool(row[6])))
@@ -200,9 +200,9 @@ class OutcomeOiFeaturePipeline:
 
     @staticmethod
     def _actual_maker_fills(conn: sqlite3.Connection) -> list[tuple[int, dict[str, Any]]]:
-        rows = conn.execute("SELECT id,payload_json FROM order_events WHERE event_type='ORDER_FILLED' ORDER BY id").fetchall()
+        cursor = conn.execute("SELECT id,payload_json FROM order_events WHERE event_type='ORDER_FILLED' ORDER BY id")
         output = []
-        for event_id, raw in rows:
+        for event_id, raw in cursor:
             try:
                 payload = json.loads(raw)
             except (TypeError, json.JSONDecodeError):
@@ -217,7 +217,8 @@ class OutcomeOiFeaturePipeline:
     @staticmethod
     def _markouts_by_fill(conn: sqlite3.Connection) -> dict[str, dict[str, Any]]:
         output: dict[str, dict[str, Any]] = {}
-        for (raw,) in conn.execute("SELECT payload_json FROM order_events WHERE event_type='FILL_MARKOUT'").fetchall():
+        cursor = conn.execute("SELECT payload_json FROM order_events WHERE event_type='FILL_MARKOUT'")
+        for (raw,) in cursor:
             try:
                 payload = json.loads(raw)
             except (TypeError, json.JSONDecodeError):

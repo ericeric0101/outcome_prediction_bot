@@ -1,7 +1,7 @@
 # Hyperliquid Outcome (HIP-4) BTC Daily Prediction Market Trading Bot — Current Authority
 
-> **權威架構版本 (Authority Version)**：2.5.11 (Outcome-only; all-loss-exit observation mode; conservative telemetry retention V1.2 compaction; bounded P2/D2 feature construction)
-> **建立與審計日期**：2026-08-23；最近修訂：2026-09-21
+> **權威架構版本 (Authority Version)**：2.5.12 (Outcome-only; all-loss-exit observation mode; conservative telemetry retention V1.2 compaction; bounded P2/D2 and X3 raw-read materialization)
+> **建立與審計日期**：2026-08-23；最近修訂：2026-09-22
 > **目標系統**：Hyperliquid HyperCore L1 原生預測市場 — Outcome (HIP-4 協議標準)  
 > **單一權威聲明**：本文件取代原 `project_overview.md`，為系統唯一的設計、架構、量化模型與執行權威規範。
 
@@ -133,6 +133,10 @@ and must be checked in the durable startup manifest.
 **已確認的舊版快取（未刪除）。** 實際 `logs/outcome_shadow.db` 仍有 v1 `outcome_deribit_point_index`（6,000 rows，watermark 2,413,936）與 `outcome_deribit_point_index_state`。自 v2 上線後，repo 現行 source、schema 和 tests 只引用 `outcome_deribit_point_index_v2`／`outcome_deribit_point_index_state_v2`（現有 363,345 rows，watermark 3,903,249）；v1 由早期 partial build 遺留，已無現行程式 consumer，故標記為 **LEGACY_CANDIDATE_DELETE**。v2 是可重建的 derived cache、不是 execution authority，但目前 D2 feature build 依賴它，仍必須保留。
 
 **未來移除 v1 的強制程序。** 這不是 live tick 操作，也不是 `outcome_journal_maintenance.py` V1 telemetry allowlist 的一部分。先停止所有 bot/collector、製作可驗證 DB copy/backup、執行 `PRAGMA integrity_check`、再次查核 `sqlite_master` 及 repo/外部排程對 v1 table 的引用，並確認當次 process 已使用 v2 state watermark；其後才可在 maintenance window 對**精確兩張** v1 table 做可回復、已審核的 schema migration。不得刪除 `outcome_shadow.db`、不得碰 canonical tables、不得手動刪除 `-wal`/`-shm`。移除後若要縮小 OS file size，仍須依既有停機、備份與磁碟空間政策另行執行 SQLite `VACUUM`。
+
+### 2026-09-22 — X3 OI raw-read materialization 縮減（語意不變）
+
+`OutcomeOiFeaturePipeline._observations()`、`_actual_maker_fills()` 與 `_markouts_by_fill()` 已將 SQLite `fetchall()` 改為同一 SQL cursor 的單次 iteration；沒有改 SQL predicate、排序、JSON parsing、filter、P3 timing validation、duplicate overwrite、feature horizon、label 或 OI math。此改動只移除 SQLite raw tuple list 的額外 peak：`_observations()` 仍必須完整保留已解析的 `_Oi` list，供 `_OiIndex` 的 as-of/prefix-stat construction 使用；maker fills 與 markout dict 也仍保留其既有最終 parsed collection。因此這不是所有 X3 路徑的 O(1) memory 宣告，而是在不改研究/交易語意下消除可避免的第二份 raw-result materialization。focused OI/X3 tests 覆蓋 ordering、backfill、非法 numeric/JSON、maker filters、P3 validation 與 duplicate last-write semantics，均通過。
 
 ### 2026-09-19 — 60 秒 stale zero-fill BUY admission 與 post-fill evidence 對齊
 

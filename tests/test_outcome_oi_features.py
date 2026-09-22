@@ -2,6 +2,7 @@ import json
 import sqlite3
 import pytest
 
+from bot.outcome_markout import P3_MARKOUT_SCHEMA_VERSION
 from bot.outcome_oi_features import FEATURE_SCHEMA_VERSION, OutcomeOiFeaturePipeline
 from bot.outcome_p2_quality import P2_SCHEMA_VERSION
 from monitoring.trade_journal_db import TradeJournalDB
@@ -23,6 +24,89 @@ def _oi(journal, *, exchange: int, local: int, oi: str, backfilled=False, mark="
         exchange_timestamp_ms=exchange, local_received_at_ms=local, request_latency_ms=1, open_interest=oi,
         open_interest_value=None, mark_price=mark, index_price=mark, taker_buy_notional="1", taker_sell_notional="1",
         taker_imbalance=0, backfilled=backfilled, raw_payload_hash=f"{exchange}-{local}-{backfilled}", raw_payload={}, context={})
+
+
+def test_x3_observations_streams_rows_preserving_order_backfill_and_invalid_values(tmp_path):
+    journal = TradeJournalDB(tmp_path / "journal.db")
+    base = 2_600_000_000_000
+    _oi(journal, exchange=base + 20, local=base + 20, oi="102")
+    _oi(journal, exchange=base + 10, local=base + 10, oi="101")
+    _oi(journal, exchange=base + 30, local=base + 30, oi="103", backfilled=True)
+    _oi(journal, exchange=base + 40, local=base + 40, oi="104")
+    with sqlite3.connect(journal.db_path) as conn:
+        ids_by_local = dict(conn.execute(
+            "SELECT local_received_at_ms,id FROM binance_oi_observations"
+        ))
+        conn.execute(
+            "UPDATE binance_oi_observations SET open_interest='not-a-number' WHERE local_received_at_ms=?",
+            (base + 40,),
+        )
+        conn.commit()
+        assert [(row.id, row.open_interest, row.backfilled) for row in OutcomeOiFeaturePipeline(journal)._observations(conn)] == [
+            (ids_by_local[base + 10], 101.0, False), (ids_by_local[base + 20], 102.0, False),
+        ]
+        assert [(row.id, row.open_interest, row.backfilled) for row in OutcomeOiFeaturePipeline(
+            journal, include_backfilled=True,
+        )._observations(conn)] == [
+            (ids_by_local[base + 10], 101.0, False), (ids_by_local[base + 20], 102.0, False),
+            (ids_by_local[base + 30], 103.0, True),
+        ]
+
+
+def test_x3_actual_maker_fills_streams_rows_preserving_filters_and_order(tmp_path):
+    journal = TradeJournalDB(tmp_path / "journal.db")
+    journal.log_order_event("live", "ORDER_FILLED", payload={
+        "actual_fill": True, "period": "1d", "liquidity_class": "maker", "timestamp_ms": 10,
+    })
+    journal.log_order_event("live", "ORDER_FILLED", payload={
+        "actual_fill": False, "period": "1d", "liquidity_class": "maker", "timestamp_ms": 11,
+    })
+    journal.log_order_event("live", "ORDER_FILLED", payload={"ignored": True})
+    journal.log_order_event("live", "ORDER_FILLED", payload={
+        "actual_fill": True, "period": "1d", "liquidity_class": "maker", "timestamp_ms": 12,
+    })
+    with sqlite3.connect(journal.db_path) as conn:
+        ids = [row[0] for row in conn.execute(
+            "SELECT id FROM order_events WHERE event_type='ORDER_FILLED' ORDER BY id"
+        )]
+        conn.execute("UPDATE order_events SET payload_json='{' WHERE id=?", (ids[2],))
+        conn.commit()
+        actual = OutcomeOiFeaturePipeline._actual_maker_fills(conn)
+    assert [(event_id, payload["timestamp_ms"]) for event_id, payload in actual] == [
+        (ids[0], 10), (ids[3], 12),
+    ]
+
+
+def test_x3_markouts_stream_rows_preserving_validation_and_duplicate_last_write(tmp_path):
+    journal = TradeJournalDB(tmp_path / "journal.db")
+
+    def markout(*, fill_id, horizon=10, signed="0.01", actual=True, schema=P3_MARKOUT_SCHEMA_VERSION):
+        return {
+            "actual_fill": actual, "p3_markout_schema_version": schema,
+            "fill_context_status": "asof_or_before_fill", "fill_id": fill_id,
+            "horizon_sec": horizon, "horizon_tolerance_ms": 2500,
+            "target_lag_ms": 0, "actual_elapsed_ms": horizon * 1000,
+            "signed_markout_ps": signed, "fee_per_share": "0.001", "executable_quote": True,
+        }
+
+    journal.log_order_event("p3", "FILL_MARKOUT", payload=markout(fill_id="fill-1", signed="0.01"))
+    journal.log_order_event("p3", "FILL_MARKOUT", payload=markout(fill_id="fill-1", signed="0.02"))
+    journal.log_order_event("p3", "FILL_MARKOUT", payload=markout(fill_id="rejected", actual=False))
+    journal.log_order_event("p3", "FILL_MARKOUT", payload=markout(fill_id="rejected-schema", schema=99))
+    journal.log_order_event("p3", "FILL_MARKOUT", payload={"ignored": True})
+    with sqlite3.connect(journal.db_path) as conn:
+        malformed = conn.execute(
+            "SELECT MAX(id) FROM order_events WHERE event_type='FILL_MARKOUT'"
+        ).fetchone()[0]
+        conn.execute("UPDATE order_events SET payload_json='{' WHERE id=?", (malformed,))
+        conn.commit()
+        actual = OutcomeOiFeaturePipeline._markouts_by_fill(conn)
+    # The FILL_MARKOUT query intentionally has no SQL ordering contract; this
+    # captures its existing cursor traversal and duplicate overwrite result.
+    assert actual == {"fill-1": {"10": {
+        "signed_markout_ps": "0.01", "fee_per_share": "0.001", "executable_quote": True,
+        "actual_elapsed_ms": 10_000, "target_lag_ms": 0,
+    }}}
 
 
 def test_x3_uses_only_locally_known_live_oi_and_executable_labels(tmp_path):
