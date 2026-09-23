@@ -104,6 +104,18 @@ class OutcomeEntryExecutionService:
                 return LiveExecutionResult("blocked", f"live strategy safety readiness: {reason}")
 
         if self.store is not None:
+            terminalized_stale_fill = self.store.reconcile_stale_cancel_fill_when_account_flat(
+                wallet=self.recovery.wallet, outcome_id=snapshot.market.outcome_id,
+                # ``snapshot.active`` is derived from the fresh account
+                # recovery immediately preceding this preflight.  Do not use
+                # a UI/display position or a cached order view as terminal
+                # evidence for a stale-cancel fill race.
+                fresh_current_outcome_flat=(
+                    bool(getattr(snapshot.report, "safe_for_new_entry", False)
+                    and not snapshot.active)
+                ),
+            )
+            admission["stale_cancel_fill_terminal_reconciled"] = terminalized_stale_fill
             pending = self.store.pending_ambiguous_submit(
                 wallet=self.recovery.wallet, outcome_id=snapshot.market.outcome_id,
             )

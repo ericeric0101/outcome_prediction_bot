@@ -39,6 +39,7 @@ class OutcomeEntryLifecycleStore:
     AMBIGUITY_RESOLVED_EVENT = "OUTCOME_ORDER_AMBIGUITY_RESOLVED"
     STALE_CANCEL_DECISION_EVENT = "OUTCOME_STALE_ENTRY_CANCEL_DECISION"
     STALE_CANCEL_CONFIRMED_EVENT = "OUTCOME_STALE_ENTRY_CANCEL_CONFIRMED"
+    STALE_CANCEL_FILLED_TERMINAL_EVENT = "OUTCOME_STALE_ENTRY_FILL_TERMINAL_RECONCILED"
     DECISION_EXPIRED_EVENT = "OUTCOME_ENTRY_DECISION_EXPIRED"
     REARMED_EVENT = "OUTCOME_ENTRY_REARMED"
 
@@ -102,6 +103,77 @@ class OutcomeEntryLifecycleStore:
         })
         return expired
 
+    def reconcile_stale_cancel_fill_when_account_flat(
+        self, *, wallet: str, outcome_id: int, fresh_current_outcome_flat: bool,
+    ) -> bool:
+        """Close a stale-cancel episode that raced with an official BUY fill.
+
+        This is deliberately distinct from ``STALE_CANCEL_CONFIRMED``: that
+        event means *zero* fill.  Here the immutable official BUY fill proves
+        the cancellation raced with execution, while the caller's current
+        account-recovery result proves there is now neither inventory nor an
+        open order for this Outcome.  The ordinary ineligible-then-fresh-signal
+        re-arm contract remains in force after this terminal reconciliation.
+        """
+        if not fresh_current_outcome_flat:
+            return False
+        try:
+            with sqlite3.connect(f"file:{self.journal.db_path}?mode=ro", uri=True) as conn:
+                decision = conn.execute(
+                    """SELECT id, payload_json FROM strategy_events WHERE event_type=?
+                       AND json_extract(payload_json, '$.wallet')=?
+                       AND CAST(json_extract(payload_json, '$.outcome_id') AS INTEGER)=?
+                       ORDER BY id DESC LIMIT 1""",
+                    (self.STALE_CANCEL_DECISION_EVENT, wallet, int(outcome_id)),
+                ).fetchone()
+                if decision is None:
+                    return False
+                decision_id, raw_payload = int(decision[0]), str(decision[1] or "{}")
+                already_terminal = conn.execute(
+                    """SELECT 1 FROM strategy_events WHERE event_type IN (?, ?) AND id>?
+                       AND json_extract(payload_json, '$.wallet')=?
+                       AND CAST(json_extract(payload_json, '$.outcome_id') AS INTEGER)=?
+                       AND CAST(json_extract(payload_json, '$.stale_cancel_decision_event_id') AS INTEGER)=?
+                       LIMIT 1""",
+                    (self.STALE_CANCEL_CONFIRMED_EVENT, self.STALE_CANCEL_FILLED_TERMINAL_EVENT,
+                     decision_id, wallet, int(outcome_id), decision_id),
+                ).fetchone()
+            if already_terminal is not None:
+                return False
+            payload = json.loads(raw_payload)
+            if not isinstance(payload, dict):
+                return False
+            coin, order_id = str(payload["coin"]), str(payload["order_id"])
+            official_fill = self.official_buy_fill(
+                outcome_id=int(outcome_id), coin=coin, order_id=order_id,
+            )
+            if official_fill is None:
+                return False
+            terminal_payload = {
+                "venue": "hyperliquid_outcome", "wallet": wallet,
+                "outcome_id": int(outcome_id), "coin": coin, "order_id": order_id,
+                "stale_cancel_decision_event_id": decision_id,
+                "fill_status": "official_buy_fill_then_fresh_account_flat",
+                "official_fill_trade_id": official_fill.get("trade_id"),
+                "official_fill_qty": official_fill.get("qty"),
+                "account_truth": "fresh_current_outcome_zero_inventory_and_zero_open_orders",
+                "reason": "stale_cancel_raced_with_fill_terminally_reconciled",
+                "state": "FILLED_TERMINAL_RECONCILED",
+            }
+            terminal_id = self.journal.log_durable_strategy_event(
+                self.run_id, self.STALE_CANCEL_FILLED_TERMINAL_EVENT, terminal_payload,
+            )
+            if terminal_id is None:
+                return False
+            expired = self.journal.log_durable_strategy_event(self.run_id, self.DECISION_EXPIRED_EVENT, {
+                **terminal_payload, "state": "EXPIRED",
+                "terminal_reconciliation_event_id": int(terminal_id),
+            })
+            return expired is not None
+        except (KeyError, TypeError, ValueError, sqlite3.Error, json.JSONDecodeError):
+            # Missing journal evidence must retain the hard admission fence.
+            return False
+
     def stale_decision_rearm_barrier(
         self, *, wallet: str, outcome_id: int, decision_at_ms: int | None,
         signal_ineligible: bool,
@@ -123,12 +195,13 @@ class OutcomeEntryLifecycleStore:
                 if stale_decision is not None:
                     stale_decision_id = int(stale_decision[0])
                     confirmed = conn.execute(
-                        """SELECT id FROM strategy_events WHERE event_type=? AND id>?
+                        """SELECT id FROM strategy_events WHERE event_type IN (?, ?) AND id>?
                            AND json_extract(payload_json, '$.wallet')=?
                            AND CAST(json_extract(payload_json, '$.outcome_id') AS INTEGER)=?
                            AND CAST(json_extract(payload_json, '$.stale_cancel_decision_event_id') AS INTEGER)=?
                            ORDER BY id DESC LIMIT 1""",
-                        (self.STALE_CANCEL_CONFIRMED_EVENT, stale_decision_id, wallet, int(outcome_id), stale_decision_id),
+                        (self.STALE_CANCEL_CONFIRMED_EVENT, self.STALE_CANCEL_FILLED_TERMINAL_EVENT,
+                         stale_decision_id, wallet, int(outcome_id), stale_decision_id),
                     ).fetchone()
                     if confirmed is None:
                         return False, "stale_cancel_pending_terminal_reconciliation", None
@@ -137,9 +210,12 @@ class OutcomeEntryLifecycleStore:
                         """SELECT id,ts FROM strategy_events
                            WHERE event_type=? AND json_extract(payload_json, '$.wallet')=?
                              AND CAST(json_extract(payload_json, '$.outcome_id') AS INTEGER)=?
-                             AND CAST(json_extract(payload_json, '$.cancel_confirmed_event_id') AS INTEGER)=?
+                             AND (
+                                 CAST(json_extract(payload_json, '$.cancel_confirmed_event_id') AS INTEGER)=?
+                                 OR CAST(json_extract(payload_json, '$.terminal_reconciliation_event_id') AS INTEGER)=?
+                             )
                            ORDER BY id DESC LIMIT 1""",
-                        (self.DECISION_EXPIRED_EVENT, wallet, int(outcome_id), confirmed_id),
+                        (self.DECISION_EXPIRED_EVENT, wallet, int(outcome_id), confirmed_id, confirmed_id),
                     ).fetchone()
                     if expired is None:
                         return False, "stale_cancel_confirmed_but_decision_expiry_missing", None

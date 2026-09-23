@@ -231,6 +231,64 @@ def test_stale_rearm_never_borrows_expiry_or_rearm_from_an_older_cancel_cycle(tm
     assert reason == "stale_cancel_confirmed_but_decision_expiry_missing"
 
 
+def test_stale_cancel_fill_race_reconciles_only_after_fresh_flat_account_truth(tmp_path):
+    """A delayed official BUY fill must not permanently poison this Outcome."""
+    journal = TradeJournalDB(tmp_path / "stale-fill-race.db")
+    store = OutcomeEntryLifecycleStore(journal, "run")
+    lifecycle = OutcomeEntryLifecycle("w", 7, "#yes", "buy-raced", Decimal("0.60"), 0, "BUY_RESTING")
+    decision = store.record_stale_cancel_decision(
+        lifecycle=lifecycle, decision_at_ms=100, order_age_sec=60,
+    )
+    assert decision is not None
+    journal.log_order_event("run", "ORDER_FILLED", venue_order_id="buy-raced", side="BUY",
+                            price=0.60, qty=13, status="FILLED", instrument_id="#yes", payload={
+                                "venue": "hyperliquid_outcome", "outcome_id": 7, "coin": "#yes",
+                                "actual_fill": True, "trade_id": "delayed-fill",
+                            })
+    assert not store.reconcile_stale_cancel_fill_when_account_flat(
+        wallet="w", outcome_id=7, fresh_current_outcome_flat=False,
+    )
+    blocked, reason, _ = store.stale_decision_rearm_barrier(
+        wallet="w", outcome_id=7, decision_at_ms=None, signal_ineligible=False,
+    )
+    assert not blocked and reason == "stale_cancel_pending_terminal_reconciliation"
+
+    assert store.reconcile_stale_cancel_fill_when_account_flat(
+        wallet="w", outcome_id=7, fresh_current_outcome_flat=True,
+    )
+    with sqlite3.connect(journal.db_path) as conn:
+        terminal = conn.execute(
+            "SELECT payload_json FROM strategy_events WHERE event_type=?",
+            (store.STALE_CANCEL_FILLED_TERMINAL_EVENT,),
+        ).fetchone()
+    assert terminal is not None and "official_buy_fill_then_fresh_account_flat" in terminal[0]
+    blocked, reason, _ = store.stale_decision_rearm_barrier(
+        wallet="w", outcome_id=7, decision_at_ms=None, signal_ineligible=False,
+    )
+    assert not blocked and reason == "stale_decision_requires_ineligible_then_fresh_eligible_signal"
+
+
+def test_preflight_records_stale_fill_race_terminal_event_from_fresh_flat_report(tmp_path):
+    journal = TradeJournalDB(tmp_path / "stale-fill-preflight.db")
+    store = OutcomeEntryLifecycleStore(journal, "run")
+    lifecycle = OutcomeEntryLifecycle("w", 7, "#yes", "buy-raced", Decimal("0.60"), 0, "BUY_RESTING")
+    assert store.record_stale_cancel_decision(lifecycle=lifecycle, decision_at_ms=100, order_age_sec=60) is not None
+    journal.log_order_event("run", "ORDER_FILLED", venue_order_id="buy-raced", side="BUY",
+                            price=0.60, qty=13, status="FILLED", instrument_id="#yes", payload={
+                                "venue": "hyperliquid_outcome", "outcome_id": 7, "coin": "#yes",
+                                "actual_fill": True, "trade_id": "delayed-fill",
+                            })
+    recovery = SimpleNamespace(wallet="w", account=SimpleNamespace(get_open_orders_sync=lambda _wallet: []))
+    service = OutcomeEntryExecutionService(
+        recovery=recovery, gateway=Gateway(), machine=SimpleNamespace(), store=store,
+        planner=OutcomeEntryQuotePlanner(OutcomeEntryQuotePlannerConfig()),
+    )
+    admission = {}
+    result = service.preflight(snapshot=snapshot(active=()), admission=admission, config=OutcomeLiveStrategyConfig())
+    assert result is not None and "requires_ineligible" in result.detail
+    assert admission["stale_cancel_fill_terminal_reconciled"] is True
+
+
 def test_stale_timer_uses_immutable_order_submit_time_after_restart_adoption(monkeypatch, tmp_path):
     journal = TradeJournalDB(tmp_path / "stale-submit-age.db")
     store = OutcomeEntryLifecycleStore(journal, "run")
