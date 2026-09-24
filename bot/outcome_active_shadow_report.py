@@ -10,7 +10,7 @@ import argparse
 import bisect
 import json
 import sqlite3
-from collections import Counter
+from collections import Counter, defaultdict
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -20,6 +20,10 @@ from bot.outcome_oi_features import FEATURE_SCHEMA_VERSION
 
 
 HORIZONS_SEC = (300, 900, 3600)
+TAKER_OPEN_FEE = Decimal("0.0007")
+TAKER_CLOSE_FEE = Decimal("0.0004")
+EARLY_PROPOSAL_MAX_GAP_SEC = 90
+EARLY_PROPOSAL_LOOKBACK_SEC = 15 * 60
 
 
 def _timestamp_ms(value: object) -> int | None:
@@ -77,6 +81,26 @@ def _selected_trained_through(payload: Mapping[str, Any], side_index: int | None
         return None
 
 
+def _side_ask(observed: Mapping[str, Any], side_index: int) -> Decimal | None:
+    return _decimal(observed.get("yes_ask" if side_index == 0 else "no_ask"))
+
+
+def _side_future_bid(future: Mapping[str, Any], side_index: int) -> Decimal | None:
+    return _decimal(future.get("yes_bid" if side_index == 0 else "no_bid"))
+
+
+def _taker_return(*, ask: Decimal | None, future_bid: Decimal | None) -> Decimal | None:
+    """Strict executable counterfactual: buy now at ask, sell later at bid.
+
+    It is intentionally usable for a shadow ``JOIN_BEST_BID`` proposal only
+    when answering the separate question "what if we crossed now?"  It never
+    re-labels the original maker quote as a fill.
+    """
+    if ask is None or future_bid is None or ask <= 0 or future_bid <= 0:
+        return None
+    return future_bid * (Decimal("1") - TAKER_CLOSE_FEE) / (ask * (Decimal("1") + TAKER_OPEN_FEE)) - Decimal("1")
+
+
 def shadow_report(
     db_path: str | Path,
     *,
@@ -118,6 +142,20 @@ def shadow_report(
     horizon_returns_by_day_type: dict[int, dict[str, list[Decimal]]] = {
         horizon: {"weekday": [], "weekend": [], "unknown": []} for horizon in HORIZONS_SEC
     }
+    # A JOIN quote is maker-only in the original challenger proposal.  Keep a
+    # separate, explicitly taker-at-ask calculation for the user's execution
+    # question; never merge it into maker opportunity returns above.
+    taker_returns_by_action: dict[int, dict[str, list[Decimal]]] = {
+        horizon: defaultdict(list) for horizon in HORIZONS_SEC
+    }
+    same_time_returns: dict[int, dict[str, dict[str, list[Decimal]]]] = {
+        horizon: {
+            "same_side": {"production": [], "challenger": []},
+            "opposite_side": {"production": [], "challenger": []},
+        }
+        for horizon in HORIZONS_SEC
+    }
+    unseen_records: list[dict[str, Any]] = []
     horizon_coverage: Counter[int] = Counter()
     entry_events = unseen_entry_events = holding_events = 0
     for raw_ts, event_type, raw_payload in raw_events:
@@ -153,6 +191,12 @@ def shadow_report(
         production_reason_counts[str(payload.get("production_reason") or "unknown")] += 1
         observed = payload.get("observed_context")
         observed = observed if isinstance(observed, Mapping) else {}
+        try:
+            production_side = int(payload.get("production_side_index"))
+        except (TypeError, ValueError):
+            production_side = None
+        if production_side not in (0, 1):
+            production_side = None
         raw_weekend = observed.get("market_session_is_weekend")
         day_type = "weekend" if raw_weekend is True else "weekday" if raw_weekend is False else "unknown"
         unseen_by_day_type[day_type] += 1
@@ -160,19 +204,46 @@ def shadow_report(
         prefix = "yes" if side_index == 0 else "no"
         ask = _decimal(observed.get(f"{prefix}_ask"))
         quote = _decimal(challenger.get("quote"))
-        # Marketable actions use the observed ask; WAIT uses that same
-        # executable counterfactual basis.  Maker actions remain conditional
-        # quote opportunities and are never classified as fills.
-        basis = ask if action in {"WAIT", "BOUNDED_MARKETABLE_BUY"} else quote
-        if basis is None or basis <= 0:
-            continue
-        open_fee = Decimal("0.0007") if action in {"WAIT", "BOUNDED_MARKETABLE_BUY"} else Decimal("0")
-        cost = basis * (Decimal("1") + open_fee)
+        record: dict[str, Any] = {
+            "outcome_id": outcome_id, "timestamp_ms": decision_ms,
+            "challenger_side": side_index, "challenger_action": action,
+            "production_side": production_side,
+            "production_reason": str(payload.get("production_reason") or "unknown"),
+            "ask": ask, "observed": observed, "taker_returns": {},
+        }
+        unseen_records.append(record)
         for horizon in HORIZONS_SEC:
             future = _future_row(future_bbo.get(outcome_id, []), decision_ms + horizon * 1000, tolerance_ms=max(1, tolerance_sec) * 1000)
             future_bid = _decimal(future.get(f"{prefix}_bid")) if future is not None else None
             if future_bid is None or future_bid <= 0:
                 continue
+            # This is the requested JOIN-as-taker calculation.  It always
+            # crosses at the observed ask, regardless of the shadow's maker
+            # quote, then closes at the observed future bid after both fees.
+            taker_return = _taker_return(ask=ask, future_bid=future_bid)
+            if taker_return is not None:
+                record["taker_returns"][horizon] = taker_return
+                taker_returns_by_action[horizon][action].append(taker_return)
+            if production_side in (0, 1) and action != "WAIT":
+                production_return = _taker_return(
+                    ask=_side_ask(observed, production_side),
+                    future_bid=_side_future_bid(future, production_side),
+                )
+                if taker_return is not None and production_return is not None:
+                    comparison = "same_side" if production_side == side_index else "opposite_side"
+                    same_time_returns[horizon][comparison]["production"].append(production_return)
+                    same_time_returns[horizon][comparison]["challenger"].append(taker_return)
+
+            # Marketable actions use the observed ask; WAIT uses that same
+            # executable counterfactual basis.  Maker actions remain
+            # conditional quote opportunities and are never classified as
+            # fills.  This legacy maker-path output is intentionally
+            # separate from the taker calculation above.
+            basis = ask if action in {"WAIT", "BOUNDED_MARKETABLE_BUY"} else quote
+            if basis is None or basis <= 0:
+                continue
+            open_fee = Decimal("0.0007") if action in {"WAIT", "BOUNDED_MARKETABLE_BUY"} else Decimal("0")
+            cost = basis * (Decimal("1") + open_fee)
             horizon_coverage[horizon] += 1
             net_return = future_bid * (Decimal("1") - Decimal("0.0004")) / cost - Decimal("1")
             horizon_returns[horizon].append(net_return)
@@ -193,6 +264,108 @@ def shadow_report(
                 for day_type, day_values in horizon_returns_by_day_type[horizon].items()
             },
         }
+
+    def return_summary(values: list[Decimal]) -> dict[str, Any]:
+        return {
+            "observations": len(values),
+            "mean_fee_adjusted_return": str(sum(values, Decimal("0")) / len(values)) if values else None,
+            "positive_rate": sum(value > 0 for value in values) / len(values) if values else None,
+        }
+
+    # An "early" proposal is a contiguous (<=90-second event gap) active
+    # non-WAIT run in the same side immediately before a new S0 confirmation.
+    # We do not claim that an intermittent quote hours earlier was a viable
+    # faster entry.  Both legs below are taker-at-ask counterfactuals.
+    early_head_to_head: list[dict[str, Any]] = []
+    by_market: dict[int, list[dict[str, Any]]] = {}
+    for record in unseen_records:
+        by_market.setdefault(int(record["outcome_id"]), []).append(record)
+    active_actions = {"JOIN_BEST_BID", "IMPROVE_ONE_TICK", "BOUNDED_MARKETABLE_BUY"}
+    for outcome_id, records in by_market.items():
+        records.sort(key=lambda item: int(item["timestamp_ms"]))
+        previous_production_side: int | None = None
+        for position, production in enumerate(records):
+            production_side = production["production_side"]
+            if production_side not in (0, 1):
+                previous_production_side = None
+                continue
+            if previous_production_side == production_side:
+                continue
+            previous_production_side = production_side
+            candidates = [
+                item for item in records[:position]
+                if item["challenger_side"] == production_side
+                and item["challenger_action"] in active_actions
+                and 0 < int(production["timestamp_ms"]) - int(item["timestamp_ms"]) <= EARLY_PROPOSAL_LOOKBACK_SEC * 1000
+            ]
+            if not candidates:
+                continue
+            # The last active observation must itself be close to the S0
+            # onset.  A proposal made many minutes before confirmation is not
+            # evidence that the challenger was still actionable at the onset.
+            if int(production["timestamp_ms"]) - int(candidates[-1]["timestamp_ms"]) > EARLY_PROPOSAL_MAX_GAP_SEC * 1000:
+                continue
+            # Keep only the last continuous run leading into the S0 onset.
+            run = [candidates[-1]]
+            for item in reversed(candidates[:-1]):
+                if int(run[0]["timestamp_ms"]) - int(item["timestamp_ms"]) > EARLY_PROPOSAL_MAX_GAP_SEC * 1000:
+                    break
+                run.insert(0, item)
+            early = run[0]
+            comparison: dict[str, Any] = {
+                "outcome_id": outcome_id,
+                "side_index": production_side,
+                "active_first_ts_ms": early["timestamp_ms"],
+                "production_s0_ts_ms": production["timestamp_ms"],
+                "lead_sec": (int(production["timestamp_ms"]) - int(early["timestamp_ms"])) / 1000,
+                "active_action": early["challenger_action"],
+                "active_run_observations": len(run),
+                "taker_return_by_horizon": {},
+            }
+            for horizon in HORIZONS_SEC:
+                active_return = early["taker_returns"].get(horizon)
+                production_return = production["taker_returns"].get(horizon)
+                if active_return is not None and production_return is not None:
+                    comparison["taker_return_by_horizon"][str(horizon)] = {
+                        "active": str(active_return), "production": str(production_return),
+                        "active_minus_production": str(active_return - production_return),
+                    }
+            early_head_to_head.append(comparison)
+
+    early_leads = [Decimal(str(item["lead_sec"])) for item in early_head_to_head]
+    same_time_summary: dict[str, Any] = {}
+    for horizon, comparisons in same_time_returns.items():
+        same_time_summary[str(horizon)] = {}
+        for relationship, legs in comparisons.items():
+            production_values = legs["production"]
+            challenger_values = legs["challenger"]
+            differences = [challenger - production for challenger, production in zip(challenger_values, production_values)]
+            same_time_summary[str(horizon)][relationship] = {
+                "production_taker": return_summary(production_values),
+                "challenger_taker": return_summary(challenger_values),
+                "challenger_minus_production": return_summary(differences),
+            }
+
+    early_head_to_head_summary: dict[str, Any] = {
+        "episodes": len(early_head_to_head),
+        "lead_sec": {
+            "mean": str(sum(early_leads, Decimal("0")) / len(early_leads)) if early_leads else None,
+            "median": str(sorted(early_leads)[len(early_leads) // 2]) if early_leads else None,
+            "min": str(min(early_leads)) if early_leads else None,
+            "max": str(max(early_leads)) if early_leads else None,
+        },
+        "by_horizon_sec": {},
+    }
+    for horizon in HORIZONS_SEC:
+        comparisons = [item["taker_return_by_horizon"].get(str(horizon), {}) for item in early_head_to_head]
+        active_values = [_decimal(item.get("active")) for item in comparisons]
+        production_values = [_decimal(item.get("production")) for item in comparisons]
+        differences = [_decimal(item.get("active_minus_production")) for item in comparisons]
+        early_head_to_head_summary["by_horizon_sec"][str(horizon)] = {
+            "active_taker": return_summary([value for value in active_values if value is not None]),
+            "production_taker": return_summary([value for value in production_values if value is not None]),
+            "active_minus_production": return_summary([value for value in differences if value is not None]),
+        }
     blockers: list[str] = []
     if len(unseen_markets) < 5:
         blockers.append("fewer_than_5_unseen_daily_markets")
@@ -203,7 +376,7 @@ def shadow_report(
     blockers.extend(["b5_evidence_review_not_completed", "b6_requires_separate_operator_authorization"])
     return {
         "report": "outcome_active_unseen_shadow",
-        "schema_version": 1,
+        "schema_version": 2,
         "period": period,
         "entry_events": entry_events,
         "unseen_entry_events": unseen_entry_events,
@@ -219,6 +392,22 @@ def shadow_report(
         "independent_unseen_daily_markets": len(unseen_markets),
         "unseen_outcome_ids": sorted(unseen_markets),
         "future_path_by_horizon_sec": path_summary,
+        "taker_at_observed_ask_counterfactual_by_action_by_horizon_sec": {
+            str(horizon): {
+                action: return_summary(values)
+                for action, values in sorted(actions.items())
+            }
+            for horizon, actions in taker_returns_by_action.items()
+        },
+        "same_timestamp_s0_vs_active_taker_counterfactual_by_horizon_sec": same_time_summary,
+        "early_same_side_active_to_s0_taker_head_to_head": early_head_to_head_summary,
+        "head_to_head_semantics": (
+            "read_only_bbo_counterfactual: buy at observed ask plus open fee, "
+            "then sell at future same-side bid less close fee; it assumes an "
+            "immediate BBO fill and excludes displayed-depth, queue, and "
+            "market-impact uncertainty. same_side is the only directional "
+            "comparison; opposite_side is reported separately."
+        ),
         "maker_semantics": "conditional_quote_opportunity_only_never_fill_or_pnl",
         "wait_semantics": "observed_ask_counterfactual_not_an_executed_trade",
         "evidence_floor_met": not any(blocker.startswith("fewer_than_") or blocker.endswith("unavailable") for blocker in blockers),

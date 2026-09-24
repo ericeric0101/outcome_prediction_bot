@@ -7,6 +7,7 @@ artifact is permanently marked ``live_authority=false``.
 from __future__ import annotations
 
 import argparse
+import bisect
 import json
 import math
 import sqlite3
@@ -16,6 +17,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 from bot.outcome_active_dataset import ACTIVE_DATASET_SCHEMA_VERSION, ACTIVE_FEATURE_NAMES, ActiveDecisionRow, load_decision_rows
+from bot.outcome_oi_features import FEATURE_SCHEMA_VERSION
 
 
 # Calendar columns alter the feature-vector contract.  Reject older frozen
@@ -31,6 +33,253 @@ PROBABILITY_TARGETS = (
     "breach_minus_20pct_1h",
     "recovered_after_minus_10pct_1h",
 )
+SETTLEMENT_CHECKPOINTS_SEC = (3600, 10_800, 21_600, 43_200)
+
+
+def _finite(value: object) -> float | None:
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return result if math.isfinite(result) else None
+
+
+def _normal_cdf(value: float) -> float:
+    return 0.5 * (1.0 + math.erf(value / math.sqrt(2.0)))
+
+
+def _logit(value: float) -> float:
+    clipped = min(1.0 - 1e-6, max(1e-6, value))
+    return math.log(clipped / (1.0 - clipped))
+
+
+def _fit_logistic(rows: list[dict[str, Any]]) -> tuple[list[float], list[float], list[float]] | None:
+    """Small L2 logistic model; all scaling is estimated from earlier markets only."""
+    if len(rows) < 8 or len({int(row["label"]) for row in rows}) < 2:
+        return None
+    width = len(rows[0]["model_features"])
+    means = [sum(row["model_features"][i] for row in rows) / len(rows) for i in range(width)]
+    scales = [math.sqrt(sum((row["model_features"][i] - means[i]) ** 2 for row in rows) / len(rows)) for i in range(width)]
+    scales = [scale if scale > 1e-9 else 1.0 for scale in scales]
+    xs = [[1.0] + [(float(v) - means[i]) / scales[i] for i, v in enumerate(row["model_features"])] for row in rows]
+    ys = [float(row["label"]) for row in rows]
+    weights = [0.0] * (width + 1)
+    for _ in range(1200):
+        grad = [0.0] * len(weights)
+        for x, y in zip(xs, ys):
+            linear = max(-30.0, min(30.0, sum(w * v for w, v in zip(weights, x))))
+            probability = 1.0 / (1.0 + math.exp(-linear))
+            for i, v in enumerate(x):
+                grad[i] += (probability - y) * v / len(rows)
+        for i in range(1, len(grad)):
+            grad[i] += 0.1 * weights[i] / len(rows)
+        step = 0.08
+        updated = [w - step * g for w, g in zip(weights, grad)]
+        if max(abs(a - b) for a, b in zip(updated, weights)) < 1e-8:
+            weights = updated
+            break
+        weights = updated
+    return means, scales, weights
+
+
+def _predict_logistic(model: tuple[list[float], list[float], list[float]], values: list[float]) -> float:
+    means, scales, weights = model
+    linear = weights[0] + sum(weights[i + 1] * ((value - means[i]) / scales[i]) for i, value in enumerate(values))
+    linear = max(-30.0, min(30.0, linear))
+    return 1.0 / (1.0 + math.exp(-linear))
+
+
+def _binary_metrics(predictions: list[float], labels: list[int]) -> dict[str, Any]:
+    if not labels:
+        return {"rows": 0, "brier": None, "log_loss": None}
+    eps = 1e-12
+    return {
+        "rows": len(labels),
+        "brier": sum((p - y) ** 2 for p, y in zip(predictions, labels)) / len(labels),
+        "log_loss": -sum(y * math.log(max(eps, p)) + (1 - y) * math.log(max(eps, 1 - p)) for p, y in zip(predictions, labels)) / len(labels),
+        "positive_rate": sum(labels) / len(labels),
+        "predicted_rate": sum(predictions) / len(predictions),
+    }
+
+
+def settlement_probability_report(db_path: str | Path) -> dict[str, Any]:
+    """Official-resolution probability comparison at fixed time-left checkpoints.
+
+    Every method is scored on the exact same out-of-sample market/checkpoint
+    rows. No settlement information enters features; only earlier settled
+    markets can train the regularized external-feature challenger.
+    """
+    path = Path(db_path)
+    empty = {"report": "outcome_settlement_probability_walk_forward", "checkpoints": {}, "live_authority": False}
+    if not path.exists():
+        return {**empty, "blockers": ["database_missing"]}
+    with sqlite3.connect(f"file:{path.resolve()}?mode=ro", uri=True) as conn:
+        tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        required = {"outcome_oi_feature_rows", "outcome_market_settlement_registry", "binance_oi_observations"}
+        if not required.issubset(tables):
+            return {**empty, "blockers": ["required_existing_tables_missing"]}
+        settled = conn.execute(
+            """SELECT outcome_id,winning_side_index,recorded_at FROM outcome_market_settlement_registry
+               WHERE winning_side_index IN (0,1)
+                 AND settlement_source LIKE 'official_sdk_settled_outcome%'"""
+        ).fetchall()
+        if not settled:
+            return {**empty, "blockers": ["no_official_settlement_labels"]}
+        outcome_ids = [int(row[0]) for row in settled]
+        placeholders = ",".join("?" for _ in outcome_ids)
+        source = conn.execute(
+            f"""SELECT outcome_id,snapshot_timestamp_ms,features_json FROM outcome_oi_feature_rows
+                WHERE feature_schema_version=? AND period='1d' AND oi_backfilled=0 AND outcome_id IN ({placeholders})
+                ORDER BY outcome_id,snapshot_timestamp_ms""",
+            (FEATURE_SCHEMA_VERSION, *outcome_ids),
+        ).fetchall()
+        marks = conn.execute(
+            """SELECT exchange_timestamp_ms,local_received_at_ms,mark_price FROM binance_oi_observations
+               WHERE symbol='BTCUSDT' AND backfilled=0 AND mark_price IS NOT NULL
+               ORDER BY exchange_timestamp_ms"""
+        ).fetchall()
+    labels_by_market = {int(oid): (int(side), str(recorded)) for oid, side, recorded in settled}
+    rows_by_market: dict[int, list[dict[str, Any]]] = {}
+    for oid, ts, raw_features in source:
+        try:
+            features = json.loads(raw_features)
+            if not isinstance(features, dict):
+                continue
+            rows_by_market.setdefault(int(oid), []).append({"timestamp_ms": int(ts), "features": features})
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+    mark_points: list[tuple[int, int, float]] = []
+    for exchange_ts, received_ts, raw_price in marks:
+        try:
+            price = float(raw_price)
+            if price > 0:
+                mark_points.append((int(exchange_ts), int(received_ts), price))
+        except (TypeError, ValueError):
+            continue
+    mark_times = [point[0] for point in mark_points]
+    report_checkpoints: dict[str, Any] = {}
+    for horizon in SETTLEMENT_CHECKPOINTS_SEC:
+        candidates: list[dict[str, Any]] = []
+        missing = {"checkpoint_row": 0, "structural_inputs": 0, "external_inputs": 0, "volatility_history": 0}
+        for outcome_id, points in rows_by_market.items():
+            winner = labels_by_market.get(outcome_id)
+            if winner is None:
+                continue
+            eligible = []
+            for point in points:
+                feature = point["features"]
+                time_left = _finite(feature.get("time_left_sec"))
+                bid, ask = _finite(feature.get("yes_bid")), _finite(feature.get("yes_ask"))
+                if time_left is None or abs(time_left - horizon) > 180 or bid is None or ask is None or not 0 < bid < ask < 1:
+                    continue
+                eligible.append((abs(time_left - horizon), point))
+            if not eligible:
+                missing["checkpoint_row"] += 1
+                continue
+            point = min(eligible, key=lambda item: (item[0], item[1]["timestamp_ms"]))[1]
+            feature, timestamp = point["features"], point["timestamp_ms"]
+            spot, strike = _finite(feature.get("binance_mark_price")), _finite(feature.get("strike"))
+            time_left = _finite(feature.get("time_left_sec"))
+            if spot is None or strike is None or time_left is None or spot <= 0 or strike <= 0 or time_left <= 0:
+                missing["structural_inputs"] += 1
+                continue
+            start = bisect.bisect_left(mark_times, timestamp - 3_600_000)
+            stop = bisect.bisect_right(mark_times, timestamp)
+            history = [item for item in mark_points[start:stop] if item[1] <= timestamp]
+            squared_return = 0.0
+            covered_seconds = 0.0
+            valid_returns = 0
+            for left, right in zip(history, history[1:]):
+                gap = (right[0] - left[0]) / 1000.0
+                if gap <= 0 or gap > 60 or left[2] <= 0 or right[2] <= 0:
+                    continue
+                squared_return += math.log(right[2] / left[2]) ** 2
+                covered_seconds += gap
+                valid_returns += 1
+            if valid_returns < 20 or covered_seconds < 900:
+                missing["volatility_history"] += 1
+                continue
+            variance_per_sec = squared_return / covered_seconds
+            z = math.log(spot / strike) / math.sqrt(max(variance_per_sec * time_left, 1e-12))
+            simple_probability = min(1 - 1e-6, max(1e-6, _normal_cdf(z)))
+            market_probability = (float(feature["yes_bid"]) + float(feature["yes_ask"])) / 2.0
+            try:
+                external = [
+                    _logit(market_probability), z,
+                    float(feature["btc_mark_return_300s_bps"]) / 100.0,
+                    float(feature["btc_mark_return_900s_bps"]) / 100.0,
+                    float(feature["oi_return_300s_bps"]),
+                    float(feature["taker_imbalance"]),
+                ]
+                if not all(math.isfinite(value) for value in external):
+                    raise ValueError
+            except (KeyError, TypeError, ValueError):
+                missing["external_inputs"] += 1
+                continue
+            try:
+                settlement_ms = int(datetime.fromisoformat(winner[1].replace("Z", "+00:00")).timestamp() * 1000)
+            except (ValueError, OverflowError):
+                continue
+            candidates.append({
+                "outcome_id": outcome_id, "decision_timestamp_ms": timestamp,
+                "settlement_timestamp_ms": settlement_ms, "time_left_sec": time_left,
+                "label": int(winner[0] == 0), "market_probability": market_probability,
+                "simple_probability": simple_probability, "model_features": external,
+            })
+        scored: list[dict[str, Any]] = []
+        folds: list[dict[str, Any]] = []
+        ordered = sorted(candidates, key=lambda row: row["decision_timestamp_ms"])
+        for test in ordered:
+            train = [row for row in ordered if row["outcome_id"] != test["outcome_id"] and row["settlement_timestamp_ms"] < test["decision_timestamp_ms"]]
+            model = _fit_logistic(train)
+            if model is None:
+                continue
+            scored.append({**test, "external_probability": _predict_logistic(model, test["model_features"]), "train_markets": len({row["outcome_id"] for row in train})})
+            folds.append({"test_outcome_id": test["outcome_id"], "train_markets": len({row["outcome_id"] for row in train}), "train_rows": len(train)})
+        labels = [int(row["label"]) for row in scored]
+        report_checkpoints[str(horizon)] = {
+            "target": "official_outcome_settlement_winning_side_yes",
+            "candidate_markets_with_all_features": len(candidates),
+            "expanding_walk_forward_oos_markets": len(scored),
+            "checkpoint_match_tolerance_sec": 180,
+            "minimum_volatility_history": {"valid_returns": 20, "covered_seconds": 900, "max_gap_sec": 60},
+            "common_oos_metrics": {
+                "market_midpoint": _binary_metrics([row["market_probability"] for row in scored], labels),
+                "simple_spot_strike_realized_vol": _binary_metrics([row["simple_probability"] for row in scored], labels),
+                "external_increment_logistic": _binary_metrics([row["external_probability"] for row in scored], labels),
+            },
+            "oos_predictions": [
+                {
+                    "outcome_id": row["outcome_id"],
+                    "decision_timestamp_ms": row["decision_timestamp_ms"],
+                    "official_yes_label": row["label"],
+                    "market_midpoint": row["market_probability"],
+                    "simple_spot_strike_realized_vol": row["simple_probability"],
+                    "external_increment_logistic": row["external_probability"],
+                    "prior_settled_training_markets": row["train_markets"],
+                }
+                for row in scored
+            ],
+            "folds": folds,
+            "unavailable_counts": missing,
+            "live_authority": False,
+        }
+    return {
+        "report": "outcome_settlement_probability_walk_forward",
+        "method": "fixed_time_left_checkpoint; market midpoint vs zero-drift lognormal spot/strike with trailing realized variance vs expanding logistic increment",
+        "official_label_source": "outcome_market_settlement_registry.winning_side_index",
+        "checkpoints": report_checkpoints,
+        "limitations": [
+            "All three forecasts use identical market/checkpoint rows that have a trainable prior-market external model.",
+            "Settlement labels are official outcome labels; settlement time is used only to gate prior-label availability.",
+            "Structural model assumes zero drift, lognormal returns, and trailing realized variance; jumps, skew, funding carry, and boundary effects are omitted.",
+            "External model is a small regularized exploratory logistic fit; few independent settled daily markets make scores high-variance.",
+            "The official spot settlement definition and exact market expiry mapping must be independently confirmed before interpreting as edge.",
+            "This is read-only research; no runtime, admission, exit, sizing, or order authority is granted.",
+        ],
+        "blockers": ["insufficient_independent_settled_markets_for_reliable_model_selection", "shadow_only"],
+        "live_authority": False,
+    }
 
 
 def _quantile(values: list[float], fraction: float) -> float | None:
@@ -266,6 +515,7 @@ def train_report(
         "folds": folds,
         "oos_metrics": metrics,
         "maker_fill_model": fill_model,
+        "settlement_probability": settlement_probability_report(db_path),
         "artifact_written": str(artifact_path) if artifact is not None and artifact_path is not None else None,
         "shadow_model_available": artifact is not None,
         "ready_for_live": False,

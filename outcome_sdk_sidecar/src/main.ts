@@ -6,7 +6,8 @@ import { createInterface } from "node:readline";
 
 type Command = "health" | "fetch_markets" | "fetch_order_book" | "fetch_settled_outcome" | "fetch_account_snapshot" | "place_limit_order" | "place_emergency_ioc_exit" | "cancel_order" | "merge_outcome";
 type Request = { id: string; command: Command; testnet?: boolean; payload?: Record<string, unknown> };
-type Response = { id: string; ok: boolean; result?: unknown; error?: { code: string; message: string }; timingMs?: number; command?: Command };
+type StepTiming = Record<string, number | boolean>;
+type Response = { id: string; ok: boolean; result?: unknown; error?: { code: string; message: string }; timingMs?: number; timingDetails?: StepTiming; command?: Command };
 type LimitOrderPayload = { marketId: string; outcome: string; side: "buy" | "sell"; price: string; amount: string; timeInForce?: "GTC" | "GTD" | "FOK" | "FAK" | "ALO"; skipMinNotionalCheck?: boolean };
 type CancelPayload = { marketId: string; outcome: string; orderId: string };
 type MergePayload = { marketId: string; amount: string };
@@ -27,6 +28,11 @@ function executionEnabled(): boolean { return process.env.OUTCOME_SDK_EXECUTION_
 const adapters = new Map<boolean, Promise<ReturnType<typeof createHIP4Adapter>>>();
 const authenticatedAdapters = new Map<string, Promise<void>>();
 const settledClients = new Map<boolean, HIP4Client>();
+// A daily Outcome market's id/coin-to-side mapping is immutable after the
+// official market discovery that created it.  Keeping this in the long-lived
+// sidecar avoids fetching the whole active market list on every order while
+// retaining a cache-miss lookup after sidecar restart or market rollover.
+const marketSideCache = new Map<string, number>();
 
 function adapterKey(testnet: boolean): boolean { return testnet; }
 function getAdapter(testnet: boolean): Promise<ReturnType<typeof createHIP4Adapter>> {
@@ -110,13 +116,18 @@ function parseMergePayload(payload: Record<string, unknown> | undefined): MergeP
   if (!/^\d+(\.\d+)?$/.test(amount) || Number(amount) <= 0) throw new Error("payload.amount must be positive");
   return { marketId, amount };
 }
-async function requireMarketSide(hip4: ReturnType<typeof createHIP4Adapter>, marketId: string, outcome: string): Promise<number> {
+function marketSideCacheKey(testnet: boolean, marketId: string, outcome: string): string { return `${testnet ? "testnet" : "mainnet"}:${marketId}:${outcome}`; }
+async function requireMarketSide(hip4: ReturnType<typeof createHIP4Adapter>, testnet: boolean, marketId: string, outcome: string): Promise<{ sideIndex: number; cacheHit: boolean }> {
+  const key = marketSideCacheKey(testnet, marketId, outcome);
+  const cached = marketSideCache.get(key);
+  if (cached !== undefined) return { sideIndex: cached, cacheHit: true };
   const markets = (await hip4.events.fetchMarkets({ type: "defaultBinary" })) as DefaultBinaryMarket[];
   const market = markets.find((candidate) => String(candidate.outcomeId) === marketId);
   if (!market) throw new Error(`active defaultBinary market ${marketId} not found`);
   const sideIndex = market.sides.findIndex((side) => side.coin === outcome);
   if (sideIndex < 0) throw new Error(`outcome ${outcome} is not a side of market ${marketId}`);
-  return sideIndex;
+  marketSideCache.set(key, sideIndex);
+  return { sideIndex, cacheHit: false };
 }
 async function requireAloIsMaker(hip4: ReturnType<typeof createHIP4Adapter>, payload: LimitOrderPayload, sideIndex: number): Promise<void> {
   if (payload.timeInForce !== "ALO") return;
@@ -140,7 +151,7 @@ async function handleCommand(request: Request): Promise<Response> {
   if (request.command === "fetch_order_book") {
     const marketId = requireString(request.payload?.marketId, "payload.marketId");
     const outcome = requireString(request.payload?.outcome, "payload.outcome");
-    const sideIndex = await requireMarketSide(hip4, marketId, outcome);
+    const { sideIndex } = await requireMarketSide(hip4, testnet, marketId, outcome);
     const book = await hip4.marketData.fetchOrderBook(marketId, sideIndex);
     return { id: request.id, ok: true, result: { marketId, outcome, bids: book.bids, asks: book.asks, timestamp: book.timestamp } };
   }
@@ -159,10 +170,21 @@ async function handleCommand(request: Request): Promise<Response> {
   const { wallet } = await ensureAuthenticated(hip4, testnet);
   if (request.command === "place_limit_order") {
     const payload = parseLimitPayload(request.payload);
-    const sideIndex = await requireMarketSide(hip4, payload.marketId, payload.outcome);
-    await requireAloIsMaker(hip4, payload, sideIndex);
+    const marketLookupStartedAt = performance.now();
+    const marketSide = await requireMarketSide(hip4, testnet, payload.marketId, payload.outcome);
+    const marketLookupMs = performance.now() - marketLookupStartedAt;
+    const aloBookCheckStartedAt = performance.now();
+    await requireAloIsMaker(hip4, payload, marketSide.sideIndex);
+    const aloBookCheckMs = performance.now() - aloBookCheckStartedAt;
+    const placeOrderStartedAt = performance.now();
     const result = await hip4.trading.placeOrder({ ...payload, type: "limit" });
-    return result.success ? { id: request.id, ok: true, result } : { id: request.id, ok: false, result, error: { code: "ORDER_REJECTED", message: result.error ?? "Outcome rejected order" } };
+    const timingDetails = {
+      market_side_lookup_ms: marketLookupMs,
+      market_side_cache_hit: marketSide.cacheHit,
+      alo_book_check_ms: aloBookCheckMs,
+      place_order_ms: performance.now() - placeOrderStartedAt,
+    };
+    return result.success ? { id: request.id, ok: true, result, timingDetails } : { id: request.id, ok: false, result, timingDetails, error: { code: "ORDER_REJECTED", message: result.error ?? "Outcome rejected order" } };
   }
   if (request.command === "place_emergency_ioc_exit") {
     // This deliberately does *not* expose a general market-order surface.
@@ -170,7 +192,7 @@ async function handleCommand(request: Request): Promise<Response> {
     // supplied its loss-cap price.  FAK maps to Hyperliquid's IOC semantics:
     // fill only at-or-better than this limit, then cancel any remainder.
     const payload = parseLimitPayload({ ...request.payload, side: "sell", timeInForce: "FAK", skipMinNotionalCheck: true });
-    await requireMarketSide(hip4, payload.marketId, payload.outcome);
+    await requireMarketSide(hip4, testnet, payload.marketId, payload.outcome);
     const result = await hip4.trading.placeOrder({ ...payload, type: "limit" });
     return result.success ? { id: request.id, ok: true, result } : { id: request.id, ok: false, result, error: { code: "EMERGENCY_IOC_REJECTED", message: result.error ?? "Outcome rejected emergency IOC exit" } };
   }

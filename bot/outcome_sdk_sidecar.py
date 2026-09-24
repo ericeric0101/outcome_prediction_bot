@@ -179,11 +179,17 @@ class OutcomeSdkSidecarClient:
                         command=command, request_id=str(request["id"]), detail="sidecar response id did not match request",
                     )
                 raise OutcomeSdkSidecarError("SDK sidecar response id did not match request")
+            timing_details = response.get("timingDetails")
             self.last_request_timing = {
                 "command": command, "python_round_trip_ms": elapsed_ms,
                 "sdk_sidecar_ms": response.get("timingMs"),
                 "pid": process.pid, "persistent": True,
             }
+            if isinstance(timing_details, Mapping):
+                # The sidecar owns these sub-step measurements.  They are
+                # diagnostic only and deliberately do not alter the official
+                # SDK response or any mutation authority.
+                self.last_request_timing["sidecar_step_timing"] = dict(timing_details)
             if not response.get("ok"):
                 error = response.get("error") or {}
                 raise OutcomeSdkSidecarError(f"{error.get('code', 'UNKNOWN')}: {error.get('message', '')}")

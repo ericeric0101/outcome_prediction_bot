@@ -56,6 +56,7 @@ def report(db_path: str | Path, *, recent_event_limit: int = 10_000) -> dict[str
         "report": "outcome_runtime_timing", "schema_version": 1, "live_authority": False,
         "recent_event_limit": recent_event_limit, "rows_scanned": 0, "valid_timing_rows": 0,
         "id_window": None, "stages_ms": {}, "account_endpoints_ms": {}, "sdk_commands_ms": {},
+        "sdk_command_steps_ms": {},
         "blockers": [],
         "limits": [
             "Reads only OUTCOME_RUNTIME_TIMING in a bounded primary-key window.",
@@ -68,6 +69,7 @@ def report(db_path: str | Path, *, recent_event_limit: int = 10_000) -> dict[str
     stage_values: dict[str, list[float]] = {name: [] for name in _STAGES}
     account_values: dict[str, list[float]] = {}
     sdk_values: dict[str, list[float]] = {}
+    sdk_step_values: dict[str, dict[str, list[float]]] = {}
     with sqlite3.connect(f"file:{path.resolve()}?mode=ro", uri=True) as conn:
         tables = {str(row[0]) for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         if "strategy_events" not in tables:
@@ -108,9 +110,24 @@ def report(db_path: str | Path, *, recent_event_limit: int = 10_000) -> dict[str
                     value = _number(request.get("python_round_trip_ms"))
                     if value is not None:
                         sdk_values.setdefault(command, []).append(value)
+                    # Step timings are emitted only by the persistent SDK
+                    # sidecar.  Keep boolean diagnostics (for example a cache
+                    # hit) out of millisecond summaries.
+                    step_timing = request.get("sidecar_step_timing")
+                    if isinstance(step_timing, dict):
+                        for name, raw_value in step_timing.items():
+                            if not str(name).endswith("_ms"):
+                                continue
+                            step_value = _number(raw_value)
+                            if step_value is not None:
+                                sdk_step_values.setdefault(command, {}).setdefault(str(name), []).append(step_value)
     base["stages_ms"] = {name: _summary(values) for name, values in stage_values.items() if values}
     base["account_endpoints_ms"] = {name: _summary(values) for name, values in sorted(account_values.items())}
     base["sdk_commands_ms"] = {name: _summary(values) for name, values in sorted(sdk_values.items())}
+    base["sdk_command_steps_ms"] = {
+        command: {name: _summary(values) for name, values in sorted(steps.items())}
+        for command, steps in sorted(sdk_step_values.items())
+    }
     if not base["valid_timing_rows"]:
         base["blockers"].append("no_runtime_timing_rows_in_id_window")
     return base

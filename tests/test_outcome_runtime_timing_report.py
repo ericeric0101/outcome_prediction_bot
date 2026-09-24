@@ -18,7 +18,13 @@ def test_runtime_timing_report_summarises_stages_account_and_sdk_in_bounded_wind
         _timing(conn, {
             "total_ms": 1000, "fill_sync_ms": 400,
             "account_read_timing": {"get_user_fills_sync": {"elapsed_ms": 390}},
-            "sdk_requests": [{"command": "fetch_order_book", "python_round_trip_ms": 200}],
+            "sdk_requests": [{
+                "command": "fetch_order_book", "python_round_trip_ms": 200,
+                "sidecar_step_timing": {
+                    "market_side_lookup_ms": 12.5, "market_side_cache_hit": False,
+                    "alo_book_check_ms": 200,
+                },
+            }],
         })
         _timing(conn, {
             "total_ms": 3000, "fill_sync_ms": 1400,
@@ -35,6 +41,9 @@ def test_runtime_timing_report_summarises_stages_account_and_sdk_in_bounded_wind
     assert result["account_endpoints_ms"]["get_user_fills_sync"]["sum_ms"] == 1780.0
     assert result["sdk_commands_ms"]["fetch_order_book"]["max_ms"] == 200.0
     assert result["sdk_commands_ms"]["cancel_order"]["max_ms"] == 1800.0
+    assert result["sdk_command_steps_ms"]["fetch_order_book"]["market_side_lookup_ms"]["max_ms"] == 12.5
+    assert result["sdk_command_steps_ms"]["fetch_order_book"]["alo_book_check_ms"]["sum_ms"] == 200.0
+    assert "market_side_cache_hit" not in result["sdk_command_steps_ms"]["fetch_order_book"]
 
 
 def test_runtime_timing_report_handles_missing_journal_and_rejects_unbounded_limit(tmp_path):

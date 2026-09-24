@@ -1,7 +1,7 @@
 # Hyperliquid Outcome (HIP-4) BTC Daily Prediction Market Trading Bot — Current Authority
 
-> **權威架構版本 (Authority Version)**：2.5.14 (Outcome-only; all-loss-exit observation mode; conservative telemetry retention V1.2 compaction; bounded recovery-probe replay)
-> **建立與審計日期**：2026-08-23；最近修訂：2026-09-22
+> **權威架構版本 (Authority Version)**：2.5.18 (Outcome-only; all-loss-exit observation mode; conservative telemetry retention V1.2 compaction; bounded recovery-probe replay; B5 taker head-to-head; SDK submit sub-step attribution; stale-cancel fill-race terminal reconciliation; official settlement probability walk-forward)
+> **建立與審計日期**：2026-08-23；最近修訂：2026-09-24
 > **目標系統**：Hyperliquid HyperCore L1 原生預測市場 — Outcome (HIP-4 協議標準)  
 > **單一權威聲明**：本文件取代原 `project_overview.md`，為系統唯一的設計、架構、量化模型與執行權威規範。
 
@@ -153,6 +153,14 @@ and must be checked in the durable startup manifest.
 **唯一 cadence 修正。** 先前 `pending_owned_exit` 使任何 durable exit lifecycle 都每 1.5 秒同步 `userFills`。現在僅當同一輪 fresh account recovery 已同時證實：`protected_inventory`、無 BUY、唯一 covering SELL 的 OID 與 durable lifecycle 精確一致、lifecycle 為 `SELL_RESTING` 或 `LOSS_BAND_RESTING`，且沒有 ambiguous exit submit，才採既有 **30 秒** fill audit cadence。任何 lifecycle/account mismatch、flat/stale lifecycle、unprotected/conflicting/orphan account state、pending entry 或 ambiguous exit 仍在**當輪**同步 fills；mutation 前後 fresh account/cancel-confirm、durable intent、VWAP/accounting、risk/recovery 與 execution semantics 均未放寬。
 
 **唯讀量測工具。** `python scripts/outcome_runtime_timing_report.py --db logs/outcome_shadow.db --recent-event-limit 10000` 只讀 bounded primary-key window 的 `OUTCOME_RUNTIME_TIMING`，輸出 stage、account endpoint 與本輪 SDK command 的 count/sum/median/p90/max；不掃描整個 journal、不寫 DB、不呼叫 venue，也不改任何 live authority。下一步只能以此 report 檢查 stable SELL 的 `fill_sync_ms` 實際下降；mutation path 的 SDK book/submit/cancel tail 必須保留並另行審計，不得為追求 cadence 而跳過 fresh confirmation。
+
+### 2026-09-23 — SDK entry-submit 子步驟歸因與 immutable market-side cache（安全/策略語意不變）
+
+**已知 bottleneck 的可檢驗分解。** 一筆實際 ALO BUY 的決策到 submit 約 4.8 秒，其中 Python `place_limit_order` round trip 約 3.69 秒，故不能再把延遲籠統歸為 Python、SQLite 或 sidecar process。persistent official SDK sidecar 現在對每次 `place_limit_order` 記錄三段 diagnostic timing：`market_side_lookup_ms`、`alo_book_check_ms`、`place_order_ms`；gateway 將它隨既有本 tick `sdk_requests` 寫入 `OUTCOME_RUNTIME_TIMING`，而 bounded read-only runtime report 另輸出 `sdk_command_steps_ms`。這些欄位只量測，不參與價格、方向、size、gate 或任何 mutation authority。
+
+**唯一延遲優化。** sidecar 存活期間會快取已由 official `fetchMarkets(defaultBinary)` 驗證的 immutable `(network, marketId, outcome coin) → sideIndex`。新 market、sidecar restart 或 cache miss 仍先向 official market discovery 查證；key 明確隔離 mainnet/testnet。每筆 ALO 仍保留**當下** `fetchOrderBook` 的 maker-only final check，仍由 SDK `placeOrder` 實際驗證/簽名，且 Python 端 fresh account truth、durable intent、drift/fresh-book gate、ambiguity fence、cancel-confirm 與所有 exit path 完全不變。因此本項只移除「每張單重抓完整市場清單」的重複 remote read，不會把舊 book、舊 price、舊 order identity 或 cached position 當作下單依據。
+
+**部署與結論邊界。** 需重新 build/restart sidecar 才會開始產生新 sub-step telemetry；未取得主網 cache-hit 與三段 timing 分佈前，不宣稱已將 submit latency 降至任何毫秒門檻。它不改 S0 5 分鐘確認、OI/Tier、spread、ALO、TP、loss exit switch/canary、sizing、re-entry 或任何 HOLD/MarketRiskMonitor authority。
 
 ### 2026-09-19 — 60 秒 stale zero-fill BUY admission 與 post-fill evidence 對齊
 
@@ -845,7 +853,32 @@ X3 是離線建構，沒有網路或交易呼叫；同一 schema/source snapshot
 | **B5 — live-as-observed challenger（完成；重啟後收集）** | runtime 在現有 S0 tick 上額外寫 `OUTCOME_ACTIVE_CHALLENGER_SHADOW`，保存 production side/reason、精簡 BBO/time-left/mark/OI、每側 frozen-model score 及 challenger action；持倉既有 full-depth capture 同輪另寫 `OUTCOME_ACTIVE_HOLDING_CHALLENGER_SHADOW`。它不持有 key、gateway/controller reference，不新增 REST/SDK request，不 submit/cancel/reprice，也不改 production side/size/quote/exit。狀態變更或 30 秒 cadence 才寫 entry event。`python -m bot.outcome_active_shadow_report --db logs/outcome_shadow.db --period 1d` 將事件與後來 X3 BBO 配對，分開報 WAIT marketable counterfactual、maker conditional opportunity 與 holding actions；`python -m bot.outcome_active_milestone_report --db logs/outcome_shadow.db --period 1d` 統一輸出 B1–B5。 | 最低 review floor 暫定至少 5 個 artifact 訓練截止後的獨立 daily markets、200 個 unseen shadow decisions 與可用 future-BBO coverage；達標只表示可以人工審查，不代表 B6 自動開啟。須另看 action/regime/time-left/weekday、fee-adjusted path、tail、production missed/correct rejection、actual fills/holding、latency 與任何 unavailable bias。 |
 | **B6 — bounded live production（未實作、未授權）** | 只有 B5 unseen evidence 證實模型相對 persistence 與現行 production 有穩健增量、marketable/maker 各自可執行，並由操作者再次明確授權後，才另做最小 live canary。首版只能選一種 action lane、維持現行 $20 global exposure/one order、fresh REST revalidation、capacity/spread/drift、official minimum、portfolio/loss guard、durable intent、official SDK response 與 post-trade reconciliation；必須有獨立 kill switch 與可回退至現行策略。 | 現在沒有 B6 程式、環境開關或交易權限。不得因 B1–B5 implementation complete、樣本 floor 達標、某一回測報酬為正或 LLM 判斷而自動 promotion。B6 必須是另一個明確授權、code review、測試與小額 canary milestone。 |
 
+### 2026-09-23 — B5 Active Challenger 同時間 taker head-to-head（read-only）
+
+**問題。** `JOIN_BEST_BID` 原始語意是 maker 報價，不是 taker 成交；因此它不能只因 production S0 尚未確認、它較早提出 `JOIN_BEST_BID`，就被宣稱為「更快且更好」。為回答操作者的精確問題，既有 `outcome_active_shadow_report` 現在在**不改變任何 runtime 或下單權限**下，另外計算 BBO taker 反事實：同側在 shadow timestamp 以 observed ask 加 entry fee 買入，於未來 300／900／3600 秒以同側 observed bid 扣 exit fee 賣出。這個欄位永遠獨立於既有 maker conditional quote path；它不是 fill、不是 PnL、沒有假設 queue priority，且未含 full-depth size、slippage 或 market impact。
+
+**比較紀律。** 報表同時輸出：（1）每一 challenger action 的 taker-at-ask path；（2）在**同一 timestamp 且同一 side**已有 S0 production side 時，兩者的同側 taker return；此情境若 entry price 完全相同，結果相同是正確基準，不是 challenger alpha；（3）只在 Active 的同側 non-WAIT proposal 於 15 分鐘內、連續事件間隔不超過 90 秒、並領先一個新的 S0 confirmation 時，才建立 `early_same_side_active_to_s0_taker_head_to_head`。不同 side 仍會報出，但嚴禁作方向性優劣比較。
+
+**當前 checkpoint 與限制。** 初次執行涵蓋 9,564 個 artifact cutoff 後的 unseen decisions、8 個 independent daily markets；`JOIN_BEST_BID` 本身的全樣本 taker-at-ask path 不可直接視為可交易候選，因為它包含 production 尚未確認且方向可能和後續 S0 相反的 proposal。任何正/負結果均只用於回答「較早同側 proposal 是否值得繼續研究」，不是 B6 evidence。B6 仍禁止 live；不得把這個 BBO counterfactual 改成 IOC entry、改寫 S0 confirmation、放寬 cap/spread/size，或將它混入 maker fill/PnL。
+
 **首次 B1–B4 checkpoint — 2026-09-11 Asia/Taipei。** 現有 DB 產生 23,376 rows、13 個 daily markets、11 個 market-walk-forward folds。future-bid model 的 OOS RMSE 在 5m/15m/30m/60m 分別約 `0.032452/0.054387/0.072682/0.088817`；同 rows 的 persistence RMSE 約 `0.032417/0.054080/0.071947/0.088331`，相對 improvement 全為小幅負值（約 `-0.11%/-0.57%/-1.02%/-0.55%`）。因此 B2 已具備可觀測 artifact，但**截至此 checkpoint 沒有勝過 persistence，明確禁止 B6**。272 個歷史 BUY submit 中 175 個有 official fill；已知 spread buckets 的 smoothed fill probability 為 0–50 bps `40.0%`、50–100 bps `31.37%`、100–125 bps `38.10%`，另有 170 個 legacy unknown-spread submits，不得拿其較高 fill rate代表已知 live bucket。
+
+### 2026-09-24 — B2 結算機率 expanding walk-forward（read-only／shadow-only）
+
+**目的與比較單位。** `bot.outcome_active_model.settlement_probability_report()` 已加入既有 B2 訓練報告，因此由 B1–B5 統一報表一併帶出；不新增資料庫、排程器或 runtime 特徵蒐集路徑。只納入 `outcome_market_settlement_registry` 中官方 SDK 結算來源標籤，使用目前 X3 `outcome_oi_feature_rows` 與 Binance OI/mark 原始觀測，在每市場剩餘 12h／6h／3h／1h、±180 秒固定 checkpoint 擇一決策列。三種預測——Outcome YES BBO midpoint、`Φ(log(spot/strike)/√(trailing realized variance × time_left))` 零漂移 lognormal 基準、以及含市場 logit／距履約價 z／5m、15m mark return／5m OI return／taker imbalance 的 L2 正則 logistic challenger——只在完全相同的未見市場與決策 timestamp 評分。波動只取決策前最多一小時、非回補 Binance mark 序列；至少 20 個有效相鄰報酬、900 秒涵蓋且 gap 不逾 60 秒才計算，否則明列缺資料。Expanding folds 僅用 settlement `recorded_at` 早於測試決策時點的已結算市場訓練；冷啟動至少 8 個不同前序市場才產生外部模型預測。
+
+**2026-09-24 既有 DB checkpoint。** 各 horizon 的共同 OOS 樣本僅 9／9／10／10 個市場（12h／6h／3h／1h）；所有比較已使用同一 matched OOS 子集。以下為 Brier／log loss：
+
+| 剩餘時間 | n | Outcome midpoint | spot/strike + realized-vol | expanding external logistic |
+|---|---:|---:|---:|---:|
+| 12h | 10 | 0.1524 / 0.4411 | 0.1555 / 0.4569 | 0.3655 / 1.4811 |
+| 6h | 10 | 0.1395 / 0.3956 | 0.1349 / 0.3841 | 0.2259 / 2.0974 |
+| 3h | 9 | 0.0264 / 0.1224 | 0.0284 / 0.1276 | 0.0864 / 0.2441 |
+| 1h | 9 | 0.0352 / 0.1038 | 0.0385 / 0.1031 | 0.1796 / 0.5514 |
+
+**解讀與界線。** 目前沒有證據顯示簡單到期基準穩定勝過市場價格；6h 小幅較好、其餘 checkpoint midpoint 的 Brier 較好，差異不足以定論。外部特徵模型在四個 checkpoint 都比 midpoint 差，不能稱有增量預測力；每個 checkpoint 只有 9–10 個 OOS 市場、前序訓練市場最多 17 個，屬極小樣本探索結果，不能據此挑模型、調策略或推論穩定優勢。報表逐市場輸出 OOS 預測與訓練市場數，並列 checkpoint、波動歷史與外部欄位 unavailable counts。公式仍假設零漂移、lognormal 且無跳躍／偏斜／carry；資料所用 Binance mark 與官方 Outcome settlement 對 BTC 價格定義未經此分析重新核實，這是重要模型風險。Deribit rows 目前是 perp feature，沒有足夠 options IV/skew 欄位納入這次 expiry probability 比較。
+
+本分析只擴充既有 B2/B1–B5 唯讀報表，不改 live code path、下單、entry/exit、size、stop、模型 artifact 載入或任何 authority；`live_authority=false`，仍需累積更多已官方結算且完整覆蓋的獨立市場後才可重評。此次離線讀取 11GB DB 約需 12–18 秒，不在交易 loop 執行，也沒有寫入 DB。
 
 B4 目前在 10,005 個 OOS decision timestamps 中提出 8,242 個 `JOIN_BEST_BID` 與 1,763 個 WAIT，沒有任何 marketable entry 通過 q10 gate。maker conditional 15m path 的表面平均為正，但它完全沒有 queue/fill counterfactual，**不能稱為 PnL 或證明更主動就更好**。這正是 B5 必須收集 frozen unseen evidence、不能直接 B6 的原因。B5 event count 在首次部署前正確為零；操作者正常重啟 bot 後才開始產生新事件。未來重跑應新增帶日期 checkpoint，不覆寫本段。
 
