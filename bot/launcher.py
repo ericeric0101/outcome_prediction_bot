@@ -46,6 +46,7 @@ from bot.outcome_execution_ledger import OutcomeExecutionLedger
 from bot.outcome_operations_monitor import OutcomeOperationsMonitor
 from bot.outcome_research_capture import OutcomeResearchCapture
 from bot.outcome_research_worker import OutcomeResearchWorker
+from bot.btc_spot_shadow import BTCSpotShadowCapture, BTCSpotShadowWorker
 from bot.outcome_derived_feature_worker import OutcomeDerivedFeatureWorker
 from bot.deribit_market_data import DeribitMarketDataWorker
 from bot.outcome_rollover import OutcomeRolloverCoordinator
@@ -250,6 +251,8 @@ def run_integrated_hyperliquid_bot(
     # wallet writer.
     research_capture = None
     research_worker = None
+    btc_spot_shadow_worker = None
+    btc_spot_shadow_capture = None
     deribit_worker = None
     derived_feature_worker = None
     if not simulation:
@@ -260,13 +263,40 @@ def run_integrated_hyperliquid_bot(
         # attempt prevents its read-only retries from competing with account
         # truth on the shared venue /info lane.
         research_client = OutcomeClient(auth, timeout_sec=3.0, info_max_retries=1)
+        # The settlement-probability observer consumes this collector's
+        # already-captured public spot mids. It makes no extra venue request
+        # and remains unavailable until its as-of volatility window is valid.
+        if os.getenv("BTC_SPOT_SHADOW_ENABLED", "0").strip().lower() in {"1", "true", "yes", "on"}:
+            spot_shadow_client = OutcomeClient(auth, timeout_sec=3.0, info_max_retries=1)
+            btc_spot_shadow_capture = BTCSpotShadowCapture(client=spot_shadow_client, journal=live_journal)
         research_capture = OutcomeResearchCapture(
             client=research_client, wallet_address=auth.wallet_address, journal=live_journal,
         )
+        probability_provider = None
+        if btc_spot_shadow_capture is not None:
+            probability_provider = lambda selected_market, as_of_ms: btc_spot_shadow_capture.settlement_probability_shadow(
+                strike=selected_market.strike,
+                time_left_sec=selected_market.time_to_expiry_sec(current_timestamp=as_of_ms // 1000),
+                as_of_ms=as_of_ms,
+            )
         research_worker = OutcomeResearchWorker(
             client=research_client, capture=research_capture, journal=live_journal,
+            settlement_probability_provider=probability_provider,
         )
         research_worker.start()
+        # Optional BTC spot shadow is isolated on its own public-data client and
+        # background thread. It is deliberately not an execution dependency.
+        if btc_spot_shadow_capture is not None:
+            btc_spot_shadow_worker = BTCSpotShadowWorker(
+                capture=btc_spot_shadow_capture,
+                journal=live_journal,
+            )
+            btc_spot_shadow_worker.start()
+            live_journal.log_best_effort_strategy_event(
+                f"btc-spot-shadow-start-{uuid.uuid4().hex[:8]}", "BTC_SPOT_SHADOW_WORKER_STARTED",
+                {"read_only": True, "live_authority": False, "execution_enabled": False,
+                 "interval_sec": 5, "testnet_execution_flag_ignored_by_launcher": True}, timeout_sec=0.05,
+            )
         # Derived X3/D2 rows are research-only, but must be produced while
         # their raw P2/OI/Deribit evidence is fresh.  The worker uses short
         # write attempts and never shares the execution client or authority.
@@ -322,6 +352,8 @@ def run_integrated_hyperliquid_bot(
         logger.error("Unable to persist runtime safety startup manifest; live startup aborted fail-closed.")
         if research_worker is not None:
             research_worker.stop()
+        if btc_spot_shadow_worker is not None:
+            btc_spot_shadow_worker.stop()
         if derived_feature_worker is not None:
             derived_feature_worker.stop()
         if deribit_worker is not None:
@@ -789,6 +821,8 @@ def run_integrated_hyperliquid_bot(
                 logger.error(f"[OUTCOME SHUTDOWN] entry-buy cancellation reconciliation failed: {exc}")
         if research_worker is not None:
             research_worker.stop()
+        if btc_spot_shadow_worker is not None:
+            btc_spot_shadow_worker.stop()
         if derived_feature_worker is not None:
             derived_feature_worker.stop()
         if deribit_worker is not None:

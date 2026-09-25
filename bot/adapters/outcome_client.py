@@ -322,6 +322,10 @@ class OutcomeClient:
     def get_spot_meta_sync(self) -> Dict[str, Any]:
         return self.post_info_sync({"type": "spotMeta"})
 
+    def get_meta_and_asset_ctxs_sync(self) -> Any:
+        """Fetch read-only perp metadata/context for external spot comparisons."""
+        return self.post_info_sync({"type": "metaAndAssetCtxs"})
+
     async def get_meta(self) -> Dict[str, Any]:
         """Fetch perps metadata and assets."""
         return await self.post_info({"type": "meta"})

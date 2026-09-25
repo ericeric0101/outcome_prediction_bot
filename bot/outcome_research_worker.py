@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import threading
 import time
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from bot.lifecycle.outcome_lifecycle import OutcomeMarketSpec
 from bot.outcome_research_capture import OutcomeResearchCapture, OutcomeResearchCaptureResult
@@ -19,10 +19,12 @@ from monitoring.trade_journal_db import TradeJournalDB
 class OutcomeResearchWorker:
     """Keep P2/P3 capture cadence independent from the live order loop."""
 
-    def __init__(self, *, client: Any, capture: OutcomeResearchCapture, journal: TradeJournalDB) -> None:
+    def __init__(self, *, client: Any, capture: OutcomeResearchCapture, journal: TradeJournalDB,
+                 settlement_probability_provider: Callable[[OutcomeMarketSpec, int], dict[str, Any]] | None = None) -> None:
         self.client = client
         self.capture = capture
         self.journal = journal
+        self.settlement_probability_provider = settlement_probability_provider
         self._market_lock = threading.Lock()
         self._market: Optional[OutcomeMarketSpec] = None
         self._stop = threading.Event()
@@ -68,11 +70,22 @@ class OutcomeResearchWorker:
             no_book = self.client.get_l2_book_sync(market.no_coin, ttl_sec=0.0)
             no_received_at_ms = int(time.time() * 1000)
             complete_at_ms = int(time.time() * 1000)
+            probability = None
+            if self.settlement_probability_provider is not None:
+                try:
+                    probability = self.settlement_probability_provider(market, complete_at_ms)
+                except Exception as exc:
+                    probability = {
+                        "status": "unavailable", "reason": "probability_shadow_provider_error",
+                        "error_type": type(exc).__name__, "live_authority": False,
+                        "execution_enabled": False,
+                    }
             return self.capture.capture_if_due(
                 market=market, yes_book=yes_book, no_book=no_book,
                 yes_local_received_at_ms=yes_received_at_ms,
                 no_local_received_at_ms=no_received_at_ms,
                 capture_complete_at_ms=complete_at_ms,
+                settlement_probability_shadow=probability,
             )
         except Exception as exc:
             self.journal.log_strategy_event(self.capture.run_id, "OUTCOME_RESEARCH_CAPTURE_WORKER_ERROR", {

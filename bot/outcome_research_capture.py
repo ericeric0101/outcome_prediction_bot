@@ -24,6 +24,20 @@ from bot.outcome_spread_candidate_tracker import OutcomeWideSpreadCandidateTrack
 from monitoring.trade_journal_db import TradeJournalDB
 
 
+def _top_price(book: Mapping[str, Any], side: int) -> Decimal | None:
+    levels = book.get("levels") if isinstance(book, Mapping) else None
+    if not isinstance(levels, list) or len(levels) <= side or not isinstance(levels[side], list) or not levels[side]:
+        return None
+    row = levels[side][0]
+    if not isinstance(row, Mapping) or row.get("px") is None:
+        return None
+    try:
+        price = Decimal(str(row["px"]))
+    except Exception:
+        return None
+    return price if price.is_finite() and Decimal("0") < price < Decimal("1") else None
+
+
 @dataclass(frozen=True)
 class OutcomeResearchCaptureResult:
     captured: bool
@@ -160,7 +174,8 @@ class OutcomeResearchCapture:
         self._last_heartbeat_ms = now_ms
 
     def capture_if_due(self, *, market: OutcomeMarketSpec, yes_book: Mapping[str, Any], no_book: Mapping[str, Any],
-                       yes_local_received_at_ms: int, no_local_received_at_ms: int, capture_complete_at_ms: int) -> OutcomeResearchCaptureResult:
+                       yes_local_received_at_ms: int, no_local_received_at_ms: int, capture_complete_at_ms: int,
+                       settlement_probability_shadow: Mapping[str, Any] | None = None) -> OutcomeResearchCaptureResult:
         publish_outcome_market_authority(market)
         self._start_account_sync_if_due(market=market, now_ms=capture_complete_at_ms)
         if self._last_capture_ms and capture_complete_at_ms - self._last_capture_ms < self.interval_ms:
@@ -184,6 +199,37 @@ class OutcomeResearchCapture:
         )
         maker_fee, taker_fee, fee_evidence = self._account_snapshot(now_ms=capture_complete_at_ms)
         parity = OutcomeParityAnalyzer(maker_close_fee_rate=maker_fee, taker_close_fee_rate=taker_fee).analyze(market, yes_book, no_book)
+        probability = dict(settlement_probability_shadow or {
+            "status": "unavailable", "reason": "btc_spot_shadow_provider_disabled",
+            "source": "hyperliquid_spot_l2_mid", "live_authority": False,
+            "execution_enabled": False,
+        })
+        probability.update({
+            "outcome_id": market.outcome_id,
+            "period": market.period,
+            "expiry": market.expiry_str,
+            "decision_timestamp_ms": capture_complete_at_ms,
+            "time_left_sec": market.time_to_expiry_sec(current_timestamp=capture_complete_at_ms // 1000),
+            "strike": str(market.strike),
+            "market_up_bid": str(_top_price(yes_book, 0) or ""),
+            "market_up_ask": str(_top_price(yes_book, 1) or ""),
+            "market_down_bid": str(_top_price(no_book, 0) or ""),
+            "market_down_ask": str(_top_price(no_book, 1) or ""),
+            "capture_quality_status": quality.get("status"),
+        })
+        yes_bid, yes_ask = _top_price(yes_book, 0), _top_price(yes_book, 1)
+        no_bid, no_ask = _top_price(no_book, 0), _top_price(no_book, 1)
+        probability["market_up_probability_mid"] = str((yes_bid + yes_ask) / 2) if yes_bid is not None and yes_ask is not None else None
+        probability["market_down_probability_mid"] = str((no_bid + no_ask) / 2) if no_bid is not None and no_ask is not None else None
+        # A compact event makes fixed-time-left settlement scoring indexed and
+        # avoids reparsing the large raw P2 L2 payload for every report.
+        self.journal.log_best_effort_strategy_event(
+            self.run_id, "OUTCOME_SETTLEMENT_PROBABILITY_SHADOW", {
+                "venue": "hyperliquid_outcome", "read_only": True,
+                "live_authority": False, "execution_enabled": False,
+                **probability,
+            }, timeout_sec=0.05,
+        )
         snapshot_event_id = self.journal.log_strategy_event(self.run_id, "OUTCOME_P2_PARITY_SNAPSHOT", {
             "venue": "hyperliquid_outcome", "period": market.period, "p2_schema_version": P2_SCHEMA_VERSION,
             "snapshot_timestamp_ms": capture_complete_at_ms, "outcome_id": market.outcome_id,
@@ -194,7 +240,8 @@ class OutcomeResearchCapture:
             "time_left_sec": market.time_to_expiry_sec(current_timestamp=capture_complete_at_ms // 1000),
             "strike": str(market.strike),
             "yes_coin": market.yes_coin, "no_coin": market.no_coin, "yes_l2": dict(yes_book), "no_l2": dict(no_book),
-            "capture_quality": quality, "fee_evidence": fee_evidence, **parity.as_dict(),
+            "capture_quality": quality, "fee_evidence": fee_evidence,
+            "settlement_probability_shadow": probability, **parity.as_dict(),
         })
         p3_written = 0
         if quality.get("status") == "accepted" and snapshot_event_id is not None:

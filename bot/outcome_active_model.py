@@ -18,6 +18,7 @@ from typing import Any, Iterable, Mapping
 
 from bot.outcome_active_dataset import ACTIVE_DATASET_SCHEMA_VERSION, ACTIVE_FEATURE_NAMES, ActiveDecisionRow, load_decision_rows
 from bot.outcome_oi_features import FEATURE_SCHEMA_VERSION
+from bot.outcome_settlement_probability import estimate_settlement_probability
 
 
 # Calendar columns alter the feature-vector contract.  Reject older frozen
@@ -42,10 +43,6 @@ def _finite(value: object) -> float | None:
     except (TypeError, ValueError):
         return None
     return result if math.isfinite(result) else None
-
-
-def _normal_cdf(value: float) -> float:
-    return 0.5 * (1.0 + math.erf(value / math.sqrt(2.0)))
 
 
 def _logit(value: float) -> float:
@@ -115,7 +112,7 @@ def settlement_probability_report(db_path: str | Path) -> dict[str, Any]:
         return {**empty, "blockers": ["database_missing"]}
     with sqlite3.connect(f"file:{path.resolve()}?mode=ro", uri=True) as conn:
         tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-        required = {"outcome_oi_feature_rows", "outcome_market_settlement_registry", "binance_oi_observations"}
+        required = {"strategy_events", "outcome_oi_feature_rows", "outcome_market_settlement_registry", "binance_oi_observations"}
         if not required.issubset(tables):
             return {**empty, "blockers": ["required_existing_tables_missing"]}
         settled = conn.execute(
@@ -138,6 +135,10 @@ def settlement_probability_report(db_path: str | Path) -> dict[str, Any]:
                WHERE symbol='BTCUSDT' AND backfilled=0 AND mark_price IS NOT NULL
                ORDER BY exchange_timestamp_ms"""
         ).fetchall()
+        online_rows = conn.execute(
+            """SELECT payload_json FROM strategy_events
+               WHERE event_type='OUTCOME_SETTLEMENT_PROBABILITY_SHADOW' ORDER BY id"""
+        ).fetchall()
     labels_by_market = {int(oid): (int(side), str(recorded)) for oid, side, recorded in settled}
     rows_by_market: dict[int, list[dict[str, Any]]] = {}
     for oid, ts, raw_features in source:
@@ -157,6 +158,18 @@ def settlement_probability_report(db_path: str | Path) -> dict[str, Any]:
         except (TypeError, ValueError):
             continue
     mark_times = [point[0] for point in mark_points]
+    online_by_market: dict[int, list[dict[str, Any]]] = {}
+    for (raw,) in online_rows:
+        try:
+            payload = json.loads(raw)
+            if not isinstance(payload, dict) or payload.get("status") != "available":
+                continue
+            market_id = int(payload["outcome_id"])
+            if market_id not in labels_by_market:
+                continue
+            online_by_market.setdefault(market_id, []).append(payload)
+        except (TypeError, ValueError, KeyError, json.JSONDecodeError):
+            continue
     report_checkpoints: dict[str, Any] = {}
     for horizon in SETTLEMENT_CHECKPOINTS_SEC:
         candidates: list[dict[str, Any]] = []
@@ -186,22 +199,15 @@ def settlement_probability_report(db_path: str | Path) -> dict[str, Any]:
             start = bisect.bisect_left(mark_times, timestamp - 3_600_000)
             stop = bisect.bisect_right(mark_times, timestamp)
             history = [item for item in mark_points[start:stop] if item[1] <= timestamp]
-            squared_return = 0.0
-            covered_seconds = 0.0
-            valid_returns = 0
-            for left, right in zip(history, history[1:]):
-                gap = (right[0] - left[0]) / 1000.0
-                if gap <= 0 or gap > 60 or left[2] <= 0 or right[2] <= 0:
-                    continue
-                squared_return += math.log(right[2] / left[2]) ** 2
-                covered_seconds += gap
-                valid_returns += 1
-            if valid_returns < 20 or covered_seconds < 900:
+            estimate = estimate_settlement_probability(
+                spot_price=spot, strike=strike, time_left_sec=time_left, as_of_ms=timestamp,
+                price_points=((item[0], item[2]) for item in history),
+            )
+            if estimate.get("status") != "available":
                 missing["volatility_history"] += 1
                 continue
-            variance_per_sec = squared_return / covered_seconds
-            z = math.log(spot / strike) / math.sqrt(max(variance_per_sec * time_left, 1e-12))
-            simple_probability = min(1 - 1e-6, max(1e-6, _normal_cdf(z)))
+            simple_probability = float(estimate["probability_up"])
+            z = float(estimate["z_score"])
             market_probability = (float(feature["yes_bid"]) + float(feature["yes_ask"])) / 2.0
             try:
                 external = [
@@ -237,6 +243,41 @@ def settlement_probability_report(db_path: str | Path) -> dict[str, Any]:
             scored.append({**test, "external_probability": _predict_logistic(model, test["model_features"]), "train_markets": len({row["outcome_id"] for row in train})})
             folds.append({"test_outcome_id": test["outcome_id"], "train_markets": len({row["outcome_id"] for row in train}), "train_rows": len(train)})
         labels = [int(row["label"]) for row in scored]
+        online_candidates: list[dict[str, Any]] = []
+        online_missing = 0
+        for outcome_id, (winning_side, recorded_at) in labels_by_market.items():
+            eligible_online = []
+            for payload in online_by_market.get(outcome_id, []):
+                time_left = _finite(payload.get("time_left_sec"))
+                p_up = _finite(payload.get("probability_up"))
+                market_mid = _finite(payload.get("market_up_probability_mid"))
+                timestamp = _finite(payload.get("decision_timestamp_ms"))
+                if (payload.get("capture_quality_status") != "accepted"
+                        or time_left is None or abs(time_left - horizon) > 180 or p_up is None
+                        or market_mid is None or timestamp is None or not 0 < market_mid < 1
+                        or not 0 < p_up < 1):
+                    continue
+                eligible_online.append((abs(time_left - horizon), int(timestamp), payload))
+            if not eligible_online:
+                online_missing += 1
+                continue
+            _, timestamp, payload = min(eligible_online, key=lambda item: (item[0], item[1]))
+            try:
+                settled_ms = int(datetime.fromisoformat(recorded_at.replace("Z", "+00:00")).timestamp() * 1000)
+            except (ValueError, OverflowError):
+                online_missing += 1
+                continue
+            if timestamp >= settled_ms:
+                online_missing += 1
+                continue
+            online_candidates.append({
+                "outcome_id": outcome_id, "decision_timestamp_ms": timestamp,
+                "label": int(winning_side == 0),
+                "market_probability": float(payload["market_up_probability_mid"]),
+                "online_spot_probability": float(payload["probability_up"]),
+                "training_markets": 0,
+            })
+        online_labels = [int(row["label"]) for row in online_candidates]
         report_checkpoints[str(horizon)] = {
             "target": "official_outcome_settlement_winning_side_yes",
             "candidate_markets_with_all_features": len(candidates),
@@ -247,6 +288,14 @@ def settlement_probability_report(db_path: str | Path) -> dict[str, Any]:
                 "market_midpoint": _binary_metrics([row["market_probability"] for row in scored], labels),
                 "simple_spot_strike_realized_vol": _binary_metrics([row["simple_probability"] for row in scored], labels),
                 "external_increment_logistic": _binary_metrics([row["external_probability"] for row in scored], labels),
+            },
+            "online_spot_shadow_common_checkpoint_metrics": {
+                "markets": len(online_candidates),
+                "market_midpoint": _binary_metrics([row["market_probability"] for row in online_candidates], online_labels),
+                "hyperliquid_spot_strike_realized_vol": _binary_metrics([row["online_spot_probability"] for row in online_candidates], online_labels),
+                "unavailable_or_unmatched_settled_markets": online_missing,
+                "checkpoint_match_tolerance_sec": 180,
+                "note": "deterministic live shadow forecast vs market at identical eligible checkpoints; descriptive until enough independent official settlements",
             },
             "oos_predictions": [
                 {
@@ -276,6 +325,7 @@ def settlement_probability_report(db_path: str | Path) -> dict[str, Any]:
             "External model is a small regularized exploratory logistic fit; few independent settled daily markets make scores high-variance.",
             "The official spot settlement definition and exact market expiry mapping must be independently confirmed before interpreting as edge.",
             "This is read-only research; no runtime, admission, exit, sizing, or order authority is granted.",
+            "The live Hyperliquid spot shadow comparison uses only records with available as-of spot-volatility history and official labels; it is not available until those forecasts settle.",
         ],
         "blockers": ["insufficient_independent_settled_markets_for_reliable_model_selection", "shadow_only"],
         "live_authority": False,

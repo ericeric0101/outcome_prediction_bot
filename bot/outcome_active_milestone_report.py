@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from bot.outcome_active_dataset import dataset_report
-from bot.outcome_active_model import train_report
+from bot.outcome_active_model import settlement_probability_report, train_report
 from bot.outcome_active_replay import replay_report
 from bot.outcome_active_shadow_report import shadow_report
 
@@ -33,6 +33,7 @@ def report(db_path: str | Path, *, period: str = "1d") -> dict[str, Any]:
         "period": period,
         "b1_dataset": dataset_report(db_path, period=period),
         "b2_models": train_report(db_path, period=period, artifact_path=None),
+        "settlement_probability_comparison": settlement_probability_report(db_path),
         "b3_action_optimizer": {
             "actions": ["WAIT", "JOIN_BEST_BID", "IMPROVE_ONE_TICK", "BOUNDED_MARKETABLE_BUY", "MARKETABLE_PROFIT_EXIT", "BOUNDED_RISK_EXIT", "HOLD_OR_PASSIVE_EXIT"],
             "implementation": "pure_deterministic_shadow_optimizer",

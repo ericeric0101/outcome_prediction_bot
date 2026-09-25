@@ -1099,6 +1099,35 @@ class TradeJournalDB:
             logger.error(f"TradeJournalDB durable strategy event {event_type} failed: {e}")
             return None
 
+    def has_unresolved_spot_testnet_intent(self, wallet: str) -> bool:
+        """Fail-closed restart check for the isolated BTC spot testnet service."""
+        intent_types = {"BTC_SPOT_TESTNET_ORDER_INTENT", "BTC_SPOT_TESTNET_CANCEL_INTENT"}
+        confirmation_types = {"BTC_SPOT_TESTNET_ORDER_CONFIRMED", "BTC_SPOT_TESTNET_CANCEL_CONFIRMED"}
+        try:
+            with sqlite3.connect(f"file:{Path(self.db_path).resolve()}?mode=ro", uri=True, timeout=0.05) as conn:
+                rows = conn.execute(
+                    "SELECT id,event_type,payload_json FROM strategy_events "
+                    "WHERE event_type IN (?,?,?,?) ORDER BY id",
+                    tuple(sorted(intent_types | confirmation_types)),
+                ).fetchall()
+            pending: set[int] = set()
+            target = str(wallet).lower()
+            for event_id, event_type, raw in rows:
+                try:
+                    payload = json.loads(raw)
+                except (TypeError, json.JSONDecodeError):
+                    return True
+                if str(payload.get("wallet", "")).lower() != target:
+                    continue
+                if event_type in intent_types:
+                    pending.add(int(event_id))
+                elif event_type in confirmation_types and payload.get("intent_event_id") is not None:
+                    pending.discard(int(payload["intent_event_id"]))
+            return bool(pending)
+        except Exception as exc:
+            logger.error(f"BTC spot testnet intent recovery check failed closed: {exc}")
+            return True
+
     def record_outcome_p3_quote(
         self,
         *,
