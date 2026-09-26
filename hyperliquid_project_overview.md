@@ -1,7 +1,7 @@
 # Hyperliquid Outcome (HIP-4) BTC Daily Prediction Market Trading Bot — Current Authority
 
-> **權威架構版本 (Authority Version)**：2.5.20 (Outcome runtime unchanged; settlement-probability shadow comparison added)
-> **建立與審計日期**：2026-08-23；最近修訂：2026-09-25
+> **權威架構版本 (Authority Version)**：2.5.21 (shared /info transient circuit breaker; bounded runtime tick I/O)
+> **建立與審計日期**：2026-08-23；最近修訂：2026-09-26
 > **目標系統**：Hyperliquid HyperCore L1 原生預測市場 — Outcome (HIP-4 協議標準)  
 > **單一權威聲明**：本文件取代原 `project_overview.md`，為系統唯一的設計、架構、量化模型與執行權威規範。
 
@@ -1997,5 +1997,13 @@ Before proposing any execution-policy canary, the candidate must show all of the
 **Stage 4 — validation and authority.** `tests/test_hyperliquid_spot.py` covers dynamic pair resolution/ambiguity, decimal alignment, marketable-price rejection, cash and size caps, durable-intent requirement, exact post-submit account-truth adoption, cancel confirmation, and mutation ambiguity fencing. Validation in this code release is local unit/contract testing only: no live or testnet order was sent. Before any testnet probe, use a separate testnet wallet and explicitly request/authorize the operator action; verify testnet `spotMeta` contains the intended BTC/USDC pair because its asset ID may differ from mainnet. No 2x leverage, automatic strategy, live authority, mainnet order path, or transfer from Outcome/perp balance is enabled or implied. No private `.env` was changed by this implementation; shadow remains off until explicitly enabled.
 
 **Promotion boundary.** First collect across at least 15 independent UTC dates, then perform an expanding walk-forward model comparison on time-ordered unseen days (market/price momentum baseline vs spot/perp/OI features), assess calibration and costs, and separately validate order fill probability, fees, spread/depth, adverse selection, exits, and capital-time results on testnet. These code paths do not themselves pass those evidence gates. A future mainnet route requires a separate explicit design and operator authorization; it must not reuse Outcome stop authority or regard a good directional score as proof of executable profitability.
+
+### 2026-09-26 — shared `/info` failure circuit and runtime tick deadline
+
+The execution, market-discovery, rollover, and public research clients all share the same `/info` host circuit keyed by API base URL. In addition to existing 429 handling, HTTP 5xx and transport/timeouts open a process-wide cooldown. Consecutive transient failures increase the cooldown to 2/4/8/16/30 seconds (quiet interval 60 seconds); new reads during an open circuit fail locally and fail closed without sending another request. This prevents each refresh tick and each independent `OutcomeClient` from repeatedly requesting `l2Book` while the common endpoint is returning errors. It does not claim to repair venue/network availability; after each cooldown, a bounded request is still required to establish recovery.
+
+Each live runtime entrypoint (`tick_live_strategy`, `tick_p3_calibration`, `tick_market`, and reduce-only/cancel flows) now has a **12-second total I/O deadline**, shared through synchronous `/info` reads and official SDK sidecar waits. Each in-flight HTTP/sidecar wait is capped by the remaining deadline; once exhausted, the current tick aborts fail-closed and sends no later request/mutation in that tick. A sidecar execution response that times out remains ambiguous and is handled by the existing durable intent/reconciliation fence; this change never treats a timed-out mutation as rejected. Market discovery and pricing remain separate loop stages with their existing bounded per-request timeouts. No strategy, price, size, or stop threshold changed.
+
+Validation: regression tests verify that a 502 or read timeout on one client blocks other clients for the same host, that an exhausted tick deadline prevents another `/info` request, and that normal Outcome runtime/sidecar tests remain intact. This is local circuit/deadline behavior; it cannot guarantee the venue is continuously available. Operationally monitor `/info circuit opened`, `Outcome live runtime /info circuit fail-closed`, and `OUTCOME LOOP SLOW` records to ensure cooldowns suppress repeated requests and runtime stage duration stays bounded.
 
 ### 關鍵環境變數清單

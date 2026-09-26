@@ -2,12 +2,28 @@
 
 import asyncio
 from decimal import Decimal
+import time
 import pytest
 from eth_account import Account
 import httpx
 
 from bot.adapters.outcome_auth import OutcomeAuth
 from bot.adapters.outcome_client import OutcomeClient, OutcomeInfoCooldownError
+from bot.outcome_tick_budget import OutcomeTickBudgetExceeded, outcome_tick_budget
+
+
+def _clear_info_circuit_state():
+    with OutcomeClient._info_cooldown_lock:
+        OutcomeClient._info_cooldowns.clear()
+        OutcomeClient._info_429_strikes.clear()
+        OutcomeClient._info_transient_strikes.clear()
+
+
+@pytest.fixture(autouse=True)
+def reset_shared_info_circuit_state():
+    _clear_info_circuit_state()
+    yield
+    _clear_info_circuit_state()
 
 
 def test_open_orders_ws_subscription_is_user_scoped_and_all_dexes():
@@ -137,6 +153,123 @@ def test_429_blocks_all_other_info_reads_without_sending_another_request(monkeyp
         with OutcomeClient._info_cooldown_lock:
             OutcomeClient._info_cooldowns.clear()
             OutcomeClient._info_429_strikes.clear()
+            OutcomeClient._info_transient_strikes.clear()
+
+
+def test_502_opens_shared_circuit_across_execution_and_other_clients(monkeypatch):
+    auth = OutcomeAuth(wallet_address="0x" + "e" * 40, is_testnet=True)
+    first = OutcomeClient(auth, timeout_sec=0.1, info_max_retries=1)
+    second = OutcomeClient(auth, timeout_sec=0.1, info_max_retries=1)
+    request = httpx.Request("POST", "https://example.test/info")
+    sent: list[str] = []
+
+    class FailingClient:
+        is_closed = False
+
+        def post(self, *_args, **_kwargs):
+            sent.append("first")
+            return httpx.Response(502, request=request)
+
+    class MustNotSendClient:
+        is_closed = False
+
+        def post(self, *_args, **_kwargs):
+            sent.append("second")
+            return httpx.Response(200, request=request, json={"levels": [[], []]})
+
+    monkeypatch.setattr(first, "get_sync_client", lambda: FailingClient())
+    monkeypatch.setattr(second, "get_sync_client", lambda: MustNotSendClient())
+    _clear_info_circuit_state()
+    try:
+        with pytest.raises(httpx.HTTPStatusError):
+            first.post_info_sync({"type": "l2Book", "coin": "#1"})
+        with pytest.raises(OutcomeInfoCooldownError, match="shared /info cooldown"):
+            second.post_info_sync({"type": "outcomeMeta"})
+        assert sent == ["first"]
+        assert first._info_cooldown_remaining({"type": "test"}) > 0
+    finally:
+        _clear_info_circuit_state()
+
+
+def test_read_timeout_opens_shared_circuit_and_later_calls_fail_fast(monkeypatch):
+    auth = OutcomeAuth(wallet_address="0x" + "f" * 40, is_testnet=True)
+    first = OutcomeClient(auth, timeout_sec=0.1, info_max_retries=1)
+    second = OutcomeClient(auth, timeout_sec=0.1, info_max_retries=1)
+    request = httpx.Request("POST", "https://example.test/info")
+    sent: list[str] = []
+
+    class TimeoutClient:
+        is_closed = False
+
+        def post(self, *_args, **_kwargs):
+            sent.append("first")
+            raise httpx.ReadTimeout("read timed out", request=request)
+
+    class MustNotSendClient:
+        is_closed = False
+
+        def post(self, *_args, **_kwargs):
+            sent.append("second")
+            return httpx.Response(200, request=request, json={})
+
+    monkeypatch.setattr(first, "get_sync_client", lambda: TimeoutClient())
+    monkeypatch.setattr(second, "get_sync_client", lambda: MustNotSendClient())
+    _clear_info_circuit_state()
+    try:
+        with pytest.raises(httpx.ReadTimeout):
+            first.post_info_sync({"type": "l2Book"})
+        with pytest.raises(OutcomeInfoCooldownError):
+            second.post_info_sync({"type": "spotClearinghouseState", "user": auth.wallet_address})
+        assert sent == ["first"]
+    finally:
+        _clear_info_circuit_state()
+
+
+def test_transient_info_backoff_expands_to_thirty_second_cap():
+    client = OutcomeClient(OutcomeAuth(wallet_address="0x" + "8" * 40, is_testnet=True))
+    _clear_info_circuit_state()
+    try:
+        assert [client._record_info_transient_failure("HTTP 502") for _ in range(6)] == [2, 4, 8, 16, 30, 30]
+    finally:
+        _clear_info_circuit_state()
+
+
+def test_exhausted_tick_budget_prevents_sending_info_request(monkeypatch):
+    client = OutcomeClient(OutcomeAuth(wallet_address="0x" + "9" * 40, is_testnet=True), info_max_retries=1)
+    sent: list[bool] = []
+
+    class MustNotSendClient:
+        is_closed = False
+
+        def post(self, *_args, **_kwargs):
+            sent.append(True)
+            raise AssertionError("expired tick must not send another request")
+
+    monkeypatch.setattr(client, "get_sync_client", lambda: MustNotSendClient())
+    with outcome_tick_budget(0.001):
+        time.sleep(0.005)
+        with pytest.raises(OutcomeTickBudgetExceeded, match="budget exhausted"):
+            client.post_info_sync({"type": "l2Book"})
+    assert sent == []
+
+
+def test_info_http_timeout_is_capped_to_remaining_tick_budget(monkeypatch):
+    client = OutcomeClient(OutcomeAuth(wallet_address="0x" + "7" * 40, is_testnet=True), timeout_sec=3)
+    request = httpx.Request("POST", "https://example.test/info")
+    received_timeouts = []
+
+    class CapturingClient:
+        is_closed = False
+
+        def post(self, *_args, **kwargs):
+            received_timeouts.append(kwargs["timeout"])
+            return httpx.Response(200, request=request, json={"levels": [[], []]})
+
+    monkeypatch.setattr(client, "get_sync_client", lambda: CapturingClient())
+    with outcome_tick_budget(0.5):
+        assert client.post_info_sync({"type": "l2Book"}) == {"levels": [[], []]}
+    assert len(received_timeouts) == 1
+    assert 0 < received_timeouts[0].read <= 0.5
 
 
 def test_repeated_429s_expand_shared_cooldown(monkeypatch):

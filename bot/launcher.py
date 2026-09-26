@@ -601,7 +601,7 @@ def run_integrated_hyperliquid_bot(
                         # apparent runtime error.
                         if time.time() - last_info_cooldown_warning_at >= 30.0:
                             last_info_cooldown_warning_at = time.time()
-                            logger.warning(f"Outcome live runtime rate-limited fail-closed: {e}")
+                            logger.warning(f"Outcome live runtime /info circuit fail-closed: {e}")
                     except httpx.HTTPStatusError as e:
                         # OutcomeClient already emits one throttled warning
                         # and establishes the shared cooldown for a real 429.

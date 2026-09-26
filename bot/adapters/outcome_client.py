@@ -44,6 +44,7 @@ from bot.adapters.outcome_auth import (
     outcome_asset_id,
     parse_outcome_asset_id,
 )
+from bot.outcome_tick_budget import OutcomeTickBudgetExceeded, require_outcome_tick_budget, remaining_outcome_tick_budget_sec
 
 
 class OutcomeInfoCooldownError(RuntimeError):
@@ -68,6 +69,7 @@ class OutcomeClient:
     _info_cooldowns: Dict[tuple[str, str], float] = {}
     _last_info_429_warning: Dict[tuple[str, str], float] = {}
     _info_429_strikes: Dict[tuple[str, str], tuple[int, float]] = {}
+    _info_transient_strikes: Dict[tuple[str, str], tuple[int, float]] = {}
 
     def __init__(
         self,
@@ -166,6 +168,55 @@ class OutcomeClient:
             self._info_cooldowns[key] = max(previous, deadline)
         return actual_delay
 
+    def _record_info_transient_failure(self, reason: str) -> float:
+        """Open a host-wide circuit after /info 5xx or transport failure.
+
+        All OutcomeClient instances for this host share the same cooldown, so
+        execution, rollover, and research reads do not independently hammer
+        a failing endpoint. Backoff grows 2/4/8/16/30 seconds and resets after
+        a quiet minute.
+        """
+        now = time.monotonic()
+        key = self._cooldown_key()
+        with self._info_cooldown_lock:
+            strikes, last_at = self._info_transient_strikes.get(key, (0, float("-inf")))
+            if now - last_at >= 60.0:
+                strikes = 0
+            strikes += 1
+            self._info_transient_strikes[key] = (strikes, now)
+            delay = min(30.0, float(2 ** min(strikes, 5)))
+            self._info_cooldowns[key] = max(self._info_cooldowns.get(key, 0.0), now + delay)
+        self._log_info_transient_failure(reason, delay_sec=delay)
+        return delay
+
+    def _log_info_transient_failure(self, reason: str, *, delay_sec: float) -> None:
+        now = time.monotonic()
+        key = self._cooldown_key()
+        with self._info_cooldown_lock:
+            previous = self._last_info_429_warning.get(key, float("-inf"))
+            if now - previous < 15.0:
+                return
+            self._last_info_429_warning[key] = now
+        logger.warning(
+            f"Hyperliquid /info circuit opened after {reason}; shared cooldown {delay_sec:.1f}s. "
+            "Other clients fail fast without sending requests."
+        )
+
+    def _request_timeout(self) -> httpx.Timeout | float:
+        remaining = remaining_outcome_tick_budget_sec()
+        if remaining is None:
+            return self.timeout_sec
+        if remaining <= 0:
+            raise OutcomeTickBudgetExceeded("Outcome execution tick budget exhausted before /info request")
+        return httpx.Timeout(min(self.timeout_sec, remaining), connect=min(5.0, remaining))
+
+    def _clear_transient_strikes_after_success(self) -> None:
+        key = self._cooldown_key()
+        now = time.monotonic()
+        with self._info_cooldown_lock:
+            if self._info_cooldowns.get(key, 0.0) <= now:
+                self._info_transient_strikes.pop(key, None)
+
     def _log_info_429(self, payload: Dict[str, Any], *, delay_sec: float, attempt: int, max_retries: int) -> None:
         """Emit one operational 429 warning per venue per 30 seconds."""
         now = time.monotonic()
@@ -202,11 +253,14 @@ class OutcomeClient:
                 # proceed; competing fresh reads remain locally blocked.
                 if attempt == 1:
                     self._raise_if_info_cooldown(payload)
-                resp = await client.post("/info", json=payload)
+                require_outcome_tick_budget(f"async /info {payload.get('type')}")
+                resp = await client.post("/info", json=payload, timeout=self._request_timeout())
                 if resp.status_code == 429 or 500 <= resp.status_code <= 599:
                     wait_sec = self._retry_after_or_backoff(resp, attempt)
                     if resp.status_code == 429:
                         wait_sec = self._record_info_cooldown(wait_sec)
+                    else:
+                        wait_sec = self._record_info_transient_failure(f"HTTP {resp.status_code}")
                     if attempt == max_retries:
                         resp.raise_for_status()
                     if resp.status_code == 429:
@@ -219,12 +273,15 @@ class OutcomeClient:
                     await asyncio.sleep(wait_sec)
                     continue
                 resp.raise_for_status()
+                self._clear_transient_strikes_after_success()
                 return resp.json()
             except httpx.HTTPStatusError as e:
                 if (e.response.status_code == 429 or 500 <= e.response.status_code <= 599) and attempt < max_retries:
                     wait_sec = self._retry_after_or_backoff(e.response, attempt)
                     if e.response.status_code == 429:
                         wait_sec = self._record_info_cooldown(wait_sec)
+                    else:
+                        wait_sec = self._record_info_transient_failure(f"HTTP {e.response.status_code}")
                     logger.warning(f"Hyperliquid /info HTTP {e.response.status_code}; retrying in {wait_sec:.1f}s...")
                     await asyncio.sleep(wait_sec)
                     continue
@@ -238,6 +295,16 @@ class OutcomeClient:
                 raise
             except OutcomeInfoCooldownError:
                 raise
+            except OutcomeTickBudgetExceeded:
+                raise
+            except httpx.TransportError as e:
+                if remaining_outcome_tick_budget_sec() is not None and remaining_outcome_tick_budget_sec() <= 0:
+                    raise OutcomeTickBudgetExceeded("Outcome execution tick budget expired during /info request") from e
+                wait_sec = self._record_info_transient_failure(type(e).__name__)
+                if attempt == max_retries:
+                    logger.error(f"OutcomeClient.post_info error for {payload.get('type')}: {e}")
+                    raise
+                await asyncio.sleep(wait_sec)
             except Exception as e:
                 if attempt == max_retries:
                     logger.error(f"OutcomeClient.post_info error for {payload.get('type')}: {e}")
@@ -254,11 +321,14 @@ class OutcomeClient:
                 # proceed; competing fresh reads remain locally blocked.
                 if attempt == 1:
                     self._raise_if_info_cooldown(payload)
-                resp = client.post("/info", json=payload)
+                require_outcome_tick_budget(f"/info {payload.get('type')}")
+                resp = client.post("/info", json=payload, timeout=self._request_timeout())
                 if resp.status_code == 429 or 500 <= resp.status_code <= 599:
                     wait_sec = self._retry_after_or_backoff(resp, attempt)
                     if resp.status_code == 429:
                         wait_sec = self._record_info_cooldown(wait_sec)
+                    else:
+                        wait_sec = self._record_info_transient_failure(f"HTTP {resp.status_code}")
                     if attempt == max_retries:
                         resp.raise_for_status()
                     if resp.status_code == 429:
@@ -271,12 +341,15 @@ class OutcomeClient:
                     time.sleep(wait_sec)
                     continue
                 resp.raise_for_status()
+                self._clear_transient_strikes_after_success()
                 return resp.json()
             except httpx.HTTPStatusError as e:
                 if (e.response.status_code == 429 or 500 <= e.response.status_code <= 599) and attempt < max_retries:
                     wait_sec = self._retry_after_or_backoff(e.response, attempt)
                     if e.response.status_code == 429:
                         wait_sec = self._record_info_cooldown(wait_sec)
+                    else:
+                        wait_sec = self._record_info_transient_failure(f"HTTP {e.response.status_code}")
                     logger.warning(f"Hyperliquid /info HTTP {e.response.status_code}; retrying in {wait_sec:.1f}s...")
                     time.sleep(wait_sec)
                     continue
@@ -290,6 +363,16 @@ class OutcomeClient:
                 raise
             except OutcomeInfoCooldownError:
                 raise
+            except OutcomeTickBudgetExceeded:
+                raise
+            except httpx.TransportError as e:
+                if remaining_outcome_tick_budget_sec() is not None and remaining_outcome_tick_budget_sec() <= 0:
+                    raise OutcomeTickBudgetExceeded("Outcome execution tick budget expired during /info request") from e
+                wait_sec = self._record_info_transient_failure(type(e).__name__)
+                if attempt == max_retries:
+                    logger.error(f"OutcomeClient.post_info_sync error for {payload.get('type')}: {e}")
+                    raise
+                time.sleep(wait_sec)
             except Exception as e:
                 if attempt == max_retries:
                     logger.error(f"OutcomeClient.post_info_sync error for {payload.get('type')}: {e}")

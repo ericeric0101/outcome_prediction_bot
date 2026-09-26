@@ -16,6 +16,8 @@ import uuid
 from pathlib import Path
 from typing import Any, IO, Literal, Mapping
 
+from bot.outcome_tick_budget import require_outcome_tick_budget, remaining_outcome_tick_budget_sec
+
 
 class OutcomeSdkSidecarError(RuntimeError):
     pass
@@ -144,6 +146,7 @@ class OutcomeSdkSidecarClient:
         execution_command = command in {"place_limit_order", "place_emergency_ioc_exit", "cancel_order", "merge_outcome"}
         with self._lock:
             started_at = time.monotonic()
+            require_outcome_tick_budget(f"SDK sidecar {command}")
             process = self._start(script)
             if process.stdin is None or process.stdout is None:
                 self._discard_unhealthy_process()
@@ -151,9 +154,15 @@ class OutcomeSdkSidecarClient:
             try:
                 process.stdin.write(json.dumps(request, separators=(",", ":")) + "\n")
                 process.stdin.flush()
-                ready, _, _ = select.select([process.stdout.fileno()], [], [], self.request_timeout_sec)
+                remaining_budget = remaining_outcome_tick_budget_sec()
+                wait_timeout = self.request_timeout_sec if remaining_budget is None else min(
+                    self.request_timeout_sec, remaining_budget,
+                )
+                if wait_timeout <= 0:
+                    raise TimeoutError("Outcome execution tick budget exhausted while awaiting SDK sidecar")
+                ready, _, _ = select.select([process.stdout.fileno()], [], [], wait_timeout)
                 if not ready:
-                    raise TimeoutError(f"SDK sidecar response exceeded {self.request_timeout_sec:g}s")
+                    raise TimeoutError(f"SDK sidecar response exceeded effective {wait_timeout:g}s wait budget")
                 line = process.stdout.readline()
             except (BrokenPipeError, OSError, TimeoutError) as exc:
                 self._discard_unhealthy_process()

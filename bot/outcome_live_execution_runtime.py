@@ -77,6 +77,7 @@ from bot.outcome_holding_risk_service import OutcomeHoldingRiskService
 from bot.outcome_exit_requote_service import OutcomeExitRequoteService
 from bot.outcome_runtime_safety import OutcomeRuntimeSafety, SafetyComponent
 from bot.outcome_risk_episode import OutcomeRiskEpisodeStore
+from bot.outcome_tick_budget import bounded_outcome_tick
 
 
 class OutcomeLiveExecutionRuntime:
@@ -1936,6 +1937,7 @@ class OutcomeLiveExecutionRuntime:
             lifecycle_id=lifecycle_id, now=time.time(), max_age_sec=15.0,
         )
 
+    @bounded_outcome_tick
     def tick_market(self, *, market: OutcomeMarketSpec, entry_side_index: int | None) -> LiveExecutionResult:
         """Advance existing exposure first; only a flat market accepts a signal."""
         self._begin_tick()
@@ -1974,6 +1976,7 @@ class OutcomeLiveExecutionRuntime:
         assert side_index is not None
         return self._record(market, side_index, result)
 
+    @bounded_outcome_tick
     def tick_p3_calibration(self, *, market: OutcomeMarketSpec) -> LiveExecutionResult:
         """Advance one explicit P3 sampling lifecycle without a directional strategy.
 
@@ -2066,6 +2069,7 @@ class OutcomeLiveExecutionRuntime:
             })
         return self._record(market, side_index, result)
 
+    @bounded_outcome_tick
     def tick_live_strategy(self, *, market: OutcomeMarketSpec, entry_side_index: int | None,
                            entry_reason: str, entry_evidence: dict[str, object],
                            retiring_markets: tuple[OutcomeMarketSpec, ...] = (),
@@ -2601,6 +2605,7 @@ class OutcomeLiveExecutionRuntime:
         admission["timing_entry_submit_ms"] = round((time.monotonic() - submit_started_at) * 1000, 3)
         return result
 
+    @bounded_outcome_tick
     def cancel_resting_buys(
         self,
         *,
@@ -2630,6 +2635,7 @@ class OutcomeLiveExecutionRuntime:
                 cancelled.append(order_id)
         return LiveExecutionResult("cancelled" if cancelled else "flat", "cancelled owned entry buys" if cancelled else "no owned entry buy", cancelled[0] if cancelled else None)
 
+    @bounded_outcome_tick
     def tick_reduce_only(
         self, *, market: OutcomeMarketSpec, entry_reason: str, entry_evidence: dict[str, object],
         retiring_markets: tuple[OutcomeMarketSpec, ...] = (), market_context: dict[str, object] | None = None,
